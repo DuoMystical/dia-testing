@@ -14,7 +14,7 @@
 	let error = $state<string | null>(null);
 
 	// Backend URL - set via PUBLIC_BACKEND_URL environment variable
-	const BACKEND_URL = env.PUBLIC_BACKEND_URL || 'http://localhost:8000';
+	const BACKEND_URL = env.PUBLIC_BACKEND_URL || 'https://distinct-rosalie-covora-2ccf0de5.koyeb.app';
 
 	async function generateAudio() {
 		if (!textInput.trim()) {
