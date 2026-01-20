@@ -35,10 +35,6 @@ class ModelManager:
 
     def __init__(self):
         self.device = DEVICE
-        self.dtype_map = {
-            "cpu": "float32",
-            "cuda": "float16",
-        }
         self.model = None
         self.processor = None
         self.model_id = "nari-labs/Dia-1.6B-0626"
@@ -46,13 +42,16 @@ class ModelManager:
     def load_model(self):
         """Load the Dia model and processor with appropriate configuration using Hugging Face Transformers."""
         try:
-            dtype = self.dtype_map.get(self.device, torch.float16)
+            # Use float16 for GPU, float32 for CPU
+            dtype = torch.float16 if self.device == "cuda" else torch.float32
             logger.info(f"Loading model and processor with {dtype} on {self.device}")
             self.processor = AutoProcessor.from_pretrained(self.model_id)
             self.model = DiaForConditionalGeneration.from_pretrained(
-                self.model_id, torch_dtype=dtype, device_map=self.device
+                self.model_id,
+                torch_dtype=dtype,
+                device_map="auto"  # Let transformers handle device placement
             )
-            logger.info("Model and processor loaded successfully")
+            logger.info(f"Model and processor loaded successfully. Model device: {self.model.device}")
         except Exception as e:
             logger.error(f"Error loading model or processor: {e}")
             raise
