@@ -46,10 +46,12 @@ class ModelManager:
             dtype = torch.float16 if self.device == "cuda" else torch.float32
             logger.info(f"Loading model and processor with {dtype} on {self.device}")
             self.processor = AutoProcessor.from_pretrained(self.model_id)
+            # Load directly on target device to avoid OOM from CPU->GPU copy
             self.model = DiaForConditionalGeneration.from_pretrained(
                 self.model_id,
                 torch_dtype=dtype,
-            ).to(self.device)  # Explicitly move model to GPU
+                device_map=self.device,
+            )
             logger.info(f"Model and processor loaded successfully. Model device: {self.model.device}")
         except Exception as e:
             logger.error(f"Error loading model or processor: {e}")
