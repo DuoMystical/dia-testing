@@ -49,8 +49,7 @@ class ModelManager:
             self.model = DiaForConditionalGeneration.from_pretrained(
                 self.model_id,
                 torch_dtype=dtype,
-                device_map="auto"  # Let transformers handle device placement
-            )
+            ).to(self.device)  # Explicitly move model to GPU
             logger.info(f"Model and processor loaded successfully. Model device: {self.model.device}")
         except Exception as e:
             logger.error(f"Error loading model or processor: {e}")
