@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { env } from '$env/dynamic/public';
+
 	let textInput = $state('');
 	let maxNewTokens = $state(1024);
 	let cfgScale = $state(3.0);
@@ -12,7 +14,7 @@
 	let error = $state<string | null>(null);
 
 	// Backend URL - set via PUBLIC_BACKEND_URL environment variable
-	const BACKEND_URL = import.meta.env.PUBLIC_BACKEND_URL || 'http://localhost:8000';
+	const BACKEND_URL = env.PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
 	async function generateAudio() {
 		if (!textInput.trim()) {
