@@ -1,6 +1,4 @@
 <script lang="ts">
-	import { env } from '$env/dynamic/public';
-
 	let textInput = $state('');
 	let maxNewTokens = $state(1024);
 	let cfgScale = $state(3.0);
@@ -13,8 +11,8 @@
 	let audioUrl = $state<string | null>(null);
 	let error = $state<string | null>(null);
 
-	// Backend URL - set via PUBLIC_BACKEND_URL environment variable
-	const BACKEND_URL = env.PUBLIC_BACKEND_URL || 'https://distinct-rosalie-covora-2ccf0de5.koyeb.app';
+	// Backend URL - premade Koyeb Dia backend
+	const BACKEND_URL = 'https://distinct-rosalie-covora-2ccf0de5.koyeb.app';
 
 	async function generateAudio() {
 		if (!textInput.trim()) {
