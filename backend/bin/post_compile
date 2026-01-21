@@ -42,7 +42,7 @@ EOF
 
 mv pyproject_fix.toml pyproject.toml
 
-# Use python -m pip since pip command is not in PATH
-python -m pip install --no-deps .
+# Use uv pip with explicit python path (pip module not available in buildpack)
+uv pip install --python /app/.heroku/python/bin/python --no-deps .
 
 echo "=== dia2 fix complete ==="
