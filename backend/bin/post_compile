@@ -42,7 +42,7 @@ EOF
 
 mv pyproject_fix.toml pyproject.toml
 
-# Use pip directly instead of uv (uv has issues finding the venv in post_compile)
-pip install --no-deps .
+# Use python -m pip since pip command is not in PATH
+python -m pip install --no-deps .
 
 echo "=== dia2 fix complete ==="
