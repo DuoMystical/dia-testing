@@ -53,6 +53,12 @@ class ModelManager:
                 device_map=self.device,
             )
             logger.info(f"Model and processor loaded successfully. Model device: {self.model.device}")
+
+            # Apply torch.compile for 2-3x speedup on GPU
+            if self.device == "cuda":
+                logger.info("Applying torch.compile() optimization...")
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                logger.info("torch.compile() applied successfully")
         except Exception as e:
             logger.error(f"Error loading model or processor: {e}")
             raise
