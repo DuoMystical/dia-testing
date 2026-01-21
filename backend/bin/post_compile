@@ -1,0 +1,48 @@
+#!/bin/bash
+# Fix dia2 package - reinstall with all subpackages
+
+set -e
+echo "=== Fixing dia2 installation ==="
+
+# Clone dia2 repo
+cd /tmp
+rm -rf dia2
+git clone --depth 1 https://github.com/nari-labs/dia2.git
+cd dia2
+
+# Replace the broken setuptools config with working one
+cat > pyproject_fix.toml << 'EOF'
+[build-system]
+requires = ["setuptools>=70.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dia2"
+version = "0.1.0"
+description = "Dia2 CUDA-only text-to-speech runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Dia Contributors" }]
+license = { file = "LICENSE" }
+dependencies = [
+  "torch>=2.8.0",
+  "numpy>=2.1.0,<3.0",
+  "transformers>=4.55.3",
+  "safetensors==0.5.3",
+  "huggingface-hub>=0.24.7",
+  "sphn>=0.2.0",
+  "soundfile>=0.12.1",
+  "whisper-timestamped>=1.14.2",
+  "gradio>=4.44.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["dia2", "dia2.*"]
+EOF
+
+mv pyproject_fix.toml pyproject.toml
+
+# Reinstall with the fix (no-deps since deps already installed)
+pip install --no-deps .
+
+echo "=== dia2 fix complete ==="
