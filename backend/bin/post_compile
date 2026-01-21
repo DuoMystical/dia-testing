@@ -43,6 +43,6 @@ EOF
 mv pyproject_fix.toml pyproject.toml
 
 # Reinstall with the fix (no-deps since deps already installed)
-pip install --no-deps .
+uv pip install --no-deps .
 
 echo "=== dia2 fix complete ==="
