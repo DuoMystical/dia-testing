@@ -284,6 +284,11 @@ async def run_inference(request: GenerateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def parse_bool(value: str) -> bool:
+    """Parse string to boolean for form data."""
+    return value.lower() in ("true", "1", "yes", "on")
+
+
 @app.post("/api/generate-with-voice")
 async def run_inference_with_voice(
     text_input: str = Form(...),
@@ -294,9 +299,9 @@ async def run_inference_with_voice(
     text_top_k: int = Form(50),
     cfg_scale: float = Form(2.0),
     cfg_filter_k: int = Form(50),
-    use_cuda_graph: bool = Form(True),
-    use_torch_compile: bool = Form(False),
-    include_prefix: bool = Form(False),
+    use_cuda_graph: str = Form("true"),
+    use_torch_compile: str = Form("false"),
+    include_prefix: str = Form("false"),
     voice_s1: Optional[UploadFile] = File(None),
     voice_s2: Optional[UploadFile] = File(None),
 ):
@@ -346,12 +351,12 @@ async def run_inference_with_voice(
             text_top_k=text_top_k,
             cfg_scale=cfg_scale,
             cfg_filter_k=cfg_filter_k,
-            use_cuda_graph=use_cuda_graph,
-            use_torch_compile=use_torch_compile,
+            use_cuda_graph=parse_bool(use_cuda_graph),
+            use_torch_compile=parse_bool(use_torch_compile),
             output_path=str(output_filepath),
             prefix_speaker_1=str(voice_s1_path) if voice_s1_path else None,
             prefix_speaker_2=str(voice_s2_path) if voice_s2_path else None,
-            include_prefix=include_prefix,
+            include_prefix=parse_bool(include_prefix),
         )
 
         end_time = time.time()
