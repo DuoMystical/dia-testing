@@ -12,8 +12,8 @@
 	let error = $state<string | null>(null);
 	let statusMessage = $state<string | null>(null);
 
-	// Backend URL - premade Koyeb Dia backend
-	const BACKEND_URL = 'https://distinct-rosalie-covora-2ccf0de5.koyeb.app';
+	// Backend URL - custom optimized Koyeb Dia backend with torch.compile()
+	const BACKEND_URL = 'https://occasional-angel-puddle-6a36e6b8.koyeb.app';
 
 	async function generateAudio() {
 		if (!textInput.trim()) {
