@@ -16,6 +16,11 @@
 	let useCudaGraph = $state(true);
 	let useTorchCompile = $state(false);
 
+	// Voice prompts
+	let voiceS1 = $state<File | null>(null);
+	let voiceS2 = $state<File | null>(null);
+	let includePrefix = $state(false);
+
 	let isGenerating = $state(false);
 	let audioUrl = $state<string | null>(null);
 	let error = $state<string | null>(null);
@@ -23,8 +28,44 @@
 	let generationTime = $state<number | null>(null);
 	let modelUsed = $state<string | null>(null);
 
+	// Live timer
+	let elapsedTime = $state(0);
+	let timerInterval: ReturnType<typeof setInterval> | null = null;
+
 	// Backend URL - Dia2 backend with dual model support
 	const BACKEND_URL = 'https://occasional-angel-puddle-6a36e6b8.koyeb.app';
+
+	function startTimer() {
+		elapsedTime = 0;
+		timerInterval = setInterval(() => {
+			elapsedTime += 0.1;
+		}, 100);
+	}
+
+	function stopTimer() {
+		if (timerInterval) {
+			clearInterval(timerInterval);
+			timerInterval = null;
+		}
+	}
+
+	function handleVoiceS1(e: Event) {
+		const target = e.target as HTMLInputElement;
+		voiceS1 = target.files?.[0] || null;
+	}
+
+	function handleVoiceS2(e: Event) {
+		const target = e.target as HTMLInputElement;
+		voiceS2 = target.files?.[0] || null;
+	}
+
+	function clearVoiceS1() {
+		voiceS1 = null;
+	}
+
+	function clearVoiceS2() {
+		voiceS2 = null;
+	}
 
 	async function generateAudio() {
 		if (!textInput.trim()) {
@@ -38,31 +79,60 @@
 		generationTime = null;
 		modelUsed = null;
 		statusMessage = `Connecting to GPU server with Dia2-${selectedModel.toUpperCase()}...`;
+		startTimer();
 
 		// Use AbortController with 5 minute timeout for slow GPU processing
 		const controller = new AbortController();
 		const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutes
 
 		try {
-			const response = await fetch(`${BACKEND_URL}/api/generate`, {
-				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json'
-				},
-				body: JSON.stringify({
-					text_input: textInput,
-					model: selectedModel,
-					audio_temperature: audioTemperature,
-					audio_top_k: audioTopK,
-					text_temperature: textTemperature,
-					text_top_k: textTopK,
-					cfg_scale: cfgScale,
-					cfg_filter_k: cfgFilterK,
-					use_cuda_graph: useCudaGraph,
-					use_torch_compile: useTorchCompile
-				}),
-				signal: controller.signal
-			});
+			let response: Response;
+
+			// Use form data endpoint if voice files are provided
+			if (voiceS1 || voiceS2) {
+				const formData = new FormData();
+				formData.append('text_input', textInput);
+				formData.append('model', selectedModel);
+				formData.append('audio_temperature', audioTemperature.toString());
+				formData.append('audio_top_k', audioTopK.toString());
+				formData.append('text_temperature', textTemperature.toString());
+				formData.append('text_top_k', textTopK.toString());
+				formData.append('cfg_scale', cfgScale.toString());
+				formData.append('cfg_filter_k', cfgFilterK.toString());
+				formData.append('use_cuda_graph', useCudaGraph.toString());
+				formData.append('use_torch_compile', useTorchCompile.toString());
+				formData.append('include_prefix', includePrefix.toString());
+				if (voiceS1) formData.append('voice_s1', voiceS1);
+				if (voiceS2) formData.append('voice_s2', voiceS2);
+
+				statusMessage = `Generating with voice prompts using Dia2-${selectedModel.toUpperCase()}...`;
+				response = await fetch(`${BACKEND_URL}/api/generate-with-voice`, {
+					method: 'POST',
+					body: formData,
+					signal: controller.signal
+				});
+			} else {
+				// Use JSON endpoint for simple generation
+				response = await fetch(`${BACKEND_URL}/api/generate`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json'
+					},
+					body: JSON.stringify({
+						text_input: textInput,
+						model: selectedModel,
+						audio_temperature: audioTemperature,
+						audio_top_k: audioTopK,
+						text_temperature: textTemperature,
+						text_top_k: textTopK,
+						cfg_scale: cfgScale,
+						cfg_filter_k: cfgFilterK,
+						use_cuda_graph: useCudaGraph,
+						use_torch_compile: useTorchCompile
+					}),
+					signal: controller.signal
+				});
+			}
 
 			clearTimeout(timeoutId);
 			statusMessage = 'Processing audio...';
@@ -101,6 +171,7 @@
 			statusMessage = null;
 		} finally {
 			isGenerating = false;
+			stopTimer();
 			clearTimeout(timeoutId);
 		}
 	}
@@ -231,6 +302,45 @@
 						</div>
 					</div>
 				</div>
+
+				<!-- Voice Prompts -->
+				<div class="settings-section">
+					<h4>Voice Prompts (Optional)</h4>
+					<p class="section-hint">Upload voice samples to maintain speaker consistency</p>
+					<div class="voice-uploads">
+						<div class="voice-upload">
+							<label>Speaker 1 [S1] Voice</label>
+							{#if voiceS1}
+								<div class="voice-file">
+									<span>{voiceS1.name}</span>
+									<button type="button" class="clear-btn" onclick={clearVoiceS1}>×</button>
+								</div>
+							{:else}
+								<input type="file" accept=".wav,.mp3" onchange={handleVoiceS1} />
+							{/if}
+						</div>
+						<div class="voice-upload">
+							<label>Speaker 2 [S2] Voice</label>
+							{#if voiceS2}
+								<div class="voice-file">
+									<span>{voiceS2.name}</span>
+									<button type="button" class="clear-btn" onclick={clearVoiceS2}>×</button>
+								</div>
+							{:else}
+								<input type="file" accept=".wav,.mp3" onchange={handleVoiceS2} />
+							{/if}
+						</div>
+					</div>
+					{#if voiceS1 || voiceS2}
+						<div class="setting checkbox-setting" style="margin-top: 0.75rem;">
+							<label>
+								<input type="checkbox" bind:checked={includePrefix} />
+								Include prefix in output
+								<span class="opt-hint">Keep voice sample audio in result</span>
+							</label>
+						</div>
+					{/if}
+				</div>
 			</div>
 		</details>
 
@@ -239,7 +349,12 @@
 		</button>
 
 		{#if statusMessage}
-			<div class="status">{statusMessage}</div>
+			<div class="status">
+				{statusMessage}
+				{#if isGenerating}
+					<span class="timer">{elapsedTime.toFixed(1)}s</span>
+				{/if}
+			</div>
 		{/if}
 
 		{#if error}
@@ -541,5 +656,84 @@
 
 	.download-btn:hover {
 		background: #444;
+	}
+
+	.timer {
+		font-weight: 600;
+		font-size: 1.1rem;
+		margin-left: 0.5rem;
+		color: #aaffaa;
+	}
+
+	.voice-uploads {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 1rem;
+	}
+
+	.voice-upload {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.voice-upload label {
+		font-size: 0.9rem;
+		color: #aaa;
+	}
+
+	.voice-upload input[type="file"] {
+		font-size: 0.85rem;
+		color: #ccc;
+	}
+
+	.voice-upload input[type="file"]::file-selector-button {
+		padding: 8px 12px;
+		background: #333;
+		border: 1px solid #444;
+		border-radius: 6px;
+		color: #ccc;
+		cursor: pointer;
+		margin-right: 0.75rem;
+	}
+
+	.voice-upload input[type="file"]::file-selector-button:hover {
+		background: #444;
+	}
+
+	.voice-file {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding: 8px 12px;
+		background: #1a2a1a;
+		border: 1px solid #2a4a2a;
+		border-radius: 6px;
+		color: #88cc88;
+		font-size: 0.85rem;
+	}
+
+	.voice-file span {
+		flex: 1;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.clear-btn {
+		width: 24px;
+		height: 24px;
+		padding: 0;
+		background: #442222;
+		border: 1px solid #663333;
+		border-radius: 4px;
+		color: #ff8888;
+		font-size: 1rem;
+		line-height: 1;
+		cursor: pointer;
+	}
+
+	.clear-btn:hover {
+		background: #553333;
 	}
 </style>

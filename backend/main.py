@@ -1,8 +1,10 @@
 import logging
+import os
+import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import time
 from typing import Optional, List, Literal
@@ -20,6 +22,8 @@ logger = logging.getLogger(__name__)
 # Ensure directories exist
 AUDIO_DIR = Path("audio_files")
 AUDIO_DIR.mkdir(exist_ok=True)
+VOICE_DIR = Path("voice_uploads")
+VOICE_DIR.mkdir(exist_ok=True)
 
 # Set computation device
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -91,6 +95,10 @@ class Dia2ModelManager:
         use_cuda_graph: bool = True,
         use_torch_compile: bool = False,
         output_path: str = None,
+        # Voice prompts
+        prefix_speaker_1: str = None,
+        prefix_speaker_2: str = None,
+        include_prefix: bool = False,
     ):
         """Generate audio using the specified model with all Dia2 options."""
         from dia2 import GenerationConfig, SamplingConfig
@@ -112,6 +120,9 @@ class Dia2ModelManager:
             config=config,
             output_wav=output_path,
             verbose=True,
+            prefix_speaker_1=prefix_speaker_1,
+            prefix_speaker_2=prefix_speaker_2,
+            include_prefix=include_prefix,
         )
 
         return result
@@ -175,6 +186,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],  # Allow frontend to read all response headers
 )
 
 
@@ -270,3 +282,100 @@ async def run_inference(request: GenerateRequest):
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/generate-with-voice")
+async def run_inference_with_voice(
+    text_input: str = Form(...),
+    model: str = Form("2b"),
+    audio_temperature: float = Form(0.8),
+    audio_top_k: int = Form(50),
+    text_temperature: float = Form(0.6),
+    text_top_k: int = Form(50),
+    cfg_scale: float = Form(2.0),
+    cfg_filter_k: int = Form(50),
+    use_cuda_graph: bool = Form(True),
+    use_torch_compile: bool = Form(False),
+    include_prefix: bool = Form(False),
+    voice_s1: Optional[UploadFile] = File(None),
+    voice_s2: Optional[UploadFile] = File(None),
+):
+    """
+    Generate audio with optional voice prompts for speaker consistency.
+
+    - voice_s1: Optional voice sample for Speaker 1 [S1]
+    - voice_s2: Optional voice sample for Speaker 2 [S2]
+    - include_prefix: Whether to include the prefix audio in the output
+    """
+    if not text_input or text_input.isspace():
+        raise HTTPException(status_code=400, detail="Text input cannot be empty.")
+
+    output_filepath = AUDIO_DIR / f"{int(time.time())}_{model}.wav"
+
+    # Handle voice file uploads
+    voice_s1_path = None
+    voice_s2_path = None
+
+    try:
+        if voice_s1 and voice_s1.filename:
+            voice_s1_path = VOICE_DIR / f"{uuid.uuid4()}.wav"
+            with open(voice_s1_path, "wb") as f:
+                content = await voice_s1.read()
+                f.write(content)
+            logger.info(f"Saved voice S1 to {voice_s1_path}")
+
+        if voice_s2 and voice_s2.filename:
+            voice_s2_path = VOICE_DIR / f"{uuid.uuid4()}.wav"
+            with open(voice_s2_path, "wb") as f:
+                content = await voice_s2.read()
+                f.write(content)
+            logger.info(f"Saved voice S2 to {voice_s2_path}")
+
+        start_time = time.time()
+        logger.info(f"Starting generation with Dia2-{model.upper()}")
+        logger.info(f"Config: cfg_scale={cfg_scale}, audio_temp={audio_temperature}, text_temp={text_temperature}")
+        logger.info(f"Voice prompts: S1={voice_s1_path}, S2={voice_s2_path}")
+        logger.info(f"Text: {text_input[:100]}...")
+
+        model_manager.generate(
+            text=text_input,
+            model_size=model,
+            audio_temperature=audio_temperature,
+            audio_top_k=audio_top_k,
+            text_temperature=text_temperature,
+            text_top_k=text_top_k,
+            cfg_scale=cfg_scale,
+            cfg_filter_k=cfg_filter_k,
+            use_cuda_graph=use_cuda_graph,
+            use_torch_compile=use_torch_compile,
+            output_path=str(output_filepath),
+            prefix_speaker_1=str(voice_s1_path) if voice_s1_path else None,
+            prefix_speaker_2=str(voice_s2_path) if voice_s2_path else None,
+            include_prefix=include_prefix,
+        )
+
+        end_time = time.time()
+        generation_time = end_time - start_time
+        logger.info(f"Generation finished in {generation_time:.2f} seconds using Dia2-{model.upper()}")
+
+        return FileResponse(
+            path=str(output_filepath),
+            media_type="audio/wav",
+            filename=output_filepath.name,
+            headers={
+                "X-Generation-Time": str(generation_time),
+                "X-Model-Used": f"dia2-{model}",
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error during inference: {e}")
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up temporary voice files
+        if voice_s1_path and voice_s1_path.exists():
+            os.remove(voice_s1_path)
+        if voice_s2_path and voice_s2_path.exists():
+            os.remove(voice_s2_path)
