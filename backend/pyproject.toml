@@ -1,14 +1,21 @@
 [project]
 name = "backend"
-version = "0.1.0"
-description = "Add your description here"
+version = "2.0.0"
+description = "Dia2 TTS API with dual model support (1B and 2B)"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "fastapi[standard]>=0.128.0",
-    "numpy>=2.4.1",
+    "numpy>=2.1.0,<3.0",
     "pydantic>=2.12.5",
-    "soundfile>=0.13.1",
-    "torch>=2.9.1",
-    "transformers[torch]>=4.57.6",
+    "soundfile>=0.12.1",
+    "torch>=2.8.0",
+    "transformers>=4.55.3",
+    "safetensors>=0.5.3",
+    "huggingface-hub>=0.24.7",
+    "sphn>=0.2.0",
+    "dia2 @ git+https://github.com/nari-labs/dia2.git",
 ]
+
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/cu128"]
