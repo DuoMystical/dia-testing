@@ -42,7 +42,7 @@ EOF
 
 mv pyproject_fix.toml pyproject.toml
 
-# Reinstall with the fix (no-deps since deps already installed)
-uv pip install --system --no-deps .
+# Use pip directly instead of uv (uv has issues finding the venv in post_compile)
+pip install --no-deps .
 
 echo "=== dia2 fix complete ==="
