@@ -67,6 +67,8 @@
 		voiceS2 = null;
 	}
 
+	let currentWebSocket: WebSocket | null = null;
+
 	async function generateAudio() {
 		if (!textInput.trim()) {
 			error = 'Please enter some text';
@@ -81,58 +83,110 @@
 		statusMessage = `Connecting to GPU server with Dia2-${selectedModel.toUpperCase()}...`;
 		startTimer();
 
-		// Use AbortController with 5 minute timeout for slow GPU processing
-		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutes
+		// If voice files are provided, use HTTP endpoint (WebSocket doesn't support file uploads easily)
+		if (voiceS1 || voiceS2) {
+			await generateWithVoice();
+			return;
+		}
+
+		// Use WebSocket for streaming generation
+		const wsUrl = BACKEND_URL.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws/generate';
 
 		try {
-			let response: Response;
+			currentWebSocket = new WebSocket(wsUrl);
 
-			// Use form data endpoint if voice files are provided
-			if (voiceS1 || voiceS2) {
-				const formData = new FormData();
-				formData.append('text_input', textInput);
-				formData.append('model', selectedModel);
-				formData.append('audio_temperature', audioTemperature.toString());
-				formData.append('audio_top_k', audioTopK.toString());
-				formData.append('text_temperature', textTemperature.toString());
-				formData.append('text_top_k', textTopK.toString());
-				formData.append('cfg_scale', cfgScale.toString());
-				formData.append('cfg_filter_k', cfgFilterK.toString());
-				formData.append('use_cuda_graph', useCudaGraph.toString());
-				formData.append('use_torch_compile', useTorchCompile.toString());
-				formData.append('include_prefix', includePrefix.toString());
-				if (voiceS1) formData.append('voice_s1', voiceS1);
-				if (voiceS2) formData.append('voice_s2', voiceS2);
+			currentWebSocket.onopen = () => {
+				statusMessage = `Connected! Sending request to Dia2-${selectedModel.toUpperCase()}...`;
+				// Send generation parameters
+				currentWebSocket!.send(JSON.stringify({
+					text_input: textInput,
+					model: selectedModel,
+					audio_temperature: audioTemperature,
+					audio_top_k: audioTopK,
+					text_temperature: textTemperature,
+					text_top_k: textTopK,
+					cfg_scale: cfgScale,
+					cfg_filter_k: cfgFilterK,
+					use_cuda_graph: useCudaGraph,
+					use_torch_compile: useTorchCompile
+				}));
+			};
 
-				statusMessage = `Generating with voice prompts using Dia2-${selectedModel.toUpperCase()}...`;
-				response = await fetch(`${BACKEND_URL}/api/generate-with-voice`, {
-					method: 'POST',
-					body: formData,
-					signal: controller.signal
-				});
-			} else {
-				// Use JSON endpoint for simple generation
-				response = await fetch(`${BACKEND_URL}/api/generate`, {
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json'
-					},
-					body: JSON.stringify({
-						text_input: textInput,
-						model: selectedModel,
-						audio_temperature: audioTemperature,
-						audio_top_k: audioTopK,
-						text_temperature: textTemperature,
-						text_top_k: textTopK,
-						cfg_scale: cfgScale,
-						cfg_filter_k: cfgFilterK,
-						use_cuda_graph: useCudaGraph,
-						use_torch_compile: useTorchCompile
-					}),
-					signal: controller.signal
-				});
-			}
+			currentWebSocket.onmessage = (event) => {
+				const data = JSON.parse(event.data);
+
+				if (data.type === 'status') {
+					statusMessage = data.message;
+				} else if (data.type === 'audio') {
+					// Decode base64 audio
+					const binaryString = atob(data.data);
+					const bytes = new Uint8Array(binaryString.length);
+					for (let i = 0; i < binaryString.length; i++) {
+						bytes[i] = binaryString.charCodeAt(i);
+					}
+					const blob = new Blob([bytes], { type: 'audio/wav' });
+					audioUrl = URL.createObjectURL(blob);
+					generationTime = data.generation_time;
+					modelUsed = data.model;
+					statusMessage = null;
+					isGenerating = false;
+					stopTimer();
+					currentWebSocket?.close();
+				} else if (data.type === 'error') {
+					error = data.message;
+					statusMessage = null;
+					isGenerating = false;
+					stopTimer();
+					currentWebSocket?.close();
+				}
+			};
+
+			currentWebSocket.onerror = () => {
+				error = 'WebSocket connection failed. Server may be starting up.';
+				statusMessage = null;
+				isGenerating = false;
+				stopTimer();
+			};
+
+			currentWebSocket.onclose = () => {
+				currentWebSocket = null;
+			};
+
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'Failed to connect';
+			statusMessage = null;
+			isGenerating = false;
+			stopTimer();
+		}
+	}
+
+	async function generateWithVoice() {
+		// Use HTTP form data endpoint for voice prompts
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 300000);
+
+		try {
+			const formData = new FormData();
+			formData.append('text_input', textInput);
+			formData.append('model', selectedModel);
+			formData.append('audio_temperature', audioTemperature.toString());
+			formData.append('audio_top_k', audioTopK.toString());
+			formData.append('text_temperature', textTemperature.toString());
+			formData.append('text_top_k', textTopK.toString());
+			formData.append('cfg_scale', cfgScale.toString());
+			formData.append('cfg_filter_k', cfgFilterK.toString());
+			formData.append('use_cuda_graph', useCudaGraph.toString());
+			formData.append('use_torch_compile', useTorchCompile.toString());
+			formData.append('include_prefix', includePrefix.toString());
+			if (voiceS1) formData.append('voice_s1', voiceS1);
+			if (voiceS2) formData.append('voice_s2', voiceS2);
+
+			statusMessage = `Generating with voice prompts using Dia2-${selectedModel.toUpperCase()}...`;
+			const response = await fetch(`${BACKEND_URL}/api/generate-with-voice`, {
+				method: 'POST',
+				body: formData,
+				signal: controller.signal
+			});
 
 			clearTimeout(timeoutId);
 			statusMessage = 'Processing audio...';
@@ -150,7 +204,6 @@
 				throw new Error(errorMsg);
 			}
 
-			// Extract headers for generation info
 			const genTime = response.headers.get('X-Generation-Time');
 			const usedModel = response.headers.get('X-Model-Used');
 			if (genTime) generationTime = parseFloat(genTime);
@@ -172,7 +225,6 @@
 		} finally {
 			isGenerating = false;
 			stopTimer();
-			clearTimeout(timeoutId);
 		}
 	}
 

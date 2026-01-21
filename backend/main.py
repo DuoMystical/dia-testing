@@ -1,8 +1,11 @@
 import logging
 import os
 import uuid
+import base64
+import json
+import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -384,3 +387,112 @@ async def run_inference_with_voice(
             os.remove(voice_s1_path)
         if voice_s2_path and voice_s2_path.exists():
             os.remove(voice_s2_path)
+
+
+@app.websocket("/ws/generate")
+async def websocket_generate(websocket: WebSocket):
+    """
+    WebSocket endpoint for streaming generation with progress updates.
+
+    Client sends JSON with generation params, server sends:
+    - {"type": "status", "message": "...", "progress": 0-100}
+    - {"type": "audio", "data": "base64...", "generation_time": float, "model": str}
+    - {"type": "error", "message": "..."}
+    """
+    await websocket.accept()
+
+    try:
+        # Receive generation parameters
+        data = await websocket.receive_json()
+
+        text_input = data.get("text_input", "")
+        model_size = data.get("model", "2b")
+        audio_temperature = float(data.get("audio_temperature", 0.8))
+        audio_top_k = int(data.get("audio_top_k", 50))
+        text_temperature = float(data.get("text_temperature", 0.6))
+        text_top_k = int(data.get("text_top_k", 50))
+        cfg_scale = float(data.get("cfg_scale", 2.0))
+        cfg_filter_k = int(data.get("cfg_filter_k", 50))
+        use_cuda_graph = data.get("use_cuda_graph", True)
+        use_torch_compile = data.get("use_torch_compile", False)
+
+        if not text_input or text_input.isspace():
+            await websocket.send_json({"type": "error", "message": "Text input cannot be empty."})
+            await websocket.close()
+            return
+
+        # Send initial status
+        await websocket.send_json({
+            "type": "status",
+            "message": f"Starting generation with Dia2-{model_size.upper()}...",
+            "progress": 0
+        })
+
+        output_filepath = AUDIO_DIR / f"{int(time.time())}_{model_size}_ws.wav"
+
+        # Run generation in thread pool to not block the event loop
+        start_time = time.time()
+
+        await websocket.send_json({
+            "type": "status",
+            "message": "Loading model and processing text...",
+            "progress": 10
+        })
+
+        # Generate audio (blocking call, run in executor)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: model_manager.generate(
+                text=text_input,
+                model_size=model_size,
+                audio_temperature=audio_temperature,
+                audio_top_k=audio_top_k,
+                text_temperature=text_temperature,
+                text_top_k=text_top_k,
+                cfg_scale=cfg_scale,
+                cfg_filter_k=cfg_filter_k,
+                use_cuda_graph=use_cuda_graph,
+                use_torch_compile=use_torch_compile,
+                output_path=str(output_filepath),
+            )
+        )
+
+        end_time = time.time()
+        generation_time = end_time - start_time
+
+        await websocket.send_json({
+            "type": "status",
+            "message": "Encoding audio...",
+            "progress": 90
+        })
+
+        # Read and encode the audio file
+        with open(output_filepath, "rb") as f:
+            audio_bytes = f.read()
+
+        audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        # Send the audio data
+        await websocket.send_json({
+            "type": "audio",
+            "data": audio_base64,
+            "generation_time": generation_time,
+            "model": f"dia2-{model_size}"
+        })
+
+        logger.info(f"WebSocket generation completed in {generation_time:.2f}s using Dia2-{model_size.upper()}")
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
