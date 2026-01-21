@@ -1,6 +1,6 @@
 <script lang="ts">
 	let textInput = $state('');
-	let maxNewTokens = $state(1024);
+	let maxNewTokens = $state(512);
 	let cfgScale = $state(3.0);
 	let temperature = $state(1.3);
 	let topP = $state(0.95);
@@ -10,6 +10,7 @@
 	let isGenerating = $state(false);
 	let audioUrl = $state<string | null>(null);
 	let error = $state<string | null>(null);
+	let statusMessage = $state<string | null>(null);
 
 	// Backend URL - premade Koyeb Dia backend
 	const BACKEND_URL = 'https://distinct-rosalie-covora-2ccf0de5.koyeb.app';
@@ -23,6 +24,11 @@
 		isGenerating = true;
 		error = null;
 		audioUrl = null;
+		statusMessage = 'Connecting to GPU server (may take 30-60s if waking up)...';
+
+		// Use AbortController with 5 minute timeout for slow GPU processing
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutes
 
 		try {
 			const response = await fetch(`${BACKEND_URL}/api/generate`, {
@@ -38,20 +44,42 @@
 					top_p: topP,
 					cfg_filter_top_k: cfgFilterTopK,
 					speed_factor: speedFactor
-				})
+				}),
+				signal: controller.signal
 			});
 
+			clearTimeout(timeoutId);
+			statusMessage = 'Processing audio...';
+
 			if (!response.ok) {
-				const errorData = await response.json();
-				throw new Error(errorData.detail || 'Failed to generate audio');
+				let errorMsg = 'Failed to generate audio';
+				try {
+					const errorData = await response.json();
+					errorMsg = errorData.detail || errorMsg;
+				} catch {
+					if (response.status === 503) {
+						errorMsg = 'Server is starting up. Please wait 30-60 seconds and try again.';
+					}
+				}
+				throw new Error(errorMsg);
 			}
 
 			const blob = await response.blob();
+			if (blob.size < 100) {
+				throw new Error('Generated audio is empty. Try again.');
+			}
 			audioUrl = URL.createObjectURL(blob);
+			statusMessage = null;
 		} catch (e) {
-			error = e instanceof Error ? e.message : 'An error occurred';
+			if (e instanceof Error && e.name === 'AbortError') {
+				error = 'Request timed out. The GPU may be busy. Please try again.';
+			} else {
+				error = e instanceof Error ? e.message : 'An error occurred';
+			}
+			statusMessage = null;
 		} finally {
 			isGenerating = false;
+			clearTimeout(timeoutId);
 		}
 	}
 
@@ -120,6 +148,10 @@
 		<button onclick={generateAudio} disabled={isGenerating}>
 			{isGenerating ? 'Generating...' : 'Generate Audio'}
 		</button>
+
+		{#if statusMessage}
+			<div class="status">{statusMessage}</div>
+		{/if}
 
 		{#if error}
 			<div class="error">{error}</div>
@@ -252,6 +284,22 @@
 	button:disabled {
 		opacity: 0.6;
 		cursor: not-allowed;
+	}
+
+	.status {
+		margin-top: 1rem;
+		padding: 12px;
+		background: #1a2a1a;
+		border: 1px solid #2a4a2a;
+		border-radius: 8px;
+		color: #88cc88;
+		text-align: center;
+		animation: pulse 2s infinite;
+	}
+
+	@keyframes pulse {
+		0%, 100% { opacity: 1; }
+		50% { opacity: 0.6; }
 	}
 
 	.error {
