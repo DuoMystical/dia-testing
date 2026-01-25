@@ -95,7 +95,10 @@ async fn run_python_bridge(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Starting Python bridge: {}", bridge_path);
 
-    let mut child = Command::new("python")
+    // Use python3 for Ubuntu compatibility, or PYTHON_PATH env var if set
+    let python_cmd = std::env::var("PYTHON_PATH").unwrap_or_else(|_| "python3".to_string());
+
+    let mut child = Command::new(&python_cmd)
         .arg(bridge_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
