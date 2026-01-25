@@ -3,7 +3,7 @@
 # NOTE: Build context is repo root for Koyeb
 
 # Stage 1: Build Rust binary
-FROM rust:1.75-slim AS rust-builder
+FROM rust:1.82-slim AS rust-builder
 
 WORKDIR /app
 
