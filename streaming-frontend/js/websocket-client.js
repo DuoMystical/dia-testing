@@ -8,10 +8,12 @@ class WebSocketClient {
         this.url = options.url || this._getDefaultUrl();
         this.reconnectInterval = options.reconnectInterval || 3000;
         this.maxReconnectAttempts = options.maxReconnectAttempts || 10;
+        this.pingInterval = options.pingInterval || 30000; // 30 seconds
         this.reconnectAttempts = 0;
         this.socket = null;
         this.isConnected = false;
         this.sessionId = null;
+        this.pingTimer = null;
 
         // Event handlers
         this.onConnect = options.onConnect || (() => {});
@@ -59,6 +61,7 @@ class WebSocketClient {
 
     disconnect() {
         this.reconnectAttempts = this.maxReconnectAttempts; // Prevent reconnection
+        this._stopPing();
         if (this.socket) {
             this.socket.close();
             this.socket = null;
@@ -131,13 +134,31 @@ class WebSocketClient {
         console.log('WebSocket connected');
         this.isConnected = true;
         this.reconnectAttempts = 0;
+        this._startPing();
         this.onConnect(event);
+    }
+
+    _startPing() {
+        this._stopPing();
+        this.pingTimer = setInterval(() => {
+            if (this.isConnected) {
+                this.send({ type: 'ping' });
+            }
+        }, this.pingInterval);
+    }
+
+    _stopPing() {
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
+            this.pingTimer = null;
+        }
     }
 
     _handleClose(event) {
         console.log('WebSocket closed:', event.code, event.reason);
         this.isConnected = false;
         this.sessionId = null;
+        this._stopPing();
         this.onDisconnect(event);
 
         if (event.code !== 1000) { // Not a normal close

@@ -52,6 +52,9 @@ def emit_error(error: str):
 
 
 def main():
+    # Early diagnostic - sent immediately on startup
+    emit_status("TTS Bridge started", 0.0)
+
     # Read request from stdin
     try:
         request_line = sys.stdin.readline()
@@ -162,4 +165,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        emit_error(f"Fatal error: {e}")
+        print(traceback.format_exc(), file=sys.stderr)
