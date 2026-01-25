@@ -133,6 +133,7 @@ def main():
         # Generate with streaming
         event_count = 0
         audio_chunk_count = 0
+        print(f"Starting generate_stream with text: {text[:50]}...", file=sys.stderr)
         try:
             for event in model.generate_stream(
                 text,
@@ -141,20 +142,29 @@ def main():
                 verbose=False,
             ):
                 event_count += 1
+                print(f"Event #{event_count}: {type(event).__name__}", file=sys.stderr)
                 if isinstance(event, AudioChunkEvent):
                     audio_chunk_count += 1
+                    print(f"  AudioChunk: index={event.chunk_index}, data_len={len(event.audio_data)}", file=sys.stderr)
                     emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
                 elif isinstance(event, StatusEvent):
+                    print(f"  Status: {event.message}, progress={event.progress}", file=sys.stderr)
                     emit_status(event.message, event.progress)
                 elif isinstance(event, CompleteEvent):
+                    print(f"  Complete: total_chunks={event.total_chunks}, duration={event.total_duration_ms}ms", file=sys.stderr)
                     emit_complete(event.total_chunks, event.total_duration_ms)
                 elif isinstance(event, ErrorEvent):
+                    print(f"  Error: {event.error}", file=sys.stderr)
                     emit_error(event.error)
+                else:
+                    print(f"  Unknown event type: {type(event)}", file=sys.stderr)
         except Exception as e:
             import traceback
             emit_error(f"Streaming error after {event_count} events ({audio_chunk_count} audio chunks): {e}")
             print(traceback.format_exc(), file=sys.stderr)
             return
+
+        print(f"Generation complete: {event_count} total events, {audio_chunk_count} audio chunks", file=sys.stderr)
 
     except ImportError as e:
         emit_error(f"Failed to import dia2: {e}. Make sure dia2 is installed.")
