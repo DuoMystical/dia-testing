@@ -1,0 +1,215 @@
+VOICE-TO-VOICE STREAMING PIPELINE - FINAL CONFIGURATION v2
+===========================================================
+Last Updated: 2025-01-25
+Status: STT/VAD DECIDED - Ready for implementation
+
+================================================================================
+FINAL STACK DECISION
+================================================================================
+
+TTS: Dia2 2B
+------------
+- Model: nari-labs/Dia2-2B
+- Performance: ~2.5x realtime on A100
+- Streaming: TRUE streaming with small chunks (0.1-0.2 seconds)
+- Estimated latency: ~100-200ms to first audio chunk
+- Self-hosted on Koyeb A100
+
+STT: Nvidia Parakeet TDT 0.6B v3
+--------------------------------
+- Model: nvidia/parakeet-tdt-0.6b-v3
+- WER: 6.32% average (multilingual)
+  - Per-language: Italian 4.3%, Spanish 5.4%, English 6.1%, German 7.4%, French 7.7%
+- Languages: 25 European languages
+  - English, Spanish, Italian, French, German, Dutch, Russian, Polish,
+  - Ukrainian, Bulgarian, Finnish, Romanian, Croatian, Czech, Swedish,
+  - Estonian, Hungarian, Lithuanian, Danish, Maltese, Slovenian, Latvian,
+  - Greek, Slovak, Portuguese
+- Streaming: NATIVE (TDT architecture - Token-and-Duration Transducer)
+- Throughput: RTFx 3332 (extremely fast)
+- Noise robustness: 12.21% WER at -5dB SNR (better than Canary's 19.38%)
+- License: CC-BY-4.0 (FREE for commercial use)
+- Link: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+
+NOTE: Does NOT support Chinese or Asian languages. European languages only.
+
+VAD: TEN VAD
+------------
+- End-of-speech detection: ~10-50ms
+- Accuracy: Superior to Silero VAD
+- License: Apache 2.0 (FREE)
+- Link: https://huggingface.co/TEN-framework/ten-vad
+
+FUTURE EXPANSION: Picovoice Cobra VAD
+-------------------------------------
+- Accuracy: 98.9% TPR (best available, 12x fewer errors than Silero)
+- Cost: $6000+ for commercial use
+- Consider upgrading if VAD accuracy becomes a bottleneck
+- Link: https://picovoice.ai/platform/cobra/
+
+LLM: TBD
+--------
+- Requirements: Good at tool calls, system prompts
+- To be researched
+
+================================================================================
+LATENCY BUDGET
+================================================================================
+
+User stops speaking
+  + VAD detection:        ~10-50ms   (TEN VAD)
+  + STT finalization:     ~50-100ms  (Parakeet TDT native streaming)
+  + LLM processing:       TBD
+  + TTS first chunk:      ~100-200ms (Dia2 2B)
+  ─────────────────────────────────────
+  = Total (no LLM):       ~200-400ms before user hears audio
+
+================================================================================
+ARCHITECTURE
+================================================================================
+
+```
+User Speaks (Audio Input)
+    ↓
+VAD: TEN VAD (detects speech activity)
+    ↓
+STT: Parakeet TDT 0.6B v3 (native streaming transcription)
+    ↓
+VAD: TEN VAD (detects end of speech)
+    ↓
+[LLM processing - TBD]
+    ↓
+TTS: Dia2 2B generate_stream() (yields audio chunks)
+    ↓
+Rust WebSocket Server (port 8080)
+    ↓
+Frontend with Web Audio API
+    ↓
+User Hears Streaming Audio
+```
+
+================================================================================
+HARDWARE
+================================================================================
+
+Server: Koyeb A100 GPU
+- VRAM: 40GB or 80GB
+- Running: Dia2-2B (~10-15GB estimated)
+- STT: Parakeet TDT 0.6B v3 (~2-3GB estimated)
+- LLM: TBD
+- Plenty of headroom
+
+Performance:
+- Dia2 TTS: ~2.5x realtime
+- Parakeet STT: RTFx 3332 (extremely fast)
+- TEN VAD: Sub-millisecond processing
+
+================================================================================
+WHY THESE CHOICES
+================================================================================
+
+WHY PARAKEET TDT 0.6B V3 (not Canary or Whisper):
+- Best accuracy among streaming models: 6.32% WER vs Canary's 8.1%
+- Native streaming: TDT architecture, no chunking delay
+- Fastest throughput: RTFx 3332 vs Canary's 749
+- Better noise robustness: 12.21% vs 19.38% at -5dB
+- Free (CC-BY-4.0)
+
+WHY TEN VAD (not Silero):
+- Faster end-of-speech detection (Silero has ~200-300ms delay)
+- Better at detecting short pauses between speech segments
+- Free (Apache 2.0)
+
+================================================================================
+BENCHMARK SOURCES
+================================================================================
+
+| Model                  | Avg WER | RTFx   | Languages | Streaming      |
+|------------------------|---------|--------|-----------|----------------|
+| Parakeet TDT 0.6B v3   | 6.32%   | 3332   | 25 EU     | Native (TDT)   |
+| Canary 1B v2           | 8.1%    | 749    | 25 EU     | Chunked (NeMo) |
+| Whisper Large v3       | 9.9%    | ~100   | 99+       | Chunked        |
+
+Source: https://arxiv.org/html/2509.14128v1
+
+================================================================================
+KEY LINKS
+================================================================================
+
+STT:
+- Parakeet TDT 0.6B v3: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+- Paper: https://arxiv.org/html/2509.14128v1
+
+VAD:
+- TEN VAD: https://huggingface.co/TEN-framework/ten-vad
+
+TTS:
+- Dia2: https://github.com/nari-labs/dia2
+
+Koyeb:
+- Service: https://patient-nomi-misok-dd44cb73.koyeb.app/
+- Terminal: /terminal (admin/dia2dev)
+
+================================================================================
+ALTERNATIVE OPTIONS (for reference)
+================================================================================
+
+If more languages needed (99+):
+- Whisper Large v3 + TEN VAD
+- WER: 9.9% (worse than Parakeet)
+- Streaming: Chunked via faster-whisper
+
+If best VAD accuracy needed:
+- Picovoice Cobra
+- 98.9% TPR (vs TEN VAD which is "superior to Silero's 87.7%")
+- Cost: $6000+ commercial
+
+If translation needed (not just transcription):
+- Nvidia Canary 1B v2
+- Optimized for ASR + translation tasks
+- 8.1% WER, RTFx 749
+
+================================================================================
+IMPLEMENTATION TASKS
+================================================================================
+
+1. [ ] Implement Dia2 streaming modifications
+   - Modify dia2/generation.py (streaming types)
+   - Modify dia2/engine.py (generate_stream method)
+   - Modify dia2/runtime/generator.py (streaming loop)
+   - Chunk size: 0.1-0.2 seconds (8-15 frames at 75fps)
+
+2. [ ] Create Rust WebSocket streaming server
+   - Port 8080
+   - Bidirectional streaming
+   - Subprocess communication with Python
+
+3. [ ] Integrate Parakeet TDT 0.6B v3
+   - Install NeMo toolkit
+   - Configure native streaming inference
+   - Connect to Rust server
+
+4. [ ] Integrate TEN VAD
+   - Install ONNX runtime
+   - Configure end-of-speech detection
+   - Trigger TTS on speech end
+
+5. [ ] Select and integrate LLM
+   - Research models good at tool calls + system prompts
+   - Consider latency budget
+
+6. [ ] Create streaming frontend
+   - WebSocket client
+   - Web Audio API for playback
+   - Audio recording and streaming
+
+7. [ ] Test end-to-end
+   - Voice in → transcription → LLM → TTS → voice out
+
+8. [ ] Deploy to Koyeb
+   - Update Dockerfile
+   - BACKUP CODE REGULARLY
+
+================================================================================
+END OF NOTES
+================================================================================

@@ -248,6 +248,7 @@ async fn handle_text_message(
             }
         }
         Some("generate") => {
+            info!("Received 'generate' message");
             // Direct generation request (non-streaming input)
             let text_input = msg.get("text")
                 .or_else(|| msg.get("text_input"))
@@ -344,13 +345,17 @@ async fn start_streaming_generation(
         "message": "Starting generation",
         "progress": 0.0
     });
+    info!("Sending 'Starting generation' status to client");
     sender.send(Message::Text(starting.to_string())).await?;
 
     // Create TTS bridge and run
+    info!("Creating TTS bridge with path: {}", bridge_path);
     let bridge = TTSBridge::new(bridge_path);
 
+    info!("Calling bridge.generate_stream()");
     match bridge.generate_stream(request).await {
         Ok(mut event_stream) => {
+            info!("Bridge started successfully, entering keep-alive loop");
             // Keep-alive interval (30 seconds) to prevent infrastructure timeouts
             let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(30));
             let mut keepalive_count = 0u32;
@@ -362,6 +367,7 @@ async fn start_streaming_generation(
                     event = event_stream.recv() => {
                         match event {
                             Some(event) => {
+                                info!("Received TTS event: {:?}", std::mem::discriminant(&event));
                                 received_first_event = true;
 
                                 // Check if cancelled
@@ -425,6 +431,8 @@ async fn start_streaming_generation(
                             format!("Processing... ({}s)", keepalive_count * 30)
                         };
 
+                        info!("Sending keep-alive #{}: {}", keepalive_count, status_msg);
+
                         let keepalive = serde_json::json!({
                             "type": "status",
                             "message": status_msg,
@@ -433,6 +441,7 @@ async fn start_streaming_generation(
                         });
 
                         if sender.send(Message::Text(keepalive.to_string())).await.is_err() {
+                            warn!("Failed to send keep-alive, breaking loop");
                             break;
                         }
                     }

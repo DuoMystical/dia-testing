@@ -1,0 +1,180 @@
+VOICE-TO-VOICE STREAMING PIPELINE - FINAL CONFIGURATION
+========================================================
+Last Updated: 2025-01-25
+Status: STT/VAD DECIDED - Ready for implementation
+
+================================================================================
+FINAL STACK DECISION
+================================================================================
+
+TTS: Dia2 2B
+------------
+- Model: nari-labs/Dia2-2B
+- Performance: ~2.5x realtime on A100
+- Streaming: TRUE streaming with small chunks (0.1-0.2 seconds)
+- Self-hosted on Koyeb A100
+
+STT: Nvidia Canary 1B v2
+------------------------
+- Model: nvidia/canary-1b-v2
+- WER: 3-5% (best accuracy for European languages)
+- Languages: 25 European languages
+  - English, Spanish, Italian, French, German, Dutch, Russian, Polish,
+  - Ukrainian, Bulgarian, Finnish, Romanian, Croatian, Czech, Swedish,
+  - Estonian, Hungarian, Lithuanian, Danish, Maltese, Slovenian, Latvian,
+  - Greek, Slovak, Portuguese
+- Streaming: Yes, via NeMo (chunked + streaming policies)
+- License: CC-BY-4.0 (FREE for commercial use)
+- Link: https://huggingface.co/nvidia/canary-1b-v2
+
+NOTE: Does NOT support Chinese or Asian languages. European languages only.
+
+VAD: TEN VAD
+------------
+- End-of-speech detection: Fastest (rapid speech-to-silence transitions)
+- Accuracy: Superior to Silero VAD
+- License: Apache 2.0 (FREE)
+- Link: https://huggingface.co/TEN-framework/ten-vad
+
+FUTURE EXPANSION: Picovoice Cobra VAD
+-------------------------------------
+- Accuracy: 98.9% TPR (best available, 12x fewer errors than Silero)
+- Cost: $6000+ for commercial use
+- Consider upgrading if VAD accuracy becomes a bottleneck
+- Link: https://picovoice.ai/platform/cobra/
+
+================================================================================
+ARCHITECTURE
+================================================================================
+
+```
+User Speaks (Audio Input)
+    ↓
+STT: Nvidia Canary 1B v2 (streaming transcription)
+    ↓
+VAD: TEN VAD (detects end of speech)
+    ↓
+[Optional: LLM processing]
+    ↓
+TTS: Dia2 2B generate_stream() (yields audio chunks)
+    ↓
+Rust WebSocket Server (port 8080)
+    ↓
+Frontend with Web Audio API
+    ↓
+User Hears Streaming Audio
+```
+
+================================================================================
+HARDWARE
+================================================================================
+
+Server: Koyeb A100 GPU
+- VRAM: 40GB or 80GB
+- Running: Dia2-2B (~10-15GB estimated)
+- STT: Canary 1B v2 (~6GB)
+- Plenty of headroom
+
+Performance:
+- Dia2 TTS: ~2.5x realtime (the bottleneck)
+- Canary STT: Much faster than 2.5x realtime
+- TEN VAD: Sub-millisecond processing
+
+================================================================================
+WHY THESE CHOICES
+================================================================================
+
+WHY CANARY 1B V2 (not Whisper):
+- Better accuracy: 3-5% WER vs Whisper's ~7%
+- Native streaming support via NeMo
+- 25 languages covers European needs
+- Free (CC-BY-4.0)
+
+WHY TEN VAD (not Silero):
+- Faster end-of-speech detection (Silero has ~200-300ms delay)
+- Better at detecting short pauses between speech segments
+- Free (Apache 2.0)
+
+WHY NOT WHISPER:
+- Lower accuracy (~7% vs 3-5%)
+- No native streaming (requires chunked workaround)
+- Only advantage is more languages (99+) - not needed for European focus
+
+================================================================================
+IMPLEMENTATION TASKS
+================================================================================
+
+1. [ ] Implement Dia2 streaming modifications
+   - Modify dia2/generation.py (streaming types)
+   - Modify dia2/engine.py (generate_stream method)
+   - Modify dia2/runtime/generator.py (streaming loop)
+   - Chunk size: 0.1-0.2 seconds (8-15 frames at 75fps)
+
+2. [ ] Create Rust WebSocket streaming server
+   - Port 8080
+   - Bidirectional streaming
+   - Subprocess communication with Python
+
+3. [ ] Integrate Canary 1B v2
+   - Install NeMo toolkit
+   - Configure streaming inference
+   - Connect to Rust server
+
+4. [ ] Integrate TEN VAD
+   - Install ONNX runtime
+   - Configure end-of-speech detection
+   - Trigger TTS on speech end
+
+5. [ ] Create streaming frontend
+   - WebSocket client
+   - Web Audio API for playback
+   - Audio recording and streaming
+
+6. [ ] Test end-to-end
+   - Voice in → transcription → TTS → voice out
+
+7. [ ] Deploy to Koyeb
+   - Update Dockerfile
+   - BACKUP CODE REGULARLY
+
+================================================================================
+KEY LINKS
+================================================================================
+
+STT:
+- Canary 1B v2: https://huggingface.co/nvidia/canary-1b-v2
+- NeMo Streaming Docs: https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/streaming_decoding/canary_chunked_and_streaming_decoding.html
+
+VAD:
+- TEN VAD: https://huggingface.co/TEN-framework/ten-vad
+
+TTS:
+- Dia2: https://github.com/nari-labs/dia2
+
+Koyeb:
+- Service: https://patient-nomi-misok-dd44cb73.koyeb.app/
+- Terminal: /terminal (admin/dia2dev)
+
+================================================================================
+ALTERNATIVE OPTIONS (for reference)
+================================================================================
+
+If more languages needed (99+):
+- Whisper Large v3 + TEN VAD
+- WER: ~7% (worse than Canary)
+- Streaming: Chunked via faster-whisper
+
+If best VAD accuracy needed:
+- Picovoice Cobra
+- 98.9% TPR (vs TEN VAD which is "superior to Silero's 87.7%")
+- Cost: $6000+ commercial
+
+If fastest streaming needed:
+- Nvidia Parakeet TDT 0.6B v3
+- Native streaming architecture
+- Same 25 European languages
+- Slightly lower accuracy than Canary
+
+================================================================================
+END OF NOTES
+================================================================================
