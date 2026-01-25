@@ -36,10 +36,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const cfgScaleInput = document.getElementById('cfg-scale');
     const chunkSizeInput = document.getElementById('chunk-size');
 
+    // Timer elements
+    const generationTimer = document.getElementById('generation-timer');
+    const firstAudioTime = document.getElementById('first-audio-time');
+
     // State
     let isGenerating = false;
     let wsClient = null;
     let audioStreamer = null;
+
+    // Timer state
+    let generationStartTime = null;
+    let timerInterval = null;
+    let firstChunkTime = null;
 
     // Initialize WebSocket client
     function initWebSocket() {
@@ -87,8 +96,47 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // Timer functions
+    function startTimer() {
+        generationStartTime = performance.now();
+        firstChunkTime = null;
+        generationTimer.textContent = '0.0s';
+        firstAudioTime.hidden = true;
+
+        timerInterval = setInterval(() => {
+            if (generationStartTime) {
+                const elapsed = (performance.now() - generationStartTime) / 1000;
+                generationTimer.textContent = `${elapsed.toFixed(1)}s`;
+            }
+        }, 100);
+    }
+
+    function stopTimer() {
+        if (timerInterval) {
+            clearInterval(timerInterval);
+            timerInterval = null;
+        }
+        // Show final time
+        if (generationStartTime) {
+            const elapsed = (performance.now() - generationStartTime) / 1000;
+            generationTimer.textContent = `${elapsed.toFixed(1)}s`;
+        }
+    }
+
+    function recordFirstChunk() {
+        if (!firstChunkTime && generationStartTime) {
+            firstChunkTime = performance.now();
+            const timeToFirst = (firstChunkTime - generationStartTime) / 1000;
+            firstAudioTime.textContent = `First audio: ${timeToFirst.toFixed(1)}s`;
+            firstAudioTime.hidden = false;
+        }
+    }
+
     // Handle audio chunk received
     async function handleAudioChunk(chunk) {
+        // Record time to first chunk
+        recordFirstChunk();
+
         const duration = await audioStreamer.addChunk(chunk.data, chunk.chunkIndex);
 
         // Update UI
@@ -109,13 +157,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Handle generation complete
     function handleComplete(result) {
-        progressText.textContent = `Complete! ${result.totalChunks} chunks, ${(result.totalDurationMs / 1000).toFixed(1)}s total`;
+        stopTimer();
+        const genTime = generationStartTime ? ((performance.now() - generationStartTime) / 1000).toFixed(1) : '?';
+        progressText.textContent = `Complete! ${result.totalChunks} chunks, ${(result.totalDurationMs / 1000).toFixed(1)}s audio in ${genTime}s`;
         progressBar.style.width = '100%';
         setGenerating(false);
     }
 
     // Handle errors
     function handleError(error) {
+        stopTimer();
         console.error('Error:', error);
         progressText.textContent = `Error: ${error.message}`;
         setGenerating(false);
@@ -230,6 +281,9 @@ document.addEventListener('DOMContentLoaded', () => {
         chunksCount.textContent = '0 chunks';
         audioDuration.textContent = '0.0s audio';
 
+        // Start the generation timer
+        startTimer();
+
         setGenerating(true);
 
         const options = {
@@ -251,6 +305,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Cancel button click
     function handleCancel() {
+        stopTimer();
         wsClient.cancel();
         setGenerating(false);
     }

@@ -56,6 +56,10 @@
             </section>
 
             <section class="progress-section" id="progress-section" hidden>
+                <div class="timer-display">
+                    <span class="timer-label">Generation Time:</span>
+                    <span id="generation-timer" class="timer-value">0.0s</span>
+                </div>
                 <div class="progress-bar-container">
                     <div class="progress-bar" id="progress-bar"></div>
                 </div>
@@ -63,6 +67,7 @@
                 <div class="stats">
                     <span id="chunks-count">0 chunks</span>
                     <span id="audio-duration">0.0s audio</span>
+                    <span id="first-audio-time" class="first-audio-stat" hidden>First audio: --</span>
                 </div>
             </section>
 
