@@ -26,14 +26,14 @@ use tts_bridge::{TTSBridge, TTSEvent, TTSRequest};
 /// Application state shared across all connections
 pub struct AppState {
     session_manager: SessionManager,
-    python_bridge_path: String,
+    tts_bridge: TTSBridge,
 }
 
 impl AppState {
     pub fn new(python_bridge_path: String) -> Self {
         Self {
             session_manager: SessionManager::new(),
-            python_bridge_path,
+            tts_bridge: TTSBridge::new(&python_bridge_path),
         }
     }
 }
@@ -116,12 +116,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<RwLock<AppState>>) {
         state_guard.session_manager.add_session(&session_id);
     }
 
-    // Get bridge path
-    let bridge_path = {
-        let state_guard = state.read().await;
-        state_guard.python_bridge_path.clone()
-    };
-
     // Text buffer for bidirectional streaming
     let text_buffer = Arc::new(RwLock::new(String::new()));
     let generation_active = Arc::new(RwLock::new(false));
@@ -146,7 +140,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<RwLock<AppState>>) {
                             &text,
                             &mut sender,
                             &session_id,
-                            &bridge_path,
+                            &state,
                             &text_buffer,
                             &generation_active,
                         ).await {
@@ -193,7 +187,7 @@ async fn handle_text_message(
     text: &str,
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     session_id: &str,
-    bridge_path: &str,
+    state: &Arc<RwLock<AppState>>,
     text_buffer: &Arc<RwLock<String>>,
     generation_active: &Arc<RwLock<bool>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -242,7 +236,7 @@ async fn handle_text_message(
                     request,
                     sender,
                     session_id,
-                    bridge_path,
+                    state,
                     generation_active,
                 ).await?;
             }
@@ -275,7 +269,7 @@ async fn handle_text_message(
                 request,
                 sender,
                 session_id,
-                bridge_path,
+                state,
                 generation_active,
             ).await?;
         }
@@ -309,12 +303,12 @@ async fn handle_text_message(
     Ok(())
 }
 
-/// Start streaming generation via Python subprocess
+/// Start streaming generation via persistent Python subprocess
 async fn start_streaming_generation(
     request: TTSRequest,
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     session_id: &str,
-    bridge_path: &str,
+    state: &Arc<RwLock<AppState>>,
     generation_active: &Arc<RwLock<bool>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Check if already generating
@@ -348,12 +342,14 @@ async fn start_streaming_generation(
     info!("Sending 'Starting generation' status to client");
     sender.send(Message::Text(starting.to_string())).await?;
 
-    // Create TTS bridge and run
-    info!("Creating TTS bridge with path: {}", bridge_path);
-    let bridge = TTSBridge::new(bridge_path);
+    // Use the shared persistent TTS bridge
+    let event_stream = {
+        let state_guard = state.read().await;
+        info!("Using persistent TTS bridge");
+        state_guard.tts_bridge.generate_stream(request).await
+    };
 
-    info!("Calling bridge.generate_stream()");
-    match bridge.generate_stream(request).await {
+    match event_stream {
         Ok(mut event_stream) => {
             info!("Bridge started successfully, entering keep-alive loop");
             // Keep-alive interval (30 seconds) to prevent infrastructure timeouts

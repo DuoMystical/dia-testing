@@ -66,8 +66,21 @@ class AudioStreamer {
         }
 
         try {
+            // Debug: log chunk info
+            console.log(`[AudioStreamer] Adding chunk ${chunkIndex}, data size: ${wavData.byteLength} bytes`);
+
+            // Validate WAV header
+            const view = new DataView(wavData);
+            const riff = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+            if (riff !== 'RIFF') {
+                console.error(`[AudioStreamer] Invalid WAV header: expected RIFF, got ${riff}`);
+                return 0;
+            }
+
             // Decode the WAV data
             const audioBuffer = await this.audioContext.decodeAudioData(wavData.slice(0));
+
+            console.log(`[AudioStreamer] Chunk ${chunkIndex} decoded: ${audioBuffer.duration.toFixed(3)}s, ${audioBuffer.sampleRate}Hz`);
 
             this.chunks.push({
                 buffer: audioBuffer,
@@ -80,12 +93,19 @@ class AudioStreamer {
 
             // Auto-play if enabled and this is the first chunk
             if (this.autoPlay && this.chunks.length === 1 && !this.isPlaying) {
+                console.log('[AudioStreamer] Auto-playing first chunk');
                 this.play();
             }
 
             return audioBuffer.duration;
         } catch (error) {
-            console.error('Failed to decode audio chunk:', error);
+            console.error(`[AudioStreamer] Failed to decode chunk ${chunkIndex}:`, error);
+            console.error('[AudioStreamer] Data size:', wavData.byteLength);
+            // Log first few bytes for debugging
+            if (wavData.byteLength > 0) {
+                const bytes = new Uint8Array(wavData.slice(0, 16));
+                console.error('[AudioStreamer] First 16 bytes:', Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' '));
+            }
             return 0;
         }
     }
@@ -98,18 +118,23 @@ class AudioStreamer {
             await this.init();
         }
 
+        console.log(`[AudioStreamer] play() called, audioContext.state: ${this.audioContext.state}, chunks: ${this.chunks.length}`);
+
         // Resume audio context if suspended
         if (this.audioContext.state === 'suspended') {
+            console.log('[AudioStreamer] Resuming suspended AudioContext');
             await this.audioContext.resume();
         }
 
         if (this.isPaused) {
             // Resume from pause
+            console.log('[AudioStreamer] Resuming from pause');
             this.isPaused = false;
             this.isPlaying = true;
             this._playFromIndex(this.currentChunkIndex, this.pauseTime);
         } else if (!this.isPlaying) {
             // Start fresh
+            console.log('[AudioStreamer] Starting fresh playback');
             this.isPlaying = true;
             this.currentChunkIndex = 0;
             this._playFromIndex(0, 0);
@@ -235,7 +260,10 @@ class AudioStreamer {
      * Internal: Play from a specific chunk index
      */
     _playFromIndex(index, timeOffset = 0) {
+        console.log(`[AudioStreamer] _playFromIndex(${index}), chunks available: ${this.chunks.length}`);
+
         if (index >= this.chunks.length) {
+            console.log('[AudioStreamer] No more chunks to play, ending playback');
             this.isPlaying = false;
             this.onPlaybackEnd();
             this._stopUpdateLoop();
@@ -245,6 +273,8 @@ class AudioStreamer {
         const chunk = this.chunks[index];
         this.currentChunkIndex = index;
 
+        console.log(`[AudioStreamer] Playing chunk ${index}, duration: ${chunk.duration.toFixed(3)}s`);
+
         // Create source for this chunk
         this.currentSource = this.audioContext.createBufferSource();
         this.currentSource.buffer = chunk.buffer;
@@ -252,6 +282,7 @@ class AudioStreamer {
 
         // Handle chunk end
         this.currentSource.onended = () => {
+            console.log(`[AudioStreamer] Chunk ${index} ended`);
             if (this.isPlaying && !this.isPaused) {
                 chunk.played = true;
                 this._playFromIndex(index + 1, 0);

@@ -2,16 +2,24 @@
 """
 TTS Bridge for Dia2 Streaming Server
 
-This script is called by the Rust WebSocket server via subprocess.
-It reads a JSON request from stdin, generates audio using Dia2's streaming API,
-and outputs JSON events to stdout.
+This script runs as a persistent process, keeping the model loaded between requests.
+It reads JSON requests from stdin (one per line) and outputs JSON events to stdout.
+
+Protocol:
+- Each request is a single JSON line on stdin
+- Each response event is a single JSON line on stdout
+- A "complete" or "error" event signals end of a request
 """
 
 import json
 import sys
 import base64
+import signal
 
-# Note: dia2 is installed via pip in the Docker image, no need to add to path
+# Global model state
+_model = None
+_device = None
+_model_size = None
 
 
 def emit_event(event: dict):
@@ -51,24 +59,50 @@ def emit_error(error: str):
     })
 
 
-def main():
-    # Early diagnostic - sent immediately on startup
-    emit_status("TTS Bridge started", 0.0)
+def load_model(model_size: str):
+    """Load or reload the model if needed."""
+    global _model, _device, _model_size
 
-    # Read request from stdin
-    try:
-        request_line = sys.stdin.readline()
-        if not request_line:
-            emit_error("No input received")
-            return
+    import torch
+    from dia2 import Dia2
 
-        request = json.loads(request_line)
-    except json.JSONDecodeError as e:
-        emit_error(f"Invalid JSON input: {e}")
-        return
-    except Exception as e:
-        emit_error(f"Error reading input: {e}")
-        return
+    # Determine device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = "bfloat16" if device == "cuda" else "float32"
+
+    # Check if model needs to be loaded
+    if _model is not None and _model_size == model_size and _device == device:
+        emit_status("Model already loaded", 0.2)
+        return _model
+
+    emit_status(f"Loading Dia2-{model_size.upper()} on {device}...", 0.1)
+
+    # Get model repo
+    model_repo = f"nari-labs/Dia2-{model_size.upper()}"
+
+    # Load model
+    model = Dia2.from_repo(model_repo, device=device, dtype=dtype)
+
+    # Store globally
+    _model = model
+    _device = device
+    _model_size = model_size
+
+    emit_status("Model loaded", 0.2)
+    return model
+
+
+def process_request(request: dict):
+    """Process a single TTS request."""
+    from dia2 import (
+        GenerationConfig,
+        SamplingConfig,
+        StreamingConfig,
+        AudioChunkEvent,
+        StatusEvent,
+        CompleteEvent,
+        ErrorEvent,
+    )
 
     text = request.get("text", "")
     model_size = request.get("model_size", "2b")
@@ -78,34 +112,11 @@ def main():
         emit_error("Text input is required")
         return
 
-    emit_status("Loading Dia2 model...", 0.0)
-
     try:
-        import torch
-        from dia2 import (
-            Dia2,
-            GenerationConfig,
-            SamplingConfig,
-            StreamingConfig,
-            AudioChunkEvent,
-            StatusEvent,
-            CompleteEvent,
-            ErrorEvent,
-        )
+        # Load model (will be fast if already loaded)
+        model = load_model(model_size)
 
-        # Determine device
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = "bfloat16" if device == "cuda" else "float32"
-
-        emit_status(f"Loading Dia2-{model_size.upper()} on {device}...", 0.1)
-
-        # Get model repo
-        model_repo = f"nari-labs/Dia2-{model_size.upper()}"
-
-        # Load model
-        model = Dia2.from_repo(model_repo, device=device, dtype=dtype)
-
-        emit_status("Model loaded, starting generation...", 0.2)
+        emit_status("Starting generation...", 0.2)
 
         # Build generation config
         gen_config = GenerationConfig(
@@ -119,8 +130,8 @@ def main():
             ),
             cfg_scale=config_overrides.get("cfg_scale", 2.0),
             cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
-            use_cuda_graph=True,  # Now enabled for streaming with CUDA graph support
-            use_torch_compile=False,  # torch_compile adds overhead, cuda_graph alone is fastest
+            use_cuda_graph=True,
+            use_torch_compile=False,
         )
 
         # Streaming config - small chunks for responsive streaming
@@ -131,47 +142,74 @@ def main():
         )
 
         # Generate with streaming
-        event_count = 0
-        audio_chunk_count = 0
-        print(f"Starting generate_stream with text: {text[:50]}...", file=sys.stderr)
+        for event in model.generate_stream(
+            text,
+            config=gen_config,
+            streaming_config=streaming_config,
+            verbose=False,
+        ):
+            if isinstance(event, AudioChunkEvent):
+                emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
+            elif isinstance(event, StatusEvent):
+                emit_status(event.message, event.progress)
+            elif isinstance(event, CompleteEvent):
+                emit_complete(event.total_chunks, event.total_duration_ms)
+            elif isinstance(event, ErrorEvent):
+                emit_error(event.error)
+
+    except Exception as e:
+        import traceback
+        emit_error(f"Generation error: {e}")
+        print(traceback.format_exc(), file=sys.stderr)
+
+
+def main():
+    """Main loop - process requests from stdin."""
+    emit_status("TTS Bridge starting...", 0.0)
+
+    # Handle SIGTERM gracefully
+    def handle_signal(signum, frame):
+        print("Received shutdown signal", file=sys.stderr)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    # Import heavy modules upfront
+    try:
+        import torch
+        from dia2 import Dia2
+        emit_status("TTS Bridge ready", 0.0)
+    except ImportError as e:
+        emit_error(f"Failed to import required modules: {e}")
+        return
+
+    # Main request loop
+    while True:
         try:
-            for event in model.generate_stream(
-                text,
-                config=gen_config,
-                streaming_config=streaming_config,
-                verbose=False,
-            ):
-                event_count += 1
-                print(f"Event #{event_count}: {type(event).__name__}", file=sys.stderr)
-                if isinstance(event, AudioChunkEvent):
-                    audio_chunk_count += 1
-                    print(f"  AudioChunk: index={event.chunk_index}, data_len={len(event.audio_data)}", file=sys.stderr)
-                    emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
-                elif isinstance(event, StatusEvent):
-                    print(f"  Status: {event.message}, progress={event.progress}", file=sys.stderr)
-                    emit_status(event.message, event.progress)
-                elif isinstance(event, CompleteEvent):
-                    print(f"  Complete: total_chunks={event.total_chunks}, duration={event.total_duration_ms}ms", file=sys.stderr)
-                    emit_complete(event.total_chunks, event.total_duration_ms)
-                elif isinstance(event, ErrorEvent):
-                    print(f"  Error: {event.error}", file=sys.stderr)
-                    emit_error(event.error)
-                else:
-                    print(f"  Unknown event type: {type(event)}", file=sys.stderr)
+            line = sys.stdin.readline()
+            if not line:
+                # EOF - stdin closed
+                break
+
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError as e:
+                emit_error(f"Invalid JSON: {e}")
+                continue
+
+            process_request(request)
+
+        except KeyboardInterrupt:
+            break
         except Exception as e:
             import traceback
-            emit_error(f"Streaming error after {event_count} events ({audio_chunk_count} audio chunks): {e}")
+            emit_error(f"Unexpected error: {e}")
             print(traceback.format_exc(), file=sys.stderr)
-            return
-
-        print(f"Generation complete: {event_count} total events, {audio_chunk_count} audio chunks", file=sys.stderr)
-
-    except ImportError as e:
-        emit_error(f"Failed to import dia2: {e}. Make sure dia2 is installed.")
-    except Exception as e:
-        emit_error(f"Generation error: {e}")
-        import traceback
-        print(traceback.format_exc(), file=sys.stderr)
 
 
 if __name__ == "__main__":

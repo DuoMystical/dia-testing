@@ -161,7 +161,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const genTime = generationStartTime ? ((performance.now() - generationStartTime) / 1000).toFixed(1) : '?';
         progressText.textContent = `Complete! ${result.totalChunks} chunks, ${(result.totalDurationMs / 1000).toFixed(1)}s audio in ${genTime}s`;
         progressBar.style.width = '100%';
-        setGenerating(false);
+        // Keep progress section visible so user can see results and play audio
+        setGenerating(false, true);
     }
 
     // Handle errors
@@ -173,11 +174,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Set generating state
-    function setGenerating(generating) {
+    function setGenerating(generating, keepProgressVisible = false) {
         isGenerating = generating;
         generateBtn.disabled = generating || !wsClient?.isConnected;
         cancelBtn.disabled = !generating;
-        progressSection.hidden = !generating;
+        // Only hide progress section if explicitly requested (not after completion)
+        if (!keepProgressVisible) {
+            progressSection.hidden = !generating;
+        }
     }
 
     // Add chunk indicator to list
