@@ -10,10 +10,8 @@ and outputs JSON events to stdout.
 import json
 import sys
 import base64
-import os
 
-# Add dia2-src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'dia2-src'))
+# Note: dia2 is installed via pip in the Docker image, no need to add to path
 
 
 def emit_event(event: dict):
