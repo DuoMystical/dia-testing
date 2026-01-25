@@ -116,8 +116,8 @@ def main():
             ),
             cfg_scale=config_overrides.get("cfg_scale", 2.0),
             cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
-            use_cuda_graph=False,  # Disabled for streaming
-            use_torch_compile=config_overrides.get("use_torch_compile", False),
+            use_cuda_graph=True,  # Now enabled for streaming with CUDA graph support
+            use_torch_compile=False,  # torch_compile adds overhead, cuda_graph alone is fastest
         )
 
         # Streaming config - small chunks for responsive streaming

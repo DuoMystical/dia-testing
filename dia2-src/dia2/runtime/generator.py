@@ -541,8 +541,8 @@ def run_streaming_generation_loop(
     eos_cutoff: Optional[int] = None
     last_step = start_step - 1
 
-    # Disable CUDA graph for streaming to allow incremental decoding
-    use_graph = False
+    # Enable CUDA graph for streaming - it works with periodic audio decoding
+    use_graph = config.use_cuda_graph and runtime.device.type == "cuda"
     use_torch_compile = config.use_torch_compile and runtime.device.type == "cuda"
     transformer_needs_compiling = use_torch_compile
     depformer_needs_compiling = [use_torch_compile] * runtime.model.depformer.num_depth
@@ -558,6 +558,12 @@ def run_streaming_generation_loop(
     depformer_step = runtime.depformer_step
     buffers = _allocate_network_buffers(runtime, branches)
     positions_view = positions.expand(branches, -1)
+
+    # CUDA graph state for streaming
+    transformer_capture = None
+    dep_captures: list[dict] | None = None
+    if use_graph:
+        _ensure_graph_cublas_ready(runtime.device)
 
     # Streaming state
     chunk_size = streaming_config.chunk_size_frames
@@ -594,22 +600,35 @@ def run_streaming_generation_loop(
                     step_tokens[1:, 0, 0] = token_ids.zero
                     step_tokens[1:, 1, 0] = token_ids.pad
 
-                # Transformer step
-                if transformer_needs_compiling:
-                    transformer_step = torch.compile(
-                        runtime.transformer_step,
-                        dynamic=True,
-                        mode="max-autotune-no-cudagraphs",
+                # Transformer step - use CUDA graph if enabled
+                if transformer_needs_compiling or not use_graph:
+                    if transformer_needs_compiling:
+                        transformer_step = torch.compile(
+                            runtime.transformer_step,
+                            dynamic=True,
+                            mode="max-autotune-no-cudagraphs",
+                        )
+                        transformer_needs_compiling = False
+                    hidden_t = _execute_transformer_step(
+                        step_tokens,
+                        positions_view,
+                        generation,
+                        transformer_step,
+                        buffers,
                     )
-                    transformer_needs_compiling = False
-
-                hidden_t = _execute_transformer_step(
-                    step_tokens,
-                    positions_view,
-                    generation,
-                    transformer_step,
-                    buffers,
-                )
+                else:
+                    transformer_capture, dep_captures = _execute_transformer_graph(
+                        runtime=runtime,
+                        step_tokens=step_tokens,
+                        positions_view=positions_view,
+                        branches=branches,
+                        generation=generation,
+                        transformer_step=transformer_step,
+                        buffers=buffers,
+                        transformer_capture=transformer_capture,
+                        dep_captures=dep_captures,
+                    )
+                    hidden_t = transformer_capture[1]
 
                 # Text token sampling
                 guided_text = apply_classifier_guidance(buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k)
@@ -643,26 +662,57 @@ def run_streaming_generation_loop(
                 main_tokens.fill_(main_token)
                 aux_tokens.fill_(second_token)
 
-                # Depformer stages
+                # Depformer stages - use CUDA graph if enabled
                 for stage in range(runtime.model.depformer.num_depth):
-                    if depformer_needs_compiling[stage]:
-                        runtime.model.depformer._forward_stage = torch.compile(
-                            runtime.model.depformer._forward_stage,
-                            dynamic=True,
-                            mode="max-autotune-no-cudagraphs",
-                        )
-                        depformer_needs_compiling[stage] = False
+                    if use_graph and dep_captures is not None:
+                        if depformer_needs_compiling[stage]:
+                            runtime.model.depformer._forward_stage = torch.compile(
+                                runtime.model.depformer._forward_stage,
+                                dynamic=True,
+                                mode="max-autotune-no-cudagraphs",
+                            )
+                            depformer_needs_compiling[stage] = False
+                            _execute_depformer_stage(
+                                stage_index=stage,
+                                prev_audio=prev_audio,
+                                hidden_t=hidden_t,
+                                generation=generation,
+                                depformer_step=depformer_step,
+                                main_tokens=main_tokens,
+                                second_tokens=aux_tokens,
+                                buffers=buffers,
+                            )
+                        else:
+                            dep_captures[stage] = _execute_depformer_graph(
+                                stage=stage,
+                                prev_audio=prev_audio,
+                                hidden_t=hidden_t,
+                                generation=generation,
+                                depformer_step=depformer_step,
+                                main_tokens=main_tokens,
+                                aux_tokens=aux_tokens,
+                                buffers=buffers,
+                                capture=dep_captures[stage],
+                            )
+                    else:
+                        if depformer_needs_compiling[stage]:
+                            runtime.model.depformer._forward_stage = torch.compile(
+                                runtime.model.depformer._forward_stage,
+                                dynamic=True,
+                                mode="max-autotune-no-cudagraphs",
+                            )
+                            depformer_needs_compiling[stage] = False
 
-                    _execute_depformer_stage(
-                        stage_index=stage,
-                        prev_audio=prev_audio,
-                        hidden_t=hidden_t,
-                        generation=generation,
-                        depformer_step=depformer_step,
-                        main_tokens=main_tokens,
-                        second_tokens=aux_tokens,
-                        buffers=buffers,
-                    )
+                        _execute_depformer_stage(
+                            stage_index=stage,
+                            prev_audio=prev_audio,
+                            hidden_t=hidden_t,
+                            generation=generation,
+                            depformer_step=depformer_step,
+                            main_tokens=main_tokens,
+                            second_tokens=aux_tokens,
+                            buffers=buffers,
+                        )
 
                     dep_logits = apply_classifier_guidance(
                         buffers.dep[stage], cfg_active, config.cfg_scale, config.cfg_filter_k
