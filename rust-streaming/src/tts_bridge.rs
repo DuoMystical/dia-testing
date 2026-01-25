@@ -114,18 +114,21 @@ impl PersistentBridge {
     }
 
     async fn read_event(&mut self) -> Result<Option<TTSEvent>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut line = String::new();
-        match self.stdout_reader.read_line(&mut line).await {
-            Ok(0) => Ok(None), // EOF
-            Ok(_) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    return Ok(None);
+        loop {
+            let mut line = String::new();
+            match self.stdout_reader.read_line(&mut line).await {
+                Ok(0) => return Ok(None), // EOF
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        // Skip empty lines, continue reading
+                        continue;
+                    }
+                    let event: PythonEvent = serde_json::from_str(trimmed)?;
+                    return Ok(Some(parse_python_event(event)));
                 }
-                let event: PythonEvent = serde_json::from_str(trimmed)?;
-                Ok(Some(parse_python_event(event)))
+                Err(e) => return Err(Box::new(e)),
             }
-            Err(e) => Err(Box::new(e)),
         }
     }
 

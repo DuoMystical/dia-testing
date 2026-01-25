@@ -165,7 +165,8 @@ def process_request(request: dict):
 
 def main():
     """Main loop - process requests from stdin."""
-    emit_status("TTS Bridge starting...", 0.0)
+    # Note: Don't emit events before receiving a request - it confuses the protocol
+    print("TTS Bridge starting...", file=sys.stderr)
 
     # Handle SIGTERM gracefully
     def handle_signal(signum, frame):
@@ -175,11 +176,11 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    # Import heavy modules upfront
+    # Import heavy modules upfront (logged to stderr only)
     try:
         import torch
         from dia2 import Dia2
-        emit_status("TTS Bridge ready", 0.0)
+        print("TTS Bridge ready", file=sys.stderr)
     except ImportError as e:
         emit_error(f"Failed to import required modules: {e}")
         return
