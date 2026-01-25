@@ -2,6 +2,9 @@
 	let textInput = $state('');
 	let selectedModel = $state<'1b' | '2b'>('2b');
 
+	// Generation mode: 'single' (HTTP) or 'streaming' (WebSocket)
+	let generationMode = $state<'single' | 'streaming'>('streaming');
+
 	// Audio sampling (affects voice quality/variation)
 	let audioTemperature = $state(0.8);
 	let audioTopK = $state(50);
@@ -27,6 +30,7 @@
 	let statusMessage = $state<string | null>(null);
 	let generationTime = $state<number | null>(null);
 	let modelUsed = $state<string | null>(null);
+	let streamingProgress = $state(0);
 
 	// Live timer
 	let elapsedTime = $state(0);
@@ -80,16 +84,92 @@
 		audioUrl = null;
 		generationTime = null;
 		modelUsed = null;
+		streamingProgress = 0;
 		statusMessage = `Connecting to GPU server with Dia2-${selectedModel.toUpperCase()}...`;
 		startTimer();
 
-		// If voice files are provided, use HTTP endpoint (WebSocket doesn't support file uploads easily)
+		// If voice files are provided, always use HTTP endpoint (WebSocket doesn't support file uploads)
 		if (voiceS1 || voiceS2) {
 			await generateWithVoice();
 			return;
 		}
 
-		// Use WebSocket for streaming generation
+		// Use selected generation mode
+		if (generationMode === 'streaming') {
+			await generateStreaming();
+		} else {
+			await generateSingle();
+		}
+	}
+
+	async function generateSingle() {
+		// Use HTTP POST endpoint for single generation
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 300000);
+
+		try {
+			statusMessage = `Generating with Dia2-${selectedModel.toUpperCase()}...`;
+
+			const response = await fetch(`${BACKEND_URL}/api/generate`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					text_input: textInput,
+					model: selectedModel,
+					audio_temperature: audioTemperature,
+					audio_top_k: audioTopK,
+					text_temperature: textTemperature,
+					text_top_k: textTopK,
+					cfg_scale: cfgScale,
+					cfg_filter_k: cfgFilterK,
+					use_cuda_graph: useCudaGraph,
+					use_torch_compile: useTorchCompile
+				}),
+				signal: controller.signal
+			});
+
+			clearTimeout(timeoutId);
+			statusMessage = 'Processing audio...';
+
+			if (!response.ok) {
+				let errorMsg = 'Failed to generate audio';
+				try {
+					const errorData = await response.json();
+					errorMsg = errorData.detail || errorMsg;
+				} catch {
+					if (response.status === 503) {
+						errorMsg = 'Server is starting up. Please wait 30-60 seconds and try again.';
+					}
+				}
+				throw new Error(errorMsg);
+			}
+
+			const genTime = response.headers.get('X-Generation-Time');
+			const usedModel = response.headers.get('X-Model-Used');
+			if (genTime) generationTime = parseFloat(genTime);
+			if (usedModel) modelUsed = usedModel;
+
+			const blob = await response.blob();
+			if (blob.size < 100) {
+				throw new Error('Generated audio is empty. Try again.');
+			}
+			audioUrl = URL.createObjectURL(blob);
+			statusMessage = null;
+		} catch (e) {
+			if (e instanceof Error && e.name === 'AbortError') {
+				error = 'Request timed out. The GPU may be busy. Please try again.';
+			} else {
+				error = e instanceof Error ? e.message : 'An error occurred';
+			}
+			statusMessage = null;
+		} finally {
+			isGenerating = false;
+			stopTimer();
+		}
+	}
+
+	async function generateStreaming() {
+		// Use WebSocket for streaming generation with progress updates
 		const wsUrl = BACKEND_URL.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws/generate';
 
 		try {
@@ -97,6 +177,7 @@
 
 			currentWebSocket.onopen = () => {
 				statusMessage = `Connected! Sending request to Dia2-${selectedModel.toUpperCase()}...`;
+				streamingProgress = 5;
 				// Send generation parameters
 				currentWebSocket!.send(JSON.stringify({
 					text_input: textInput,
@@ -117,7 +198,11 @@
 
 				if (data.type === 'status') {
 					statusMessage = data.message;
+					if (data.progress !== undefined) {
+						streamingProgress = data.progress;
+					}
 				} else if (data.type === 'audio') {
+					streamingProgress = 100;
 					// Decode base64 audio
 					const binaryString = atob(data.data);
 					const bytes = new Uint8Array(binaryString.length);
