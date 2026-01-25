@@ -351,48 +351,91 @@ async fn start_streaming_generation(
 
     match bridge.generate_stream(request).await {
         Ok(mut event_stream) => {
-            while let Some(event) = event_stream.recv().await {
-                // Check if cancelled
-                {
-                    let active = generation_active.read().await;
-                    if !*active {
-                        break;
-                    }
-                }
+            // Keep-alive interval (30 seconds) to prevent infrastructure timeouts
+            let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut keepalive_count = 0u32;
+            let mut received_first_event = false;
 
-                let msg = match event {
-                    TTSEvent::Status { message, progress } => {
-                        serde_json::json!({
+            loop {
+                tokio::select! {
+                    // Handle TTS events
+                    event = event_stream.recv() => {
+                        match event {
+                            Some(event) => {
+                                received_first_event = true;
+
+                                // Check if cancelled
+                                {
+                                    let active = generation_active.read().await;
+                                    if !*active {
+                                        break;
+                                    }
+                                }
+
+                                let (msg, is_terminal) = match event {
+                                    TTSEvent::Status { message, progress } => {
+                                        (serde_json::json!({
+                                            "type": "status",
+                                            "message": message,
+                                            "progress": progress
+                                        }), false)
+                                    }
+                                    TTSEvent::AudioChunk { data, chunk_index, timestamp_ms } => {
+                                        (serde_json::json!({
+                                            "type": "audio",
+                                            "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data),
+                                            "chunk_index": chunk_index,
+                                            "timestamp_ms": timestamp_ms
+                                        }), false)
+                                    }
+                                    TTSEvent::Complete { total_chunks, total_duration_ms } => {
+                                        (serde_json::json!({
+                                            "type": "complete",
+                                            "total_chunks": total_chunks,
+                                            "total_duration_ms": total_duration_ms
+                                        }), true)
+                                    }
+                                    TTSEvent::Error { error } => {
+                                        (serde_json::json!({
+                                            "type": "error",
+                                            "error": error
+                                        }), true)
+                                    }
+                                };
+
+                                if sender.send(Message::Text(msg.to_string())).await.is_err() {
+                                    break;
+                                }
+
+                                if is_terminal {
+                                    break;
+                                }
+                            }
+                            None => break, // Stream ended
+                        }
+                    }
+
+                    // Send keep-alive messages to prevent timeout
+                    _ = keepalive_interval.tick() => {
+                        keepalive_count += 1;
+                        let status_msg = if !received_first_event {
+                            // Model is still loading
+                            format!("Loading model... ({}s)", keepalive_count * 30)
+                        } else {
+                            format!("Processing... ({}s)", keepalive_count * 30)
+                        };
+
+                        let keepalive = serde_json::json!({
                             "type": "status",
-                            "message": message,
-                            "progress": progress
-                        })
-                    }
-                    TTSEvent::AudioChunk { data, chunk_index, timestamp_ms } => {
-                        serde_json::json!({
-                            "type": "audio",
-                            "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data),
-                            "chunk_index": chunk_index,
-                            "timestamp_ms": timestamp_ms
-                        })
-                    }
-                    TTSEvent::Complete { total_chunks, total_duration_ms } => {
-                        serde_json::json!({
-                            "type": "complete",
-                            "total_chunks": total_chunks,
-                            "total_duration_ms": total_duration_ms
-                        })
-                    }
-                    TTSEvent::Error { error } => {
-                        serde_json::json!({
-                            "type": "error",
-                            "error": error
-                        })
-                    }
-                };
+                            "message": status_msg,
+                            "progress": 0.05, // Small progress to indicate activity
+                            "keepalive": true
+                        });
 
-                if sender.send(Message::Text(msg.to_string())).await.is_err() {
-                    break;
+                        if sender.send(Message::Text(keepalive.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }

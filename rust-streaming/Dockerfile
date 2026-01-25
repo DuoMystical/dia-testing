@@ -72,6 +72,8 @@ ENV TTS_BRIDGE_PATH=/app/tts_bridge.py
 ENV FRONTEND_PATH=/app/frontend
 ENV PORT=8080
 ENV RUST_LOG=dia2_streaming_server=info
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/app/.cache/huggingface
 
 EXPOSE 8080
 
