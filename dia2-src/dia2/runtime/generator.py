@@ -731,6 +731,9 @@ def run_streaming_generation_loop(
                         except Exception as e:
                             if logger:
                                 logger.event(f"Chunk decode error: {e}")
+                            # Emit error so client knows about decode failure
+                            yield ErrorEvent(error=f"Chunk decode error: {e}")
+                            return
 
                     last_decoded_step = chunk_end
 
@@ -775,6 +778,8 @@ def run_streaming_generation_loop(
                     except Exception as e:
                         if logger:
                             logger.event(f"Final chunk decode error: {e}")
+                        yield ErrorEvent(error=f"Final chunk decode error: {e}")
+                        return
 
         # Emit completion event
         yield CompleteEvent(

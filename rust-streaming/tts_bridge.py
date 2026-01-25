@@ -128,20 +128,30 @@ def main():
         )
 
         # Generate with streaming
-        for event in model.generate_stream(
-            text,
-            config=gen_config,
-            streaming_config=streaming_config,
-            verbose=False,
-        ):
-            if isinstance(event, AudioChunkEvent):
-                emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
-            elif isinstance(event, StatusEvent):
-                emit_status(event.message, event.progress)
-            elif isinstance(event, CompleteEvent):
-                emit_complete(event.total_chunks, event.total_duration_ms)
-            elif isinstance(event, ErrorEvent):
-                emit_error(event.error)
+        event_count = 0
+        audio_chunk_count = 0
+        try:
+            for event in model.generate_stream(
+                text,
+                config=gen_config,
+                streaming_config=streaming_config,
+                verbose=False,
+            ):
+                event_count += 1
+                if isinstance(event, AudioChunkEvent):
+                    audio_chunk_count += 1
+                    emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
+                elif isinstance(event, StatusEvent):
+                    emit_status(event.message, event.progress)
+                elif isinstance(event, CompleteEvent):
+                    emit_complete(event.total_chunks, event.total_duration_ms)
+                elif isinstance(event, ErrorEvent):
+                    emit_error(event.error)
+        except Exception as e:
+            import traceback
+            emit_error(f"Streaming error after {event_count} events ({audio_chunk_count} audio chunks): {e}")
+            print(traceback.format_exc(), file=sys.stderr)
+            return
 
     except ImportError as e:
         emit_error(f"Failed to import dia2: {e}. Make sure dia2 is installed.")
