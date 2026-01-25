@@ -60,13 +60,6 @@ RUN uv pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
 COPY dia2-src /app/dia2-src
 RUN cd /app/dia2-src && uv pip install -e .
 
-# Environment variables (set early for model download)
-ENV PYTHONUNBUFFERED=1
-ENV HF_HOME=/app/.cache/huggingface
-
-# Pre-download model weights during build (not at runtime!)
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('nari-labs/Dia2-2B')"
-
 # Copy Rust binary from builder
 COPY --from=rust-builder /app/target/release/dia2-streaming-server /app/
 
@@ -79,6 +72,8 @@ ENV TTS_BRIDGE_PATH=/app/tts_bridge.py
 ENV FRONTEND_PATH=/app/frontend
 ENV PORT=8080
 ENV RUST_LOG=dia2_streaming_server=info
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/app/.cache/huggingface
 
 EXPOSE 8080
 
