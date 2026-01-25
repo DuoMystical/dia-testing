@@ -60,12 +60,16 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Get frontend path from environment or use default
+    let frontend_path = std::env::var("FRONTEND_PATH")
+        .unwrap_or_else(|_| "./frontend".to_string());
+
     // Build router
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/ws/stream", get(ws_handler))
         .route("/health", get(health_handler))
-        .nest_service("/", ServeDir::new("../frontend"))
+        .nest_service("/", ServeDir::new(&frontend_path))
         .layer(cors)
         .with_state(state);
 

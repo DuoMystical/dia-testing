@@ -69,6 +69,7 @@ COPY streaming-frontend /app/frontend
 
 # Environment variables
 ENV TTS_BRIDGE_PATH=/app/tts_bridge.py
+ENV FRONTEND_PATH=/app/frontend
 ENV PORT=8080
 ENV RUST_LOG=dia2_streaming_server=info
 
