@@ -1,0 +1,311 @@
+/**
+ * Dia2 Streaming TTS - Main Application
+ */
+
+document.addEventListener('DOMContentLoaded', () => {
+    // DOM Elements
+    const textInput = document.getElementById('text-input');
+    const charCount = document.getElementById('char-count');
+    const modelSelect = document.getElementById('model');
+    const streamInputCheckbox = document.getElementById('stream-input');
+    const generateBtn = document.getElementById('generate-btn');
+    const cancelBtn = document.getElementById('cancel-btn');
+
+    const connectionStatus = document.getElementById('connection-status');
+    const statusText = connectionStatus.querySelector('.status-text');
+
+    const progressSection = document.getElementById('progress-section');
+    const progressBar = document.getElementById('progress-bar');
+    const progressText = document.getElementById('progress-text');
+    const chunksCount = document.getElementById('chunks-count');
+    const audioDuration = document.getElementById('audio-duration');
+
+    const visualizerCanvas = document.getElementById('visualizer');
+    const visualizerCtx = visualizerCanvas.getContext('2d');
+    const playPauseBtn = document.getElementById('play-pause-btn');
+    const playIcon = document.getElementById('play-icon');
+    const currentTimeEl = document.getElementById('current-time');
+    const totalTimeEl = document.getElementById('total-time');
+    const volumeSlider = document.getElementById('volume');
+    const chunkList = document.getElementById('chunk-list');
+    const chunkTotal = document.getElementById('chunk-total');
+
+    // Advanced settings
+    const audioTempInput = document.getElementById('audio-temp');
+    const textTempInput = document.getElementById('text-temp');
+    const cfgScaleInput = document.getElementById('cfg-scale');
+    const chunkSizeInput = document.getElementById('chunk-size');
+
+    // State
+    let isGenerating = false;
+    let wsClient = null;
+    let audioStreamer = null;
+
+    // Initialize WebSocket client
+    function initWebSocket() {
+        wsClient = new WebSocketClient({
+            onConnect: () => {
+                connectionStatus.classList.remove('disconnected');
+                connectionStatus.classList.add('connected');
+                statusText.textContent = 'Connected';
+                generateBtn.disabled = false;
+            },
+            onDisconnect: () => {
+                connectionStatus.classList.remove('connected');
+                connectionStatus.classList.add('disconnected');
+                statusText.textContent = 'Disconnected';
+                generateBtn.disabled = true;
+                setGenerating(false);
+            },
+            onAudioChunk: handleAudioChunk,
+            onStatus: handleStatus,
+            onComplete: handleComplete,
+            onError: handleError
+        });
+
+        wsClient.connect();
+    }
+
+    // Initialize Audio Streamer
+    function initAudioStreamer() {
+        audioStreamer = new AudioStreamer({
+            volume: volumeSlider.value / 100,
+            autoPlay: true,
+            onChunkPlay: (index) => {
+                updateChunkHighlight(index);
+            },
+            onPlaybackEnd: () => {
+                playIcon.textContent = '\u25B6'; // Play icon
+            },
+            onTimeUpdate: (current, total) => {
+                currentTimeEl.textContent = formatTime(current);
+                totalTimeEl.textContent = formatTime(total);
+            },
+            onVisualizerData: (data) => {
+                drawVisualizer(data);
+            }
+        });
+    }
+
+    // Handle audio chunk received
+    async function handleAudioChunk(chunk) {
+        const duration = await audioStreamer.addChunk(chunk.data, chunk.chunkIndex);
+
+        // Update UI
+        chunksCount.textContent = `${audioStreamer.getChunkCount()} chunks`;
+        audioDuration.textContent = `${audioStreamer.getTotalDuration().toFixed(1)}s audio`;
+
+        // Add chunk to list
+        addChunkToList(chunk.chunkIndex, duration);
+
+        playPauseBtn.disabled = false;
+    }
+
+    // Handle status update
+    function handleStatus(status) {
+        progressText.textContent = status.message;
+        progressBar.style.width = `${(status.progress || 0) * 100}%`;
+    }
+
+    // Handle generation complete
+    function handleComplete(result) {
+        progressText.textContent = `Complete! ${result.totalChunks} chunks, ${(result.totalDurationMs / 1000).toFixed(1)}s total`;
+        progressBar.style.width = '100%';
+        setGenerating(false);
+    }
+
+    // Handle errors
+    function handleError(error) {
+        console.error('Error:', error);
+        progressText.textContent = `Error: ${error.message}`;
+        setGenerating(false);
+    }
+
+    // Set generating state
+    function setGenerating(generating) {
+        isGenerating = generating;
+        generateBtn.disabled = generating || !wsClient?.isConnected;
+        cancelBtn.disabled = !generating;
+        progressSection.hidden = !generating;
+    }
+
+    // Add chunk indicator to list
+    function addChunkToList(index, duration) {
+        const item = document.createElement('div');
+        item.className = 'chunk-item new';
+        item.textContent = index + 1;
+        item.title = `Chunk ${index + 1}: ${duration.toFixed(2)}s`;
+        item.dataset.index = index;
+
+        item.addEventListener('click', () => {
+            // Could implement click-to-seek here
+        });
+
+        chunkList.appendChild(item);
+        chunkTotal.textContent = `(${audioStreamer.getChunkCount()})`;
+
+        // Remove 'new' animation class after animation
+        setTimeout(() => {
+            item.classList.remove('new');
+        }, 300);
+
+        // Auto-scroll to show new chunk
+        chunkList.scrollTop = chunkList.scrollHeight;
+    }
+
+    // Update chunk highlight during playback
+    function updateChunkHighlight(currentIndex) {
+        const items = chunkList.querySelectorAll('.chunk-item');
+        items.forEach((item, i) => {
+            item.classList.toggle('playing', i === currentIndex);
+        });
+    }
+
+    // Draw audio visualizer
+    function drawVisualizer(data) {
+        const width = visualizerCanvas.width;
+        const height = visualizerCanvas.height;
+        const barCount = data.length;
+        const barWidth = width / barCount;
+
+        visualizerCtx.fillStyle = '#0f172a';
+        visualizerCtx.fillRect(0, 0, width, height);
+
+        for (let i = 0; i < barCount; i++) {
+            const value = data[i] / 255;
+            const barHeight = value * height;
+
+            // Gradient color based on value
+            const hue = 240 + value * 120; // Blue to purple
+            visualizerCtx.fillStyle = `hsl(${hue}, 70%, ${50 + value * 30}%)`;
+
+            visualizerCtx.fillRect(
+                i * barWidth,
+                height - barHeight,
+                barWidth - 1,
+                barHeight
+            );
+        }
+    }
+
+    // Draw idle visualizer
+    function drawIdleVisualizer() {
+        const width = visualizerCanvas.width;
+        const height = visualizerCanvas.height;
+
+        visualizerCtx.fillStyle = '#0f172a';
+        visualizerCtx.fillRect(0, 0, width, height);
+
+        // Draw a flat line
+        visualizerCtx.strokeStyle = '#334155';
+        visualizerCtx.lineWidth = 2;
+        visualizerCtx.beginPath();
+        visualizerCtx.moveTo(0, height / 2);
+        visualizerCtx.lineTo(width, height / 2);
+        visualizerCtx.stroke();
+    }
+
+    // Format time as M:SS
+    function formatTime(seconds) {
+        const mins = Math.floor(seconds / 60);
+        const secs = Math.floor(seconds % 60);
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+    }
+
+    // Generate button click
+    function handleGenerate() {
+        const text = textInput.value.trim();
+        if (!text) {
+            alert('Please enter some text');
+            return;
+        }
+
+        // Reset audio streamer
+        audioStreamer.reset();
+        chunkList.innerHTML = '';
+
+        // Reset progress
+        progressBar.style.width = '0%';
+        progressText.textContent = 'Starting...';
+        chunksCount.textContent = '0 chunks';
+        audioDuration.textContent = '0.0s audio';
+
+        setGenerating(true);
+
+        const options = {
+            model: modelSelect.value,
+            audioTemperature: parseFloat(audioTempInput.value) || 0.8,
+            textTemperature: parseFloat(textTempInput.value) || 0.6,
+            cfgScale: parseFloat(cfgScaleInput.value) || 2.0,
+            chunkSize: parseInt(chunkSizeInput.value) || 8
+        };
+
+        if (streamInputCheckbox.checked) {
+            // Bidirectional streaming - send text in chunks
+            wsClient.sendTextChunks(text, 50);
+        } else {
+            // Direct generation
+            wsClient.generate(text, options);
+        }
+    }
+
+    // Cancel button click
+    function handleCancel() {
+        wsClient.cancel();
+        setGenerating(false);
+    }
+
+    // Play/Pause button click
+    async function handlePlayPause() {
+        try {
+            if (audioStreamer.isPlaying) {
+                audioStreamer.pause();
+                playIcon.textContent = '\u25B6'; // Play icon
+            } else {
+                await audioStreamer.play();
+                playIcon.textContent = '\u23F8'; // Pause icon
+            }
+        } catch (error) {
+            console.error('Playback error:', error);
+        }
+    }
+
+    // Volume change
+    function handleVolumeChange() {
+        audioStreamer.setVolume(volumeSlider.value / 100);
+    }
+
+    // Character count update
+    function updateCharCount() {
+        charCount.textContent = textInput.value.length;
+    }
+
+    // Event Listeners
+    generateBtn.addEventListener('click', handleGenerate);
+    cancelBtn.addEventListener('click', handleCancel);
+    playPauseBtn.addEventListener('click', handlePlayPause);
+    volumeSlider.addEventListener('input', handleVolumeChange);
+    textInput.addEventListener('input', updateCharCount);
+
+    // Initialize
+    initWebSocket();
+    initAudioStreamer();
+    drawIdleVisualizer();
+    updateCharCount();
+
+    // Set default text
+    if (!textInput.value) {
+        textInput.value = '[S1] Hello! This is a streaming TTS demo. [S2] It generates audio in real-time as the model processes the text.';
+        updateCharCount();
+    }
+
+    // Resize visualizer canvas to match container
+    function resizeVisualizer() {
+        const container = visualizerCanvas.parentElement;
+        visualizerCanvas.width = container.clientWidth;
+        drawIdleVisualizer();
+    }
+
+    window.addEventListener('resize', resizeVisualizer);
+    resizeVisualizer();
+});
