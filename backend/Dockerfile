@@ -18,7 +18,16 @@ RUN apt-get update && apt-get install -y \
     nano \
     htop \
     tree \
+    ca-certificates \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20 for Claude Code
+RUN mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -27,9 +36,9 @@ ENV PATH="/root/.local/bin:$PATH"
 # Set working directory
 WORKDIR /app
 
-# Copy project files
-COPY pyproject.toml uv.lock ./
-COPY main.py utils.py ./
+# Copy project files (paths relative to repo root since Koyeb uses repo root as build context)
+COPY backend/pyproject.toml backend/uv.lock ./
+COPY backend/main.py backend/utils.py ./
 
 # Create virtual environment and install dependencies
 RUN uv venv /app/.venv --python python3.12
