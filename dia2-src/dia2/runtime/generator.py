@@ -536,8 +536,11 @@ def run_streaming_generation_loop(
     token_ids = runtime.constants
     delay_tensor = runtime.audio_delay_tensor
     max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
-    flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
+    # FIX: flush_tail only needs max_delay to flush audio through codec delay pipeline
+    # Previously included max_padding which caused extra "hallucinated" audio at end
+    flush_tail = max_delay
     first_word_frame: Optional[int] = None
+    first_word_frame_applied = False  # Track if we've applied the skip for initial frames
     eos_cutoff: Optional[int] = None
     last_step = start_step - 1
 
@@ -707,6 +710,7 @@ def run_streaming_generation_loop(
 
                 if first_word_frame is None and main_token == token_ids.new_word:
                     first_word_frame = t - config.initial_padding
+                    print(f"[TIMING] First word detected at step {t}, first_word_frame={first_word_frame}", file=sys.stderr)
 
                 step_tokens[:, 0, 0] = main_token
                 step_tokens[:, 1, 0] = second_token
@@ -811,6 +815,15 @@ def run_streaming_generation_loop(
                 if eos_cutoff is None and state.end_step is not None:
                     eos_cutoff = state.end_step + flush_tail
                     print(f"[TIMING] EOS detected at step {t}, eos_cutoff set to {eos_cutoff}", file=sys.stderr)
+
+                # FIX: Skip initial frames before first_word_frame (warmup/padding frames)
+                # This matches the crop behavior in non-streaming generate()
+                if not first_word_frame_applied and first_word_frame is not None:
+                    skip_to = max(first_word_frame, 0)
+                    if skip_to > last_aligned_emitted:
+                        print(f"[TIMING] Skipping initial frames: last_aligned_emitted {last_aligned_emitted} -> {skip_to}", file=sys.stderr)
+                        last_aligned_emitted = skip_to
+                    first_word_frame_applied = True
 
                 # Check if we have enough NEW aligned frames for a chunk
                 # aligned length = (t + 1) - max_delay, we've emitted last_aligned_emitted
