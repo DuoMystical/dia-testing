@@ -150,7 +150,7 @@ def process_request(request: dict):
             text,
             config=gen_config,
             streaming_config=streaming_config,
-            verbose=True,  # Enable verbose for debugging
+            verbose=False,  # Must be False - verbose=True outputs to stdout and corrupts JSON protocol
         ):
             event_count += 1
             event_type = type(event).__name__
