@@ -565,6 +565,14 @@ def run_streaming_generation_loop(
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
 
+    # Check if we're on CUDA for sync operations
+    is_cuda = runtime.device.type == "cuda"
+
+    # Create separate CUDA stream for audio decoding (can overlap with generation)
+    # NOTE: Currently not used for async - kept for future optimization
+    # Audio decode is only ~3% of total time, so async gains are limited
+    decode_stream = torch.cuda.Stream() if is_cuda else None
+
     # Streaming state
     chunk_size = streaming_config.chunk_size_frames
     min_chunk = streaming_config.min_chunk_frames
@@ -661,6 +669,11 @@ def run_streaming_generation_loop(
                     )
                     hidden_t = transformer_capture[1]
 
+                # EXPLICIT SYNC: Wait for transformer to complete before timing text sampling
+                # This ensures accurate timing attribution (otherwise .item() waits for transformer)
+                if is_cuda:
+                    torch.cuda.synchronize()
+
                 t1 = time.time()
                 if is_graph_capture:
                     timing_stats['cuda_graph_capture'] += (t1 - t0)
@@ -669,7 +682,7 @@ def run_streaming_generation_loop(
                 else:
                     timing_stats['transformer_step'] += (t1 - t0)
 
-                # Text token sampling
+                # Text token sampling (now accurately timed - transformer already synced)
                 t0 = time.time()
                 guided_text = apply_classifier_guidance(buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k)
                 if guided_text.shape[0] > 1:
@@ -695,7 +708,7 @@ def run_streaming_generation_loop(
                 step_tokens[:, 0, 0] = main_token
                 step_tokens[:, 1, 0] = second_token
 
-                # Audio token sampling
+                # Audio token sampling (CB0)
                 t0 = time.time()
                 guided_cb0 = apply_classifier_guidance(buffers.cb0, cfg_active, config.cfg_scale, config.cfg_filter_k)
                 if guided_cb0.shape[0] > 1:
@@ -703,6 +716,11 @@ def run_streaming_generation_loop(
                 masked_cb0 = mask_audio_logits(guided_cb0, token_ids.audio_pad, token_ids.audio_bos)
                 codebook_token = sample_audio_logits_fn(masked_cb0, config.audio.temperature, config.audio.top_k)
                 audio_buf[:, 0, t + 1] = codebook_token
+
+                # EXPLICIT SYNC: Ensure CB0 sampling is complete before timing
+                if is_cuda:
+                    torch.cuda.synchronize()
+
                 t1 = time.time()
                 timing_stats['audio_sampling'] += (t1 - t0)
 
@@ -776,6 +794,10 @@ def run_streaming_generation_loop(
                     )
                     audio_buf[:, stage + 1, t + 1] = stage_token
                     prev_audio = stage_token.expand(branches)
+
+                # EXPLICIT SYNC: Wait for depformer to complete for accurate timing
+                if is_cuda:
+                    torch.cuda.synchronize()
 
                 t1 = time.time()
                 timing_stats['depformer_stages'] += (t1 - t0)
@@ -906,19 +928,19 @@ def run_streaming_generation_loop(
             total_duration_ms=total_audio_ms,
         )
 
-        # Print timing summary
+        # Print timing summary (with explicit CUDA syncs for accurate attribution)
         total_elapsed = time.time() - generation_start_time
         step_count = timing_stats['step_count']
-        print(f"\n[TIMING SUMMARY] Total: {total_elapsed*1000:.0f}ms, Steps: {step_count}, Audio: {total_audio_ms:.0f}ms", file=sys.stderr)
-        print(f"  CUDA graph capture: {timing_stats['cuda_graph_capture']*1000:.0f}ms", file=sys.stderr)
-        print(f"  Transformer steps:  {timing_stats['transformer_step']*1000:.0f}ms ({timing_stats['transformer_step']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
-        print(f"  Text sampling:      {timing_stats['text_sampling']*1000:.0f}ms ({timing_stats['text_sampling']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
-        print(f"  Machine process:    {timing_stats['machine_process']*1000:.0f}ms ({timing_stats['machine_process']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
-        print(f"  Audio sampling:     {timing_stats['audio_sampling']*1000:.0f}ms ({timing_stats['audio_sampling']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
-        print(f"  Depformer stages:   {timing_stats['depformer_stages']*1000:.0f}ms ({timing_stats['depformer_stages']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
-        print(f"  Audio decode:       {timing_stats['audio_decode']*1000:.0f}ms", file=sys.stderr)
+        print(f"\n[TIMING SUMMARY - ACCURATE] Total: {total_elapsed*1000:.0f}ms, Steps: {step_count}, Audio: {total_audio_ms:.0f}ms", file=sys.stderr)
+        print(f"  CUDA graph capture:  {timing_stats['cuda_graph_capture']*1000:.0f}ms (one-time)", file=sys.stderr)
+        print(f"  Transformer+sync:    {timing_stats['transformer_step']*1000:.0f}ms ({timing_stats['transformer_step']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Text sampling+sync:  {timing_stats['text_sampling']*1000:.0f}ms ({timing_stats['text_sampling']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Machine process:     {timing_stats['machine_process']*1000:.0f}ms ({timing_stats['machine_process']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Audio CB0+sync:      {timing_stats['audio_sampling']*1000:.0f}ms ({timing_stats['audio_sampling']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Depformer+sync:      {timing_stats['depformer_stages']*1000:.0f}ms ({timing_stats['depformer_stages']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Audio decode:        {timing_stats['audio_decode']*1000:.0f}ms", file=sys.stderr)
         accounted = sum(timing_stats.values()) - timing_stats['step_count']
-        print(f"  Other/overhead:     {(total_elapsed - accounted)*1000:.0f}ms", file=sys.stderr)
+        print(f"  Other/overhead:      {(total_elapsed - accounted)*1000:.0f}ms", file=sys.stderr)
 
         if logger:
             elapsed = time.time() - generation_start_time
