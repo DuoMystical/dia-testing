@@ -47,6 +47,9 @@ class MimiCodec(nn.Module):
         )
         model = model.to(device)
         model.eval()
+        # Enable use_cache so decoder returns past_key_values for streaming
+        # Without this, decode_with_state won't preserve state between chunks
+        model.config.use_cache = True
         return cls(model, device)
 
     def decode(

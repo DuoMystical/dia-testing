@@ -403,6 +403,12 @@ async fn start_streaming_generation(
                                             "error": error
                                         }), true)
                                     }
+                                    TTSEvent::Seed { seed } => {
+                                        (serde_json::json!({
+                                            "type": "seed",
+                                            "seed": seed
+                                        }), false)
+                                    }
                                 };
 
                                 if sender.send(Message::Text(msg.to_string())).await.is_err() {

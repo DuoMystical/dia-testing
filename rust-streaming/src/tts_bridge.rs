@@ -38,6 +38,9 @@ pub enum TTSEvent {
     Error {
         error: String,
     },
+    Seed {
+        seed: u64,
+    },
 }
 
 /// JSON structure from Python bridge
@@ -57,6 +60,8 @@ struct PythonEvent {
     total_duration_ms: Option<f64>,
     // Error fields
     error: Option<String>,
+    // Seed field
+    seed: Option<u64>,
 }
 
 /// Persistent Python bridge process
@@ -288,6 +293,9 @@ fn parse_python_event(event: PythonEvent) -> TTSEvent {
         },
         "error" => TTSEvent::Error {
             error: event.error.unwrap_or_else(|| "Unknown error".to_string()),
+        },
+        "seed" => TTSEvent::Seed {
+            seed: event.seed.unwrap_or(0),
         },
         _ => TTSEvent::Error {
             error: format!("Unknown event type: {}", event.event_type),

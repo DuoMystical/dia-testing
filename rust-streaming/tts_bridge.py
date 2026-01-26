@@ -257,7 +257,12 @@ def process_request(request: dict):
             # FAST PATH: Restore from cache
             print(f"[CACHE] HIT - Restoring state for seed {seed}", file=sys.stderr)
             emit_status("Using cached voice...", 0.1)
-            gen_state = cached_state.clone()
+            gen_state, rng_state, cuda_rng_state = cached_state
+            gen_state = gen_state.clone()
+            # Restore RNG state to match post-warmup state
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
             start_step = gen_config.initial_padding
         else:
             # SLOW PATH: Build initial state and run warmup
@@ -288,7 +293,10 @@ def process_request(request: dict):
 
             # Cache the warmed-up state (only if not voice cloning)
             if use_cache:
-                _cache_put(seed, gen_state.clone())
+                # Save RNG state along with generation state
+                rng_state = torch.get_rng_state()
+                cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+                _cache_put(seed, (gen_state.clone(), rng_state, cuda_rng_state))
 
         warmup_time = time_module.time() - generation_start
         print(f"[TIMING] Warmup/restore took {warmup_time*1000:.0f}ms", file=sys.stderr)
@@ -299,11 +307,11 @@ def process_request(request: dict):
         text_normalized = normalize_script(text)
         entries = parse_script([text_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate)
 
-        # Set initial_padding to 0 since warmup is done
-        runtime.machine.initial_padding = 0
+        # Create state - don't modify runtime.machine.initial_padding globally
+        # Instead, create state and reset its padding since warmup already consumed it
         state = runtime.machine.new_state(entries)
-        # Reset forced_padding since warmup already consumed it
         state.forced_padding = 0
+        state.padding_budget = 0
 
         # Run streaming generation
         logger = RuntimeLogger(enabled=False)
