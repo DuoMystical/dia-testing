@@ -134,10 +134,11 @@ def process_request(request: dict):
             use_torch_compile=False,
         )
 
-        # Streaming config - small chunks for responsive streaming
+        # Streaming config - chunk_size must be larger than max audio delay (~12-16 frames)
+        # Using 32 frames (~0.4s at 75fps) to ensure chunks have actual audio after undelaying
         streaming_config = StreamingConfig(
-            chunk_size_frames=config_overrides.get("chunk_size_frames", 8),
-            min_chunk_frames=config_overrides.get("min_chunk_frames", 4),
+            chunk_size_frames=config_overrides.get("chunk_size_frames", 32),
+            min_chunk_frames=config_overrides.get("min_chunk_frames", 16),
             emit_status_every=config_overrides.get("emit_status_every", 5),
         )
 
