@@ -155,7 +155,7 @@ def process_request(request: dict):
     )
     from dia2.runtime.voice_clone import build_prefix_plan
     from dia2.generation import PrefixConfig, merge_generation_config
-    from dia2.script import parse_script
+    from dia2.runtime.script_parser import parse_script
     from dia2.runtime.logger import RuntimeLogger
 
     text = request.get("text", "")
