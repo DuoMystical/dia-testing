@@ -306,7 +306,7 @@ def process_request(request: dict):
         state.forced_padding = 0
 
         # Run streaming generation
-        logger = RuntimeLogger(verbose=False)
+        logger = RuntimeLogger(enabled=False)
         event_count = 0
         audio_chunk_count = 0
         first_audio_time = None
