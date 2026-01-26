@@ -141,13 +141,23 @@ for i, token in enumerate(text_tokens):
 
 ## Implementation Plan
 
-### Phase 1: Accurate Timing (IMPLEMENTED)
-Add explicit `torch.cuda.synchronize()` after each major section to get real breakdown.
+### Phase 1: Accurate Timing (IMPLEMENTED ✓)
+Added explicit `torch.cuda.synchronize()` after each major section:
+- After transformer step (before text sampling)
+- After audio CB0 sampling (before depformer)
+- After depformer stages
 
-### Phase 2: Async Audio Decode (IMPLEMENTED)
-Use separate CUDA stream for audio decode to overlap with generation.
+This ensures timing is correctly attributed to each operation.
+
+### Phase 2: Async Audio Decode (IMPLEMENTED ✓)
+Implemented pipelined async decode using separate CUDA stream:
+- `decode_stream` runs audio decode in parallel with generation
+- Pattern: yield previous chunk while starting new decode async
+- Pending decode stored as `(waveform, chunk_index, timestamp)`
+- Overlaps ~170ms decode time with generation steps
 
 ### Phase 3: Based on Real Numbers
+After getting accurate timing, next steps:
 - If transformer is bottleneck → limited options (already using CUDA graphs)
 - If depformer is bottleneck → look at batching/fusion
 - If sync overhead is real → implement GPU state machine (Option A)
