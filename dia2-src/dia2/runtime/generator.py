@@ -568,10 +568,13 @@ def run_streaming_generation_loop(
     # Check if we're on CUDA for sync operations
     is_cuda = runtime.device.type == "cuda"
 
-    # Create separate CUDA stream for audio decoding (can overlap with generation)
-    # NOTE: Currently not used for async - kept for future optimization
-    # Audio decode is only ~3% of total time, so async gains are limited
+    # Create separate CUDA stream for audio decoding (overlaps with generation)
+    # Decode runs async on decode_stream while next generation steps run on default stream
     decode_stream = torch.cuda.Stream() if is_cuda else None
+
+    # Pending async decode state: (waveform_tensor, chunk_index, timestamp_ms)
+    # Waveform computation runs on decode_stream, we yield it at START of next chunk cycle
+    pending_decode = None
 
     # Streaming state
     chunk_size = streaming_config.chunk_size_frames
@@ -821,10 +824,45 @@ def run_streaming_generation_loop(
                     should_emit_chunk = True
 
                 if should_emit_chunk:
+                    # ASYNC DECODE PIPELINE:
+                    # 1. First, yield any pending chunk from PREVIOUS async decode
+                    # 2. Start new decode on decode_stream (async)
+                    # 3. Store waveform for next iteration
+                    # This overlaps decode with generation of next steps
+
+                    # Step 1: Yield pending chunk from previous async decode
+                    if pending_decode is not None:
+                        prev_waveform, prev_idx, prev_ts = pending_decode
+                        try:
+                            # Wait for decode_stream to finish (if using async)
+                            if decode_stream is not None:
+                                decode_stream.synchronize()
+
+                            t0 = time.time()
+                            if prev_waveform.numel() > 0:
+                                # Encode to WAV (runs on CPU)
+                                wav_bytes = _encode_wav_chunk(prev_waveform, runtime.mimi.sample_rate)
+                                chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
+
+                                yield AudioChunkEvent(
+                                    audio_data=wav_bytes,
+                                    chunk_index=prev_idx,
+                                    timestamp_ms=prev_ts,
+                                )
+                                total_audio_ms += chunk_duration_ms
+
+                            t1 = time.time()
+                            timing_stats['audio_decode'] += (t1 - t0)  # WAV encoding time
+                        except Exception as e:
+                            if logger:
+                                logger.event(f"Chunk encode error: {e}")
+                            yield ErrorEvent(error=f"Chunk encode error: {e}")
+                            return
+                        pending_decode = None
+
+                    # Step 2: Prepare new chunk for async decode
                     # BUG FIX: undelay_frames assumes input starts from frame 0
                     # We must undelay the FULL buffer, then slice the ALIGNED result
-                    # Otherwise each chunk reads from wrong positions (spread out audio)
-
                     current_frame = t + 1
 
                     # Undelay the entire buffer up to current position
@@ -835,8 +873,6 @@ def run_streaming_generation_loop(
                         token_ids.audio_pad
                     ).unsqueeze(0)
 
-                    # aligned_full has length = current_frame + 1 - max_delay
-                    # We want to emit frames [last_aligned_emitted : current_aligned_end]
                     current_aligned_end = aligned_full.shape[-1]
 
                     if current_aligned_end > last_aligned_emitted:
@@ -844,27 +880,30 @@ def run_streaming_generation_loop(
 
                         if aligned_chunk.shape[-1] > 0:
                             try:
-                                # Decode audio chunk
+                                # Step 3: Start decode on separate stream (async)
                                 t0 = time.time()
-                                chunk_waveform = decode_audio(runtime, aligned_chunk)
-                                t1 = time.time()
-                                timing_stats['audio_decode'] += (t1 - t0)
-
-                                if chunk_waveform.numel() > 0:
-                                    # Encode to WAV
-                                    wav_bytes = _encode_wav_chunk(chunk_waveform, runtime.mimi.sample_rate)
-
-                                    # Calculate timestamp
-                                    chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
-
-                                    yield AudioChunkEvent(
-                                        audio_data=wav_bytes,
-                                        chunk_index=chunk_index,
-                                        timestamp_ms=total_audio_ms,
-                                    )
-
-                                    total_audio_ms += chunk_duration_ms
+                                if decode_stream is not None:
+                                    with torch.cuda.stream(decode_stream):
+                                        chunk_waveform = decode_audio(runtime, aligned_chunk)
+                                    # Store for next iteration - decode runs async
+                                    pending_decode = (chunk_waveform, chunk_index, total_audio_ms)
                                     chunk_index += 1
+                                else:
+                                    # No CUDA - decode synchronously
+                                    chunk_waveform = decode_audio(runtime, aligned_chunk)
+                                    if chunk_waveform.numel() > 0:
+                                        wav_bytes = _encode_wav_chunk(chunk_waveform, runtime.mimi.sample_rate)
+                                        chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
+                                        yield AudioChunkEvent(
+                                            audio_data=wav_bytes,
+                                            chunk_index=chunk_index,
+                                            timestamp_ms=total_audio_ms,
+                                        )
+                                        total_audio_ms += chunk_duration_ms
+                                        chunk_index += 1
+
+                                t1 = time.time()
+                                # Only count decode launch time here (actual decode is async)
 
                             except Exception as e:
                                 if logger:
@@ -881,6 +920,31 @@ def run_streaming_generation_loop(
                         message=f"Generating audio ({offset + 1}/{max_context} steps)",
                         progress=progress
                     )
+
+        # First, yield any pending async decode from the loop
+        if pending_decode is not None:
+            prev_waveform, prev_idx, prev_ts = pending_decode
+            try:
+                if decode_stream is not None:
+                    decode_stream.synchronize()
+
+                if prev_waveform.numel() > 0:
+                    wav_bytes = _encode_wav_chunk(prev_waveform, runtime.mimi.sample_rate)
+                    chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
+
+                    yield AudioChunkEvent(
+                        audio_data=wav_bytes,
+                        chunk_index=prev_idx,
+                        timestamp_ms=prev_ts,
+                    )
+                    total_audio_ms += chunk_duration_ms
+
+            except Exception as e:
+                if logger:
+                    logger.event(f"Pending chunk encode error: {e}")
+                yield ErrorEvent(error=f"Pending chunk encode error: {e}")
+                return
+            pending_decode = None
 
         # Handle any remaining frames (same fix: undelay full buffer, slice result)
         if last_step >= 0:
@@ -901,6 +965,7 @@ def run_streaming_generation_loop(
 
                     if aligned_remaining.shape[-1] > 0:
                         try:
+                            # Final chunk - decode synchronously (no point in async for last one)
                             remaining_waveform = decode_audio(runtime, aligned_remaining)
 
                             if remaining_waveform.numel() > 0:
