@@ -568,10 +568,13 @@ def run_streaming_generation_loop(
     # Streaming state
     chunk_size = streaming_config.chunk_size_frames
     min_chunk = streaming_config.min_chunk_frames
-    last_decoded_step = start_step
     chunk_index = 0
     total_audio_ms = 0.0
     generation_start_time = time.time()
+
+    # Track aligned frames we've already emitted (after undelay)
+    # undelay output length = input_length - max_delay
+    last_aligned_emitted = 0
 
     # Calculate approximate frame rate for timing
     frame_rate = getattr(runtime, 'frame_rate', 75.0)
@@ -784,44 +787,103 @@ def run_streaming_generation_loop(
                     eos_cutoff = state.end_step + flush_tail
                     print(f"[TIMING] EOS detected at step {t}, eos_cutoff set to {eos_cutoff}", file=sys.stderr)
 
-                # Check if we have enough frames for a chunk
-                frames_generated = t + 1 - last_decoded_step
-                should_emit_chunk = frames_generated >= chunk_size
+                # Check if we have enough NEW aligned frames for a chunk
+                # aligned length = (t + 1) - max_delay, we've emitted last_aligned_emitted
+                current_aligned_len = max(0, (t + 1) - max_delay)
+                new_aligned_frames = current_aligned_len - last_aligned_emitted
+                should_emit_chunk = new_aligned_frames >= chunk_size
 
                 # Also emit on EOS if we have enough frames
                 at_end = (eos_cutoff is not None and t + 1 >= eos_cutoff) or (t + 2 >= audio_buf.shape[-1])
-                if at_end and frames_generated >= min_chunk:
+                if at_end and new_aligned_frames >= min_chunk:
                     should_emit_chunk = True
 
                 if should_emit_chunk:
-                    # Extract the frames for this chunk
-                    chunk_start = last_decoded_step
-                    chunk_end = t + 1
+                    # BUG FIX: undelay_frames assumes input starts from frame 0
+                    # We must undelay the FULL buffer, then slice the ALIGNED result
+                    # Otherwise each chunk reads from wrong positions (spread out audio)
 
-                    # Get the audio tokens for this chunk
-                    chunk_tokens = audio_buf[0, :, chunk_start:chunk_end + 1]
+                    current_frame = t + 1
 
-                    # Undelay and decode
-                    aligned_chunk = undelay_frames(
-                        chunk_tokens,
+                    # Undelay the entire buffer up to current position
+                    full_tokens = audio_buf[0, :, :current_frame + 1]
+                    aligned_full = undelay_frames(
+                        full_tokens,
                         runtime.audio_delays,
                         token_ids.audio_pad
                     ).unsqueeze(0)
 
-                    if aligned_chunk.shape[-1] > 0:
+                    # aligned_full has length = current_frame + 1 - max_delay
+                    # We want to emit frames [last_aligned_emitted : current_aligned_end]
+                    current_aligned_end = aligned_full.shape[-1]
+
+                    if current_aligned_end > last_aligned_emitted:
+                        aligned_chunk = aligned_full[:, :, last_aligned_emitted:current_aligned_end]
+
+                        if aligned_chunk.shape[-1] > 0:
+                            try:
+                                # Decode audio chunk
+                                t0 = time.time()
+                                chunk_waveform = decode_audio(runtime, aligned_chunk)
+                                t1 = time.time()
+                                timing_stats['audio_decode'] += (t1 - t0)
+
+                                if chunk_waveform.numel() > 0:
+                                    # Encode to WAV
+                                    wav_bytes = _encode_wav_chunk(chunk_waveform, runtime.mimi.sample_rate)
+
+                                    # Calculate timestamp
+                                    chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
+
+                                    yield AudioChunkEvent(
+                                        audio_data=wav_bytes,
+                                        chunk_index=chunk_index,
+                                        timestamp_ms=total_audio_ms,
+                                    )
+
+                                    total_audio_ms += chunk_duration_ms
+                                    chunk_index += 1
+
+                            except Exception as e:
+                                if logger:
+                                    logger.event(f"Chunk decode error: {e}")
+                                yield ErrorEvent(error=f"Chunk decode error: {e}")
+                                return
+
+                        last_aligned_emitted = current_aligned_end
+
+                # Emit status periodically
+                if (offset + 1) % (streaming_config.emit_status_every * chunk_size) == 0:
+                    progress = min(1.0, (offset + 1) / max_context)
+                    yield StatusEvent(
+                        message=f"Generating audio ({offset + 1}/{max_context} steps)",
+                        progress=progress
+                    )
+
+        # Handle any remaining frames (same fix: undelay full buffer, slice result)
+        if last_step >= 0:
+            remaining_end = min(last_step + 2, audio_buf.shape[-1])
+
+            if remaining_end > 0:
+                full_tokens = audio_buf[0, :, :remaining_end]
+                aligned_full = undelay_frames(
+                    full_tokens,
+                    runtime.audio_delays,
+                    token_ids.audio_pad
+                ).unsqueeze(0)
+
+                current_aligned_end = aligned_full.shape[-1]
+
+                if current_aligned_end > last_aligned_emitted:
+                    aligned_remaining = aligned_full[:, :, last_aligned_emitted:current_aligned_end]
+
+                    if aligned_remaining.shape[-1] > 0:
                         try:
-                            # Decode audio chunk
-                            t0 = time.time()
-                            chunk_waveform = decode_audio(runtime, aligned_chunk)
-                            t1 = time.time()
-                            timing_stats['audio_decode'] += (t1 - t0)
+                            remaining_waveform = decode_audio(runtime, aligned_remaining)
 
-                            if chunk_waveform.numel() > 0:
-                                # Encode to WAV
-                                wav_bytes = _encode_wav_chunk(chunk_waveform, runtime.mimi.sample_rate)
-
-                                # Calculate timestamp
-                                chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
+                            if remaining_waveform.numel() > 0:
+                                wav_bytes = _encode_wav_chunk(remaining_waveform, runtime.mimi.sample_rate)
+                                chunk_duration_ms = (remaining_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                                 yield AudioChunkEvent(
                                     audio_data=wav_bytes,
@@ -834,56 +896,9 @@ def run_streaming_generation_loop(
 
                         except Exception as e:
                             if logger:
-                                logger.event(f"Chunk decode error: {e}")
-                            # Emit error so client knows about decode failure
-                            yield ErrorEvent(error=f"Chunk decode error: {e}")
+                                logger.event(f"Final chunk decode error: {e}")
+                            yield ErrorEvent(error=f"Final chunk decode error: {e}")
                             return
-
-                    last_decoded_step = chunk_end
-
-                # Emit status periodically
-                if (offset + 1) % (streaming_config.emit_status_every * chunk_size) == 0:
-                    progress = min(1.0, (offset + 1) / max_context)
-                    yield StatusEvent(
-                        message=f"Generating audio ({offset + 1}/{max_context} steps)",
-                        progress=progress
-                    )
-
-        # Handle any remaining frames
-        if last_step >= last_decoded_step:
-            remaining_start = last_decoded_step
-            remaining_end = min(last_step + 2, audio_buf.shape[-1])
-
-            if remaining_end > remaining_start:
-                remaining_tokens = audio_buf[0, :, remaining_start:remaining_end]
-                aligned_remaining = undelay_frames(
-                    remaining_tokens,
-                    runtime.audio_delays,
-                    token_ids.audio_pad
-                ).unsqueeze(0)
-
-                if aligned_remaining.shape[-1] > 0:
-                    try:
-                        remaining_waveform = decode_audio(runtime, aligned_remaining)
-
-                        if remaining_waveform.numel() > 0:
-                            wav_bytes = _encode_wav_chunk(remaining_waveform, runtime.mimi.sample_rate)
-                            chunk_duration_ms = (remaining_waveform.numel() / runtime.mimi.sample_rate) * 1000
-
-                            yield AudioChunkEvent(
-                                audio_data=wav_bytes,
-                                chunk_index=chunk_index,
-                                timestamp_ms=total_audio_ms,
-                            )
-
-                            total_audio_ms += chunk_duration_ms
-                            chunk_index += 1
-
-                    except Exception as e:
-                        if logger:
-                            logger.event(f"Final chunk decode error: {e}")
-                        yield ErrorEvent(error=f"Final chunk decode error: {e}")
-                        return
 
         # Emit completion event
         yield CompleteEvent(
