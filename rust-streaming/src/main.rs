@@ -351,11 +351,13 @@ async fn start_streaming_generation(
 
     match event_stream {
         Ok(mut event_stream) => {
-            info!("Bridge started successfully, entering keep-alive loop");
+            info!("Bridge started successfully, waiting for request_start synchronization");
+
             // Keep-alive interval (30 seconds) to prevent infrastructure timeouts
             let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(30));
             let mut keepalive_count = 0u32;
             let mut received_first_event = false;
+            let mut synchronized = false;  // Wait for request_start before processing events
 
             loop {
                 tokio::select! {
@@ -363,6 +365,21 @@ async fn start_streaming_generation(
                     event = event_stream.recv() => {
                         match event {
                             Some(event) => {
+                                // Handle request synchronization first
+                                if let TTSEvent::RequestStart { ref request_id } = event {
+                                    info!("Synchronized with request: {}", request_id);
+                                    synchronized = true;
+                                    received_first_event = true;
+                                    continue;  // Don't forward request_start to client
+                                }
+
+                                // Discard stale events until we see request_start
+                                if !synchronized {
+                                    warn!("Discarding stale event before request_start: {:?}",
+                                          std::mem::discriminant(&event));
+                                    continue;
+                                }
+
                                 info!("Received TTS event: {:?}", std::mem::discriminant(&event));
                                 received_first_event = true;
 
@@ -408,6 +425,10 @@ async fn start_streaming_generation(
                                             "type": "seed",
                                             "seed": seed
                                         }), false)
+                                    }
+                                    TTSEvent::RequestStart { .. } => {
+                                        // Already handled above, but match is exhaustive
+                                        continue;
                                     }
                                 };
 

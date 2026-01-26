@@ -41,6 +41,9 @@ pub enum TTSEvent {
     Seed {
         seed: u64,
     },
+    RequestStart {
+        request_id: String,
+    },
 }
 
 /// JSON structure from Python bridge
@@ -62,6 +65,8 @@ struct PythonEvent {
     error: Option<String>,
     // Seed field
     seed: Option<u64>,
+    // Request ID field
+    request_id: Option<String>,
 }
 
 /// Persistent Python bridge process
@@ -296,6 +301,9 @@ fn parse_python_event(event: PythonEvent) -> TTSEvent {
         },
         "seed" => TTSEvent::Seed {
             seed: event.seed.unwrap_or(0),
+        },
+        "request_start" => TTSEvent::RequestStart {
+            request_id: event.request_id.unwrap_or_default(),
         },
         _ => TTSEvent::Error {
             error: format!("Unknown event type: {}", event.event_type),

@@ -138,6 +138,13 @@ def process_request(request: dict):
     import tempfile
     import os
     import time as time_module
+    import uuid
+
+    # Generate unique request ID to sync with Rust side
+    # This allows Rust to discard stale events from previous requests
+    request_id = str(uuid.uuid4())
+    emit_event({"type": "request_start", "request_id": request_id})
+
     from dia2 import (
         GenerationConfig,
         SamplingConfig,
