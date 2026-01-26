@@ -577,19 +577,44 @@ def run_streaming_generation_loop(
     frame_rate = getattr(runtime, 'frame_rate', 75.0)
     ms_per_frame = 1000.0 / frame_rate
 
+    # Timing accumulators for profiling
+    timing_stats = {
+        'transformer_step': 0.0,
+        'text_sampling': 0.0,
+        'machine_process': 0.0,
+        'audio_sampling': 0.0,
+        'depformer_stages': 0.0,
+        'audio_decode': 0.0,
+        'cuda_graph_capture': 0.0,
+        'step_count': 0,
+    }
+    first_step_time = None
+    cuda_graph_captured = False
+
+    import sys
+    print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}", file=sys.stderr)
+
     yield StatusEvent(message="Starting generation", progress=0.0)
 
     try:
         with torch.inference_mode():
             for offset in range(max_context):
+                step_start = time.time()
+
+                if first_step_time is None:
+                    first_step_time = step_start
+                    print(f"[TIMING] First step started at {(step_start - generation_start_time)*1000:.0f}ms", file=sys.stderr)
+
                 if use_torch_compile:
                     torch.compiler.cudagraph_mark_step_begin()
 
                 t = start_step + offset
 
                 if eos_cutoff is not None and t >= eos_cutoff:
+                    print(f"[TIMING] Breaking: eos_cutoff reached at step {t} (eos_cutoff={eos_cutoff})", file=sys.stderr)
                     break
                 if t + 1 >= audio_buf.shape[-1]:
+                    print(f"[TIMING] Breaking: audio_buf limit reached at step {t} (buf_size={audio_buf.shape[-1]})", file=sys.stderr)
                     break
 
                 generation.reset_dep_cache()
@@ -601,6 +626,9 @@ def run_streaming_generation_loop(
                     step_tokens[1:, 1, 0] = token_ids.pad
 
                 # Transformer step - use CUDA graph if enabled
+                t0 = time.time()
+                is_graph_capture = (use_graph and transformer_capture is None)
+
                 if transformer_needs_compiling or not use_graph:
                     if transformer_needs_compiling:
                         transformer_step = torch.compile(
@@ -630,7 +658,16 @@ def run_streaming_generation_loop(
                     )
                     hidden_t = transformer_capture[1]
 
+                t1 = time.time()
+                if is_graph_capture:
+                    timing_stats['cuda_graph_capture'] += (t1 - t0)
+                    print(f"[TIMING] CUDA graph capture took {(t1-t0)*1000:.0f}ms", file=sys.stderr)
+                    cuda_graph_captured = True
+                else:
+                    timing_stats['transformer_step'] += (t1 - t0)
+
                 # Text token sampling
+                t0 = time.time()
                 guided_text = apply_classifier_guidance(buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k)
                 if guided_text.shape[0] > 1:
                     guided_text = guided_text[:1]
@@ -640,9 +677,14 @@ def run_streaming_generation_loop(
                     temp=config.text.temperature,
                     top_k=config.text.top_k,
                 ).item()
+                t1 = time.time()
+                timing_stats['text_sampling'] += (t1 - t0)
 
+                t0 = time.time()
                 main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
                 second_token = aux_token if aux_token != -1 else token_ids.pad
+                t1 = time.time()
+                timing_stats['machine_process'] += (t1 - t0)
 
                 if first_word_frame is None and main_token == token_ids.new_word:
                     first_word_frame = t - config.initial_padding
@@ -651,18 +693,22 @@ def run_streaming_generation_loop(
                 step_tokens[:, 1, 0] = second_token
 
                 # Audio token sampling
+                t0 = time.time()
                 guided_cb0 = apply_classifier_guidance(buffers.cb0, cfg_active, config.cfg_scale, config.cfg_filter_k)
                 if guided_cb0.shape[0] > 1:
                     guided_cb0 = guided_cb0[:1]
                 masked_cb0 = mask_audio_logits(guided_cb0, token_ids.audio_pad, token_ids.audio_bos)
                 codebook_token = sample_audio_logits_fn(masked_cb0, config.audio.temperature, config.audio.top_k)
                 audio_buf[:, 0, t + 1] = codebook_token
+                t1 = time.time()
+                timing_stats['audio_sampling'] += (t1 - t0)
 
                 prev_audio = codebook_token.expand(branches)
                 main_tokens.fill_(main_token)
                 aux_tokens.fill_(second_token)
 
                 # Depformer stages - use CUDA graph if enabled
+                t0 = time.time()
                 for stage in range(runtime.model.depformer.num_depth):
                     if use_graph and dep_captures is not None:
                         if depformer_needs_compiling[stage]:
@@ -728,10 +774,15 @@ def run_streaming_generation_loop(
                     audio_buf[:, stage + 1, t + 1] = stage_token
                     prev_audio = stage_token.expand(branches)
 
+                t1 = time.time()
+                timing_stats['depformer_stages'] += (t1 - t0)
+
                 last_step = t
+                timing_stats['step_count'] += 1
 
                 if eos_cutoff is None and state.end_step is not None:
                     eos_cutoff = state.end_step + flush_tail
+                    print(f"[TIMING] EOS detected at step {t}, eos_cutoff set to {eos_cutoff}", file=sys.stderr)
 
                 # Check if we have enough frames for a chunk
                 frames_generated = t + 1 - last_decoded_step
@@ -760,7 +811,10 @@ def run_streaming_generation_loop(
                     if aligned_chunk.shape[-1] > 0:
                         try:
                             # Decode audio chunk
+                            t0 = time.time()
                             chunk_waveform = decode_audio(runtime, aligned_chunk)
+                            t1 = time.time()
+                            timing_stats['audio_decode'] += (t1 - t0)
 
                             if chunk_waveform.numel() > 0:
                                 # Encode to WAV
@@ -836,6 +890,20 @@ def run_streaming_generation_loop(
             total_chunks=chunk_index,
             total_duration_ms=total_audio_ms,
         )
+
+        # Print timing summary
+        total_elapsed = time.time() - generation_start_time
+        step_count = timing_stats['step_count']
+        print(f"\n[TIMING SUMMARY] Total: {total_elapsed*1000:.0f}ms, Steps: {step_count}, Audio: {total_audio_ms:.0f}ms", file=sys.stderr)
+        print(f"  CUDA graph capture: {timing_stats['cuda_graph_capture']*1000:.0f}ms", file=sys.stderr)
+        print(f"  Transformer steps:  {timing_stats['transformer_step']*1000:.0f}ms ({timing_stats['transformer_step']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Text sampling:      {timing_stats['text_sampling']*1000:.0f}ms ({timing_stats['text_sampling']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Machine process:    {timing_stats['machine_process']*1000:.0f}ms ({timing_stats['machine_process']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Audio sampling:     {timing_stats['audio_sampling']*1000:.0f}ms ({timing_stats['audio_sampling']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Depformer stages:   {timing_stats['depformer_stages']*1000:.0f}ms ({timing_stats['depformer_stages']/max(step_count,1)*1000:.1f}ms/step)", file=sys.stderr)
+        print(f"  Audio decode:       {timing_stats['audio_decode']*1000:.0f}ms", file=sys.stderr)
+        accounted = sum(timing_stats.values()) - timing_stats['step_count']
+        print(f"  Other/overhead:     {(total_elapsed - accounted)*1000:.0f}ms", file=sys.stderr)
 
         if logger:
             elapsed = time.time() - generation_start_time
