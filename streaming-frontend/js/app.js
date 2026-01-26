@@ -30,11 +30,25 @@ document.addEventListener('DOMContentLoaded', () => {
     const chunkList = document.getElementById('chunk-list');
     const chunkTotal = document.getElementById('chunk-total');
 
-    // Advanced settings
+    // Advanced settings - Sampling
     const audioTempInput = document.getElementById('audio-temp');
+    const audioTopKInput = document.getElementById('audio-top-k');
     const textTempInput = document.getElementById('text-temp');
+    const textTopKInput = document.getElementById('text-top-k');
+
+    // Advanced settings - CFG
     const cfgScaleInput = document.getElementById('cfg-scale');
+    const cfgFilterKInput = document.getElementById('cfg-filter-k');
+
+    // Advanced settings - Streaming
     const chunkSizeInput = document.getElementById('chunk-size');
+    const minChunkSizeInput = document.getElementById('min-chunk-size');
+
+    // Voice cloning
+    const speaker1AudioInput = document.getElementById('speaker-1-audio');
+    const speaker1Status = document.getElementById('speaker-1-status');
+    const speaker2AudioInput = document.getElementById('speaker-2-audio');
+    const speaker2Status = document.getElementById('speaker-2-status');
 
     // Timer elements
     const generationTimer = document.getElementById('generation-timer');
@@ -49,6 +63,10 @@ document.addEventListener('DOMContentLoaded', () => {
     let generationStartTime = null;
     let timerInterval = null;
     let firstChunkTime = null;
+
+    // Voice cloning state (base64 encoded audio)
+    let speaker1AudioData = null;
+    let speaker2AudioData = null;
 
     // Initialize WebSocket client
     function initWebSocket() {
@@ -292,10 +310,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const options = {
             model: modelSelect.value,
+            // Sampling config
             audioTemperature: parseFloat(audioTempInput.value) || 0.8,
+            audioTopK: parseInt(audioTopKInput.value) || 50,
             textTemperature: parseFloat(textTempInput.value) || 0.6,
+            textTopK: parseInt(textTopKInput.value) || 50,
+            // CFG config
             cfgScale: parseFloat(cfgScaleInput.value) || 2.0,
-            chunkSize: parseInt(chunkSizeInput.value) || 8
+            cfgFilterK: parseInt(cfgFilterKInput.value) || 50,
+            // Streaming config
+            chunkSizeFrames: parseInt(chunkSizeInput.value) || 32,
+            minChunkFrames: parseInt(minChunkSizeInput.value) || 16,
+            // Voice cloning (base64 audio data)
+            speaker1Audio: speaker1AudioData,
+            speaker2Audio: speaker2AudioData
         };
 
         if (streamInputCheckbox.checked) {
@@ -339,12 +367,83 @@ document.addEventListener('DOMContentLoaded', () => {
         charCount.textContent = textInput.value.length;
     }
 
+    // Voice cloning file upload handlers
+    function handleSpeaker1Upload(event) {
+        const file = event.target.files[0];
+        if (!file) {
+            speaker1AudioData = null;
+            speaker1Status.textContent = '';
+            speaker1Status.className = 'upload-status';
+            return;
+        }
+
+        // Validate file type
+        if (!file.type.includes('wav') && !file.name.endsWith('.wav')) {
+            speaker1Status.textContent = 'Error: Only WAV files are supported';
+            speaker1Status.className = 'upload-status error';
+            speaker1AudioData = null;
+            return;
+        }
+
+        // Read and convert to base64
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            // Get base64 part (remove data:audio/wav;base64, prefix)
+            const base64 = e.target.result.split(',')[1];
+            speaker1AudioData = base64;
+            speaker1Status.textContent = `Loaded: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+            speaker1Status.className = 'upload-status loaded';
+        };
+        reader.onerror = function() {
+            speaker1Status.textContent = 'Error reading file';
+            speaker1Status.className = 'upload-status error';
+            speaker1AudioData = null;
+        };
+        reader.readAsDataURL(file);
+    }
+
+    function handleSpeaker2Upload(event) {
+        const file = event.target.files[0];
+        if (!file) {
+            speaker2AudioData = null;
+            speaker2Status.textContent = '';
+            speaker2Status.className = 'upload-status';
+            return;
+        }
+
+        // Validate file type
+        if (!file.type.includes('wav') && !file.name.endsWith('.wav')) {
+            speaker2Status.textContent = 'Error: Only WAV files are supported';
+            speaker2Status.className = 'upload-status error';
+            speaker2AudioData = null;
+            return;
+        }
+
+        // Read and convert to base64
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            // Get base64 part (remove data:audio/wav;base64, prefix)
+            const base64 = e.target.result.split(',')[1];
+            speaker2AudioData = base64;
+            speaker2Status.textContent = `Loaded: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+            speaker2Status.className = 'upload-status loaded';
+        };
+        reader.onerror = function() {
+            speaker2Status.textContent = 'Error reading file';
+            speaker2Status.className = 'upload-status error';
+            speaker2AudioData = null;
+        };
+        reader.readAsDataURL(file);
+    }
+
     // Event Listeners
     generateBtn.addEventListener('click', handleGenerate);
     cancelBtn.addEventListener('click', handleCancel);
     playPauseBtn.addEventListener('click', handlePlayPause);
     volumeSlider.addEventListener('input', handleVolumeChange);
     textInput.addEventListener('input', updateCharCount);
+    speaker1AudioInput.addEventListener('change', handleSpeaker1Upload);
+    speaker2AudioInput.addEventListener('change', handleSpeaker2Upload);
 
     // Initialize
     initWebSocket();

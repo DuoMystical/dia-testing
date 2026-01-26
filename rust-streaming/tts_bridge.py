@@ -73,6 +73,10 @@ def load_model(model_size: str):
     # Check if model needs to be loaded
     if _model is not None and _model_size == model_size and _device == device:
         emit_status("Model already loaded", 0.2)
+        # Log max_delay for debugging/optimization
+        runtime = _model._ensure_runtime()
+        max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
+        print(f"[INFO] Model max_delay: {max_delay} frames (chunk_size must be > {max_delay})", file=sys.stderr)
         return _model
 
     emit_status(f"Loading Dia2-{model_size.upper()} on {device}...", 0.1)
@@ -88,12 +92,19 @@ def load_model(model_size: str):
     _device = device
     _model_size = model_size
 
+    # Log max_delay for debugging/optimization
+    runtime = model._ensure_runtime()
+    max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
+    print(f"[INFO] Model loaded. max_delay: {max_delay} frames (chunk_size must be > {max_delay})", file=sys.stderr)
+
     emit_status("Model loaded", 0.2)
     return model
 
 
 def process_request(request: dict):
     """Process a single TTS request."""
+    import tempfile
+    import os
     from dia2 import (
         GenerationConfig,
         SamplingConfig,
@@ -112,7 +123,35 @@ def process_request(request: dict):
         emit_error("Text input is required")
         return
 
+    # Handle voice cloning - base64 audio data for speakers
+    prefix_speaker_1 = None
+    prefix_speaker_2 = None
+    temp_files = []
+
     try:
+        # Handle voice cloning audio
+        speaker_1_audio = config_overrides.get("speaker_1_audio")
+        speaker_2_audio = config_overrides.get("speaker_2_audio")
+
+        if speaker_1_audio:
+            # Decode base64 and write to temp file
+            audio_bytes = base64.b64decode(speaker_1_audio)
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            os.write(fd, audio_bytes)
+            os.close(fd)
+            prefix_speaker_1 = path
+            temp_files.append(path)
+            print(f"[INFO] Voice cloning: Speaker 1 audio saved to {path} ({len(audio_bytes)} bytes)", file=sys.stderr)
+
+        if speaker_2_audio:
+            audio_bytes = base64.b64decode(speaker_2_audio)
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            os.write(fd, audio_bytes)
+            os.close(fd)
+            prefix_speaker_2 = path
+            temp_files.append(path)
+            print(f"[INFO] Voice cloning: Speaker 2 audio saved to {path} ({len(audio_bytes)} bytes)", file=sys.stderr)
+
         # Load model (will be fast if already loaded)
         model = load_model(model_size)
 
@@ -142,15 +181,19 @@ def process_request(request: dict):
             emit_status_every=config_overrides.get("emit_status_every", 5),
         )
 
-        # Generate with streaming
+        # Generate with streaming (include voice cloning if provided)
         event_count = 0
         audio_chunk_count = 0
         print(f"Starting generate_stream with text: {text[:50]}...", file=sys.stderr)
+        if prefix_speaker_1 or prefix_speaker_2:
+            print(f"  Voice cloning enabled: S1={prefix_speaker_1}, S2={prefix_speaker_2}", file=sys.stderr)
 
         for event in model.generate_stream(
             text,
             config=gen_config,
             streaming_config=streaming_config,
+            prefix_speaker_1=prefix_speaker_1,
+            prefix_speaker_2=prefix_speaker_2,
             verbose=False,  # Must be False - verbose=True outputs to stdout and corrupts JSON protocol
         ):
             event_count += 1
@@ -179,6 +222,16 @@ def process_request(request: dict):
         import traceback
         emit_error(f"Generation error: {e}")
         print(traceback.format_exc(), file=sys.stderr)
+
+    finally:
+        # Clean up temp files for voice cloning
+        import os
+        for temp_file in temp_files:
+            try:
+                os.unlink(temp_file)
+                print(f"[INFO] Cleaned up temp file: {temp_file}", file=sys.stderr)
+            except Exception as cleanup_err:
+                print(f"[WARN] Failed to clean up {temp_file}: {cleanup_err}", file=sys.stderr)
 
 
 def main():

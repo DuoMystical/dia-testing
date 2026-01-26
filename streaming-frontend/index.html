@@ -95,22 +95,83 @@
             <section class="advanced-section">
                 <details>
                     <summary>Advanced Settings</summary>
-                    <div class="settings-grid">
-                        <div class="setting">
-                            <label for="audio-temp">Audio Temperature:</label>
-                            <input type="number" id="audio-temp" value="0.8" min="0.1" max="2.0" step="0.1">
+
+                    <!-- Voice Cloning Section -->
+                    <div class="settings-subsection">
+                        <h4>Voice Cloning (Optional)</h4>
+                        <p class="settings-hint">Upload WAV files (3-10 seconds) to clone voices for [S1] and [S2] speakers.</p>
+                        <div class="voice-clone-grid">
+                            <div class="setting voice-upload">
+                                <label for="speaker-1-audio">Speaker 1 [S1] Voice:</label>
+                                <input type="file" id="speaker-1-audio" accept="audio/wav,audio/x-wav,.wav">
+                                <span id="speaker-1-status" class="upload-status"></span>
+                            </div>
+                            <div class="setting voice-upload">
+                                <label for="speaker-2-audio">Speaker 2 [S2] Voice:</label>
+                                <input type="file" id="speaker-2-audio" accept="audio/wav,audio/x-wav,.wav">
+                                <span id="speaker-2-status" class="upload-status"></span>
+                            </div>
                         </div>
-                        <div class="setting">
-                            <label for="text-temp">Text Temperature:</label>
-                            <input type="number" id="text-temp" value="0.6" min="0.1" max="2.0" step="0.1">
+                    </div>
+
+                    <!-- Sampling Settings -->
+                    <div class="settings-subsection">
+                        <h4>Sampling Parameters</h4>
+                        <div class="settings-grid">
+                            <div class="setting">
+                                <label for="audio-temp">Audio Temperature:</label>
+                                <input type="number" id="audio-temp" value="0.8" min="0.1" max="2.0" step="0.1">
+                                <span class="setting-hint">Higher = more varied audio (0.1-2.0)</span>
+                            </div>
+                            <div class="setting">
+                                <label for="audio-top-k">Audio Top-K:</label>
+                                <input type="number" id="audio-top-k" value="50" min="1" max="500" step="1">
+                                <span class="setting-hint">Token sampling diversity (1-500)</span>
+                            </div>
+                            <div class="setting">
+                                <label for="text-temp">Text Temperature:</label>
+                                <input type="number" id="text-temp" value="0.6" min="0.1" max="2.0" step="0.1">
+                                <span class="setting-hint">Higher = more varied text encoding (0.1-2.0)</span>
+                            </div>
+                            <div class="setting">
+                                <label for="text-top-k">Text Top-K:</label>
+                                <input type="number" id="text-top-k" value="50" min="1" max="500" step="1">
+                                <span class="setting-hint">Token sampling diversity (1-500)</span>
+                            </div>
                         </div>
-                        <div class="setting">
-                            <label for="cfg-scale">CFG Scale:</label>
-                            <input type="number" id="cfg-scale" value="2.0" min="1.0" max="5.0" step="0.1">
+                    </div>
+
+                    <!-- CFG Settings -->
+                    <div class="settings-subsection">
+                        <h4>Classifier-Free Guidance</h4>
+                        <div class="settings-grid">
+                            <div class="setting">
+                                <label for="cfg-scale">CFG Scale:</label>
+                                <input type="number" id="cfg-scale" value="2.0" min="1.0" max="5.0" step="0.1">
+                                <span class="setting-hint">Guidance strength (1.0=disabled, 2.0=default)</span>
+                            </div>
+                            <div class="setting">
+                                <label for="cfg-filter-k">CFG Filter K:</label>
+                                <input type="number" id="cfg-filter-k" value="50" min="1" max="200" step="1">
+                                <span class="setting-hint">Top-K filter for guidance (1-200)</span>
+                            </div>
                         </div>
-                        <div class="setting">
-                            <label for="chunk-size">Chunk Size (frames):</label>
-                            <input type="number" id="chunk-size" value="8" min="4" max="25" step="1">
+                    </div>
+
+                    <!-- Streaming Settings -->
+                    <div class="settings-subsection">
+                        <h4>Streaming Parameters</h4>
+                        <div class="settings-grid">
+                            <div class="setting">
+                                <label for="chunk-size">Chunk Size (frames):</label>
+                                <input type="number" id="chunk-size" value="32" min="16" max="64" step="1">
+                                <span class="setting-hint">Frames per audio chunk (must be > audio delay ~12-16)</span>
+                            </div>
+                            <div class="setting">
+                                <label for="min-chunk-size">Min Chunk Size:</label>
+                                <input type="number" id="min-chunk-size" value="16" min="8" max="32" step="1">
+                                <span class="setting-hint">Minimum frames before emitting chunk</span>
+                            </div>
                         </div>
                     </div>
                 </details>

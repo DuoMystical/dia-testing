@@ -1,6 +1,6 @@
 /**
  * Audio Streamer for Dia2 TTS
- * Handles real-time audio playback of streaming WAV chunks
+ * Handles real-time gapless audio playback of streaming WAV chunks
  */
 
 class AudioStreamer {
@@ -8,14 +8,24 @@ class AudioStreamer {
         this.audioContext = null;
         this.gainNode = null;
         this.analyser = null;
-        this.chunks = [];
-        this.currentChunkIndex = 0;
+
+        // Chunk storage - indexed by chunk number for proper ordering
+        this.chunkBuffers = new Map(); // chunkIndex -> AudioBuffer
+        this.nextExpectedChunk = 0;
+        this.highestChunkReceived = -1;
+
+        // Playback state
         this.isPlaying = false;
         this.isPaused = false;
-        this.currentSource = null;
-        this.startTime = 0;
-        this.pauseTime = 0;
-        this.totalDuration = 0;
+        this.scheduledSources = []; // Track scheduled sources for cleanup
+        this.nextPlayTime = 0; // When the next chunk should start
+        this.playbackStartTime = 0; // When playback began
+        this.totalScheduledDuration = 0;
+        this.lastScheduledChunk = -1;
+
+        // Scheduling settings
+        this.scheduleAheadTime = 0.1; // Schedule 100ms ahead
+        this.schedulerInterval = null;
 
         // Playback settings
         this.volume = options.volume || 0.8;
@@ -50,9 +60,9 @@ class AudioStreamer {
             this.gainNode.connect(this.analyser);
             this.analyser.connect(this.audioContext.destination);
 
-            console.log('AudioStreamer initialized');
+            console.log('[AudioStreamer] Initialized');
         } catch (error) {
-            console.error('Failed to initialize AudioContext:', error);
+            console.error('[AudioStreamer] Failed to initialize AudioContext:', error);
             throw error;
         }
     }
@@ -66,7 +76,6 @@ class AudioStreamer {
         }
 
         try {
-            // Debug: log chunk info
             console.log(`[AudioStreamer] Adding chunk ${chunkIndex}, data size: ${wavData.byteLength} bytes`);
 
             // Validate WAV header
@@ -82,26 +91,24 @@ class AudioStreamer {
 
             console.log(`[AudioStreamer] Chunk ${chunkIndex} decoded: ${audioBuffer.duration.toFixed(3)}s, ${audioBuffer.sampleRate}Hz`);
 
-            this.chunks.push({
-                buffer: audioBuffer,
-                index: chunkIndex,
-                duration: audioBuffer.duration,
-                played: false
-            });
-
-            this.totalDuration = this.chunks.reduce((sum, c) => sum + c.duration, 0);
+            // Store by index for proper ordering
+            this.chunkBuffers.set(chunkIndex, audioBuffer);
+            this.highestChunkReceived = Math.max(this.highestChunkReceived, chunkIndex);
 
             // Auto-play if enabled and this is the first chunk
-            if (this.autoPlay && this.chunks.length === 1 && !this.isPlaying) {
+            if (this.autoPlay && chunkIndex === 0 && !this.isPlaying) {
                 console.log('[AudioStreamer] Auto-playing first chunk');
-                this.play();
+                await this.play();
+            }
+
+            // If already playing, try to schedule newly arrived chunks
+            if (this.isPlaying && !this.isPaused) {
+                this._scheduleAvailableChunks();
             }
 
             return audioBuffer.duration;
         } catch (error) {
             console.error(`[AudioStreamer] Failed to decode chunk ${chunkIndex}:`, error);
-            console.error('[AudioStreamer] Data size:', wavData.byteLength);
-            // Log first few bytes for debugging
             if (wavData.byteLength > 0) {
                 const bytes = new Uint8Array(wavData.slice(0, 16));
                 console.error('[AudioStreamer] First 16 bytes:', Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' '));
@@ -118,7 +125,7 @@ class AudioStreamer {
             await this.init();
         }
 
-        console.log(`[AudioStreamer] play() called, audioContext.state: ${this.audioContext.state}, chunks: ${this.chunks.length}`);
+        console.log(`[AudioStreamer] play() called, state: ${this.audioContext.state}, chunks: ${this.chunkBuffers.size}`);
 
         // Resume audio context if suspended
         if (this.audioContext.state === 'suspended') {
@@ -126,21 +133,116 @@ class AudioStreamer {
             await this.audioContext.resume();
         }
 
-        if (this.isPaused) {
-            // Resume from pause
-            console.log('[AudioStreamer] Resuming from pause');
+        if (!this.isPlaying) {
+            this.isPlaying = true;
             this.isPaused = false;
-            this.isPlaying = true;
-            this._playFromIndex(this.currentChunkIndex, this.pauseTime);
-        } else if (!this.isPlaying) {
-            // Start fresh
-            console.log('[AudioStreamer] Starting fresh playback');
-            this.isPlaying = true;
-            this.currentChunkIndex = 0;
-            this._playFromIndex(0, 0);
+
+            // Initialize playback timing
+            this.playbackStartTime = this.audioContext.currentTime;
+            this.nextPlayTime = this.audioContext.currentTime;
+            this.lastScheduledChunk = -1;
+            this.nextExpectedChunk = 0;
+            this.totalScheduledDuration = 0;
+
+            // Start the scheduler
+            this._startScheduler();
+            this._startUpdateLoop();
+
+            // Schedule initial chunks
+            this._scheduleAvailableChunks();
+        }
+    }
+
+    /**
+     * Schedule all available chunks in order
+     */
+    _scheduleAvailableChunks() {
+        // Schedule chunks in order starting from the next expected
+        while (this.chunkBuffers.has(this.lastScheduledChunk + 1)) {
+            const chunkIndex = this.lastScheduledChunk + 1;
+            const buffer = this.chunkBuffers.get(chunkIndex);
+
+            this._scheduleChunk(buffer, chunkIndex);
+            this.lastScheduledChunk = chunkIndex;
+        }
+    }
+
+    /**
+     * Schedule a single chunk for playback at the correct time
+     */
+    _scheduleChunk(buffer, chunkIndex) {
+        const source = this.audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.gainNode);
+
+        // Schedule to play at the exact right time
+        const startTime = this.nextPlayTime;
+        source.start(startTime);
+
+        console.log(`[AudioStreamer] Scheduled chunk ${chunkIndex} at ${startTime.toFixed(3)}s, duration: ${buffer.duration.toFixed(3)}s`);
+
+        // Track this source
+        this.scheduledSources.push({
+            source,
+            chunkIndex,
+            startTime,
+            endTime: startTime + buffer.duration
+        });
+
+        // Update timing for next chunk
+        this.nextPlayTime = startTime + buffer.duration;
+        this.totalScheduledDuration += buffer.duration;
+
+        // Notify chunk play when it actually starts
+        const timeUntilStart = (startTime - this.audioContext.currentTime) * 1000;
+        if (timeUntilStart > 0) {
+            setTimeout(() => this.onChunkPlay(chunkIndex), timeUntilStart);
+        } else {
+            this.onChunkPlay(chunkIndex);
         }
 
-        this._startUpdateLoop();
+        // Handle source end
+        source.onended = () => {
+            // Remove from tracked sources
+            this.scheduledSources = this.scheduledSources.filter(s => s.source !== source);
+
+            // Check if playback is complete
+            if (this.scheduledSources.length === 0 && this.lastScheduledChunk === this.highestChunkReceived) {
+                // Wait a moment to see if more chunks arrive
+                setTimeout(() => {
+                    if (this.scheduledSources.length === 0 && this.lastScheduledChunk === this.highestChunkReceived) {
+                        console.log('[AudioStreamer] Playback complete');
+                        this.isPlaying = false;
+                        this.onPlaybackEnd();
+                        this._stopScheduler();
+                        this._stopUpdateLoop();
+                    }
+                }, 200);
+            }
+        };
+    }
+
+    /**
+     * Start the scheduler that checks for new chunks to schedule
+     */
+    _startScheduler() {
+        if (this.schedulerInterval) return;
+
+        this.schedulerInterval = setInterval(() => {
+            if (this.isPlaying && !this.isPaused) {
+                this._scheduleAvailableChunks();
+            }
+        }, 50); // Check every 50ms
+    }
+
+    /**
+     * Stop the scheduler
+     */
+    _stopScheduler() {
+        if (this.schedulerInterval) {
+            clearInterval(this.schedulerInterval);
+            this.schedulerInterval = null;
+        }
     }
 
     /**
@@ -151,17 +253,18 @@ class AudioStreamer {
 
         this.isPaused = true;
         this.isPlaying = false;
-        this.pauseTime = this.getCurrentTime();
 
-        if (this.currentSource) {
+        // Stop all scheduled sources
+        for (const scheduled of this.scheduledSources) {
             try {
-                this.currentSource.stop();
+                scheduled.source.stop();
             } catch (e) {
                 // Ignore if already stopped
             }
-            this.currentSource = null;
         }
+        this.scheduledSources = [];
 
+        this._stopScheduler();
         this._stopUpdateLoop();
     }
 
@@ -171,18 +274,18 @@ class AudioStreamer {
     stop() {
         this.isPlaying = false;
         this.isPaused = false;
-        this.currentChunkIndex = 0;
-        this.pauseTime = 0;
 
-        if (this.currentSource) {
+        // Stop all scheduled sources
+        for (const scheduled of this.scheduledSources) {
             try {
-                this.currentSource.stop();
+                scheduled.source.stop();
             } catch (e) {
                 // Ignore if already stopped
             }
-            this.currentSource = null;
         }
+        this.scheduledSources = [];
 
+        this._stopScheduler();
         this._stopUpdateLoop();
     }
 
@@ -191,9 +294,13 @@ class AudioStreamer {
      */
     reset() {
         this.stop();
-        this.chunks = [];
-        this.totalDuration = 0;
-        this.startTime = 0;
+        this.chunkBuffers.clear();
+        this.nextExpectedChunk = 0;
+        this.highestChunkReceived = -1;
+        this.lastScheduledChunk = -1;
+        this.nextPlayTime = 0;
+        this.playbackStartTime = 0;
+        this.totalScheduledDuration = 0;
     }
 
     /**
@@ -211,37 +318,29 @@ class AudioStreamer {
      */
     getCurrentTime() {
         if (!this.isPlaying || !this.audioContext) {
-            return this.pauseTime;
+            return 0;
         }
 
-        // Calculate time based on chunks played
-        let time = 0;
-        for (let i = 0; i < this.currentChunkIndex; i++) {
-            if (this.chunks[i]) {
-                time += this.chunks[i].duration;
-            }
-        }
-
-        // Add time within current chunk
-        if (this.startTime > 0) {
-            time += this.audioContext.currentTime - this.startTime;
-        }
-
-        return Math.min(time, this.totalDuration);
+        const elapsed = this.audioContext.currentTime - this.playbackStartTime;
+        return Math.min(elapsed, this.totalScheduledDuration);
     }
 
     /**
-     * Get total duration
+     * Get total duration of all received chunks
      */
     getTotalDuration() {
-        return this.totalDuration;
+        let total = 0;
+        for (const buffer of this.chunkBuffers.values()) {
+            total += buffer.duration;
+        }
+        return total;
     }
 
     /**
      * Get chunk count
      */
     getChunkCount() {
-        return this.chunks.length;
+        return this.chunkBuffers.size;
     }
 
     /**
@@ -257,51 +356,6 @@ class AudioStreamer {
     }
 
     /**
-     * Internal: Play from a specific chunk index
-     */
-    _playFromIndex(index, timeOffset = 0) {
-        console.log(`[AudioStreamer] _playFromIndex(${index}), chunks available: ${this.chunks.length}`);
-
-        if (index >= this.chunks.length) {
-            console.log('[AudioStreamer] No more chunks to play, ending playback');
-            this.isPlaying = false;
-            this.onPlaybackEnd();
-            this._stopUpdateLoop();
-            return;
-        }
-
-        const chunk = this.chunks[index];
-        this.currentChunkIndex = index;
-
-        console.log(`[AudioStreamer] Playing chunk ${index}, duration: ${chunk.duration.toFixed(3)}s`);
-
-        // Create source for this chunk
-        this.currentSource = this.audioContext.createBufferSource();
-        this.currentSource.buffer = chunk.buffer;
-        this.currentSource.connect(this.gainNode);
-
-        // Handle chunk end
-        this.currentSource.onended = () => {
-            console.log(`[AudioStreamer] Chunk ${index} ended`);
-            if (this.isPlaying && !this.isPaused) {
-                chunk.played = true;
-                this._playFromIndex(index + 1, 0);
-            }
-        };
-
-        // Start playback
-        this.startTime = this.audioContext.currentTime;
-
-        if (timeOffset > 0 && timeOffset < chunk.duration) {
-            this.currentSource.start(0, timeOffset);
-        } else {
-            this.currentSource.start(0);
-        }
-
-        this.onChunkPlay(index);
-    }
-
-    /**
      * Internal: Start update loop for time and visualizer
      */
     _startUpdateLoop() {
@@ -309,7 +363,7 @@ class AudioStreamer {
             if (!this.isPlaying) return;
 
             const currentTime = this.getCurrentTime();
-            this.onTimeUpdate(currentTime, this.totalDuration);
+            this.onTimeUpdate(currentTime, this.getTotalDuration());
 
             const visualizerData = this.getVisualizerData();
             this.onVisualizerData(visualizerData);

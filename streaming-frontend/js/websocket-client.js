@@ -110,16 +110,33 @@ class WebSocketClient {
      * Send a generate request (non-streaming input)
      */
     generate(text, options = {}) {
+        const config = {
+            // Sampling parameters
+            audio_temperature: options.audioTemperature || 0.8,
+            audio_top_k: options.audioTopK || 50,
+            text_temperature: options.textTemperature || 0.6,
+            text_top_k: options.textTopK || 50,
+            // CFG parameters
+            cfg_scale: options.cfgScale || 2.0,
+            cfg_filter_k: options.cfgFilterK || 50,
+            // Streaming parameters
+            chunk_size_frames: options.chunkSizeFrames || 32,
+            min_chunk_frames: options.minChunkFrames || 16
+        };
+
+        // Add voice cloning audio if provided
+        if (options.speaker1Audio) {
+            config.speaker_1_audio = options.speaker1Audio;
+        }
+        if (options.speaker2Audio) {
+            config.speaker_2_audio = options.speaker2Audio;
+        }
+
         return this.send({
             type: 'generate',
             text: text,
             model: options.model || '2b',
-            config: {
-                audio_temperature: options.audioTemperature || 0.8,
-                text_temperature: options.textTemperature || 0.6,
-                cfg_scale: options.cfgScale || 2.0,
-                chunk_size_frames: options.chunkSize || 8
-            }
+            config: config
         });
     }
 
