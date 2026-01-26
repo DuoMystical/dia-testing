@@ -199,6 +199,7 @@ class WebSocketClient {
                 case 'audio_chunk':
                     // Decode base64 audio data
                     const audioBytes = this._base64ToArrayBuffer(data.data);
+                    console.log(`[WebSocket] Received audio chunk: index=${data.chunk_index}, size=${audioBytes.byteLength} bytes`);
                     this.onAudioChunk({
                         data: audioBytes,
                         chunkIndex: data.chunk_index,

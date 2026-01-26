@@ -93,11 +93,14 @@ class AudioStreamer {
 
             // Store by index for proper ordering
             this.chunkBuffers.set(chunkIndex, audioBuffer);
+
+            // Track if this is our first chunk (regardless of index)
+            const isFirstChunk = this.highestChunkReceived === -1;
             this.highestChunkReceived = Math.max(this.highestChunkReceived, chunkIndex);
 
-            // Auto-play if enabled and this is the first chunk
-            if (this.autoPlay && chunkIndex === 0 && !this.isPlaying) {
-                console.log('[AudioStreamer] Auto-playing first chunk');
+            // Auto-play if enabled and this is the first chunk we've received (not necessarily index 0)
+            if (this.autoPlay && isFirstChunk && !this.isPlaying) {
+                console.log(`[AudioStreamer] Auto-playing first chunk (index=${chunkIndex})`);
                 await this.play();
             }
 
@@ -140,9 +143,17 @@ class AudioStreamer {
             // Initialize playback timing
             this.playbackStartTime = this.audioContext.currentTime;
             this.nextPlayTime = this.audioContext.currentTime;
-            this.lastScheduledChunk = -1;
-            this.nextExpectedChunk = 0;
             this.totalScheduledDuration = 0;
+
+            // Find the minimum chunk index we have, and set lastScheduledChunk to one less
+            const chunkIndices = Array.from(this.chunkBuffers.keys()).sort((a, b) => a - b);
+            if (chunkIndices.length > 0) {
+                this.lastScheduledChunk = chunkIndices[0] - 1;
+                console.log(`[AudioStreamer] Starting playback: available chunks=[${chunkIndices.join(',')}], lastScheduledChunk=${this.lastScheduledChunk}`);
+            } else {
+                this.lastScheduledChunk = -1;
+                console.log('[AudioStreamer] Starting playback with no chunks yet');
+            }
 
             // Start the scheduler
             this._startScheduler();
@@ -157,13 +168,41 @@ class AudioStreamer {
      * Schedule all available chunks in order
      */
     _scheduleAvailableChunks() {
-        // Schedule chunks in order starting from the next expected
-        while (this.chunkBuffers.has(this.lastScheduledChunk + 1)) {
-            const chunkIndex = this.lastScheduledChunk + 1;
-            const buffer = this.chunkBuffers.get(chunkIndex);
+        // Debug: log current state
+        const chunkIndices = Array.from(this.chunkBuffers.keys()).sort((a, b) => a - b);
 
-            this._scheduleChunk(buffer, chunkIndex);
-            this.lastScheduledChunk = chunkIndex;
+        // First, check if we have ANY unscheduled chunks
+        const unscheduledChunks = chunkIndices.filter(idx => idx > this.lastScheduledChunk);
+
+        if (unscheduledChunks.length > 0) {
+            console.log(`[AudioStreamer] Scheduling: lastScheduled=${this.lastScheduledChunk}, available=[${chunkIndices.join(',')}], unscheduled=[${unscheduledChunks.join(',')}]`);
+        }
+
+        // Schedule chunks in order starting from the next expected
+        // But also handle gaps - if we're missing chunk N, skip to the next available
+        while (true) {
+            const nextExpected = this.lastScheduledChunk + 1;
+
+            if (this.chunkBuffers.has(nextExpected)) {
+                // Normal case: next chunk is available
+                const buffer = this.chunkBuffers.get(nextExpected);
+                this._scheduleChunk(buffer, nextExpected);
+                this.lastScheduledChunk = nextExpected;
+            } else {
+                // Check if there are any chunks with higher indices we should schedule
+                // This handles cases where chunk indices skip (e.g., 0, 2, 4 instead of 0, 1, 2)
+                const nextAvailable = chunkIndices.find(idx => idx > this.lastScheduledChunk);
+
+                if (nextAvailable !== undefined && nextAvailable !== nextExpected) {
+                    console.warn(`[AudioStreamer] Gap detected! Expected chunk ${nextExpected}, scheduling ${nextAvailable} instead`);
+                    const buffer = this.chunkBuffers.get(nextAvailable);
+                    this._scheduleChunk(buffer, nextAvailable);
+                    this.lastScheduledChunk = nextAvailable;
+                } else {
+                    // No more chunks to schedule
+                    break;
+                }
+            }
         }
     }
 
