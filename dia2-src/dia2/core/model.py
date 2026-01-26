@@ -18,6 +18,13 @@ class DecodeState:
     transformer: KVCache
     depformer: KVCache
 
+    def clone(self) -> "DecodeState":
+        """Create a deep copy of this decode state."""
+        return DecodeState(
+            transformer=self.transformer.clone(),
+            depformer=self.depformer.clone(),
+        )
+
 
 class Dia2Model(nn.Module):
     def __init__(

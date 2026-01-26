@@ -68,6 +68,14 @@ class GenerationState:
     def reset_dep_cache(self) -> None:
         self.decode.depformer.reset()
 
+    def clone(self) -> "GenerationState":
+        """Create a deep copy of this generation state for caching."""
+        return GenerationState(
+            decode=self.decode.clone(),
+            step_tokens=self.step_tokens.clone(),
+            audio_buf=self.audio_buf.clone(),
+        )
+
 
 @dataclass
 class NetworkBuffers:
@@ -460,11 +468,39 @@ def run_generation_loop(
 
 
 def decode_audio(runtime: RuntimeContext, tokens: torch.Tensor) -> torch.Tensor:
+    """Decode audio tokens to waveform (stateless)."""
     if tokens.shape[-1] == 0:
         return torch.zeros(0, device=runtime.device)
     with torch.inference_mode():
         pcm = runtime.mimi.decode(tokens.to(runtime.device))
         return pcm[0, 0]
+
+
+def decode_audio_streaming(
+    runtime: RuntimeContext,
+    tokens: torch.Tensor,
+    decoder_state=None,
+):
+    """Decode audio tokens to waveform with state preservation for streaming.
+
+    This maintains decoder state across chunks for seamless audio transitions.
+
+    Args:
+        runtime: Runtime context containing the mimi codec
+        tokens: Audio tokens to decode
+        decoder_state: Previous decoder state, or None for first chunk
+
+    Returns:
+        Tuple of (waveform, new_decoder_state)
+    """
+    if tokens.shape[-1] == 0:
+        return torch.zeros(0, device=runtime.device), decoder_state
+    with torch.inference_mode():
+        pcm, new_state = runtime.mimi.decode_with_state(
+            tokens.to(runtime.device),
+            decoder_state=decoder_state,
+        )
+        return pcm[0, 0], new_state
 
 
 def _encode_wav_chunk(
@@ -488,6 +524,163 @@ def _encode_wav_chunk(
         wav_file.writeframes(pcm16.tobytes())
 
     return buffer.getvalue()
+
+
+def run_seed_warmup(
+    runtime: RuntimeContext,
+    generation: GenerationState,
+    config: GenerationConfig,
+    num_steps: int,
+) -> GenerationState:
+    """
+    Run warmup steps to establish seed-dependent state.
+
+    This runs num_steps of generation with only pad tokens (no text influence),
+    building up the KV cache and audio buffer based purely on the random seed.
+    The resulting state can be cached and reused for any text with the same seed.
+
+    Args:
+        runtime: Runtime context
+        generation: Initial generation state
+        config: Generation configuration
+        num_steps: Number of warmup steps (should be >= max_delay)
+
+    Returns:
+        The generation state after warmup, ready for caching
+    """
+    import sys
+
+    step_tokens = generation.step_tokens
+    audio_buf = generation.audio_buf
+    branches = step_tokens.shape[0]
+
+    positions = torch.empty(1, 1, dtype=torch.long, device=runtime.device)
+    main_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
+    aux_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
+    cfg_active = config.cfg_scale != 1.0
+    token_ids = runtime.constants
+    delay_tensor = runtime.audio_delay_tensor
+
+    use_graph = config.use_cuda_graph and runtime.device.type == "cuda"
+    sample_token_fn = sample_token
+    sample_audio_logits_fn = sample_audio_logits
+
+    transformer_step = runtime.transformer_step
+    depformer_step = runtime.depformer_step
+    buffers = _allocate_network_buffers(runtime, branches)
+    positions_view = positions.expand(branches, -1)
+
+    transformer_capture = None
+    dep_captures = None
+
+    if use_graph:
+        _ensure_graph_cublas_ready(runtime.device)
+
+    print(f"[WARMUP] Running {num_steps} warmup steps for seed caching", file=sys.stderr)
+
+    with torch.inference_mode():
+        for t in range(num_steps):
+            generation.reset_dep_cache()
+            positions.fill_(t)
+            _fill_audio_channels(step_tokens, audio_buf, delay_tensor, t, token_ids.audio_bos)
+
+            if branches > 1:
+                step_tokens[1:, 0, 0] = token_ids.zero
+                step_tokens[1:, 1, 0] = token_ids.pad
+
+            # Run transformer
+            if use_graph and transformer_capture is not None:
+                transformer_capture[0].replay()
+                hidden_t = transformer_capture[1]
+            else:
+                if use_graph and transformer_capture is None:
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        hidden_t = _execute_transformer_step(
+                            step_tokens, positions_view, generation,
+                            transformer_step, buffers,
+                        )
+                    transformer_capture = (graph, hidden_t)
+                    # Initialize dep_captures
+                    dep_captures = []
+                    for idx in range(runtime.model.depformer.num_depth):
+                        dep_captures.append({
+                            "graph": torch.cuda.CUDAGraph(),
+                            "captured": False,
+                            "prev_audio": torch.empty((branches,), dtype=torch.long, device=runtime.device),
+                            "main_tokens": torch.empty((branches,), dtype=torch.long, device=runtime.device) if idx == 0 else None,
+                            "second_tokens": torch.empty((branches,), dtype=torch.long, device=runtime.device) if idx == 0 else None,
+                        })
+                else:
+                    hidden_t = _execute_transformer_step(
+                        step_tokens, positions_view, generation,
+                        transformer_step, buffers,
+                    )
+
+            # Sample text token (but we'll force pad anyway during warmup)
+            guided_text = apply_classifier_guidance(buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k)
+            if guided_text.shape[0] > 1:
+                guided_text = guided_text[:1]
+            _ = sample_token_fn(guided_text, temp=config.text.temperature, top_k=config.text.top_k).item()
+
+            # During warmup, always output pad (no text influence)
+            main_token = token_ids.pad
+            second_token = token_ids.pad
+            step_tokens[:, 0, 0] = main_token
+            step_tokens[:, 1, 0] = second_token
+
+            # Sample audio token (CB0)
+            guided_cb0 = apply_classifier_guidance(buffers.cb0, cfg_active, config.cfg_scale, config.cfg_filter_k)
+            if guided_cb0.shape[0] > 1:
+                guided_cb0 = guided_cb0[:1]
+            masked_cb0 = mask_audio_logits(guided_cb0, token_ids.audio_pad, token_ids.audio_bos)
+            codebook_token = sample_audio_logits_fn(masked_cb0, config.audio.temperature, config.audio.top_k)
+            audio_buf[:, 0, t + 1] = codebook_token
+
+            # Run depformer stages
+            prev_audio = codebook_token.expand(branches)
+            main_tokens.fill_(main_token)
+            aux_tokens.fill_(second_token)
+
+            for stage in range(runtime.model.depformer.num_depth):
+                if use_graph and dep_captures is not None:
+                    dep_captures[stage] = _execute_depformer_graph(
+                        stage=stage,
+                        prev_audio=prev_audio,
+                        hidden_t=hidden_t,
+                        generation=generation,
+                        depformer_step=depformer_step,
+                        main_tokens=main_tokens,
+                        aux_tokens=aux_tokens,
+                        buffers=buffers,
+                        capture=dep_captures[stage],
+                    )
+                else:
+                    _execute_depformer_stage(
+                        stage_index=stage,
+                        prev_audio=prev_audio,
+                        hidden_t=hidden_t,
+                        generation=generation,
+                        depformer_step=depformer_step,
+                        main_tokens=main_tokens,
+                        second_tokens=aux_tokens,
+                        buffers=buffers,
+                    )
+
+                dep_logits = apply_classifier_guidance(
+                    buffers.dep[stage], cfg_active, config.cfg_scale, config.cfg_filter_k
+                )
+                if dep_logits.shape[0] > 1:
+                    dep_logits = dep_logits[:1]
+                stage_token = sample_audio_logits_fn(
+                    dep_logits, config.audio.temperature, config.audio.top_k
+                )
+                audio_buf[:, stage + 1, t + 1] = stage_token
+                prev_audio = stage_token.expand(branches)
+
+    print(f"[WARMUP] Completed {num_steps} warmup steps", file=sys.stderr)
+    return generation
 
 
 def run_streaming_generation_loop(
@@ -519,6 +712,7 @@ def run_streaming_generation_loop(
         StreamEvent objects (AudioChunkEvent, StatusEvent, CompleteEvent, ErrorEvent)
     """
     import time
+    import sys
 
     step_tokens = generation.step_tokens
     audio_buf = generation.audio_buf
@@ -586,6 +780,11 @@ def run_streaming_generation_loop(
     total_audio_ms = 0.0
     generation_start_time = time.time()
 
+    # Decoder state for maintaining continuity between audio chunks
+    # This preserves the Mimi decoder's internal state (key-value cache) across chunks,
+    # eliminating boundary artifacts that occur when decoding chunks independently
+    decoder_state = None
+
     # Track aligned frames we've already emitted (after undelay)
     # undelay output length = input_length - max_delay
     last_aligned_emitted = 0
@@ -608,7 +807,6 @@ def run_streaming_generation_loop(
     first_step_time = None
     cuda_graph_captured = False
 
-    import sys
     print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}", file=sys.stderr)
 
     yield StatusEvent(message="Starting generation", progress=0.0)
@@ -894,16 +1092,21 @@ def run_streaming_generation_loop(
                         if aligned_chunk.shape[-1] > 0:
                             try:
                                 # Step 3: Start decode on separate stream (async)
+                                # Use decode_audio_streaming to maintain decoder state across chunks
                                 t0 = time.time()
                                 if decode_stream is not None:
                                     with torch.cuda.stream(decode_stream):
-                                        chunk_waveform = decode_audio(runtime, aligned_chunk)
+                                        chunk_waveform, decoder_state = decode_audio_streaming(
+                                            runtime, aligned_chunk, decoder_state
+                                        )
                                     # Store for next iteration - decode runs async
                                     pending_decode = (chunk_waveform, chunk_index, total_audio_ms)
                                     chunk_index += 1
                                 else:
-                                    # No CUDA - decode synchronously
-                                    chunk_waveform = decode_audio(runtime, aligned_chunk)
+                                    # No CUDA - decode synchronously with state preservation
+                                    chunk_waveform, decoder_state = decode_audio_streaming(
+                                        runtime, aligned_chunk, decoder_state
+                                    )
                                     if chunk_waveform.numel() > 0:
                                         wav_bytes = _encode_wav_chunk(chunk_waveform, runtime.mimi.sample_rate)
                                         chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
@@ -978,8 +1181,11 @@ def run_streaming_generation_loop(
 
                     if aligned_remaining.shape[-1] > 0:
                         try:
-                            # Final chunk - decode synchronously (no point in async for last one)
-                            remaining_waveform = decode_audio(runtime, aligned_remaining)
+                            # Final chunk - decode synchronously with state preservation
+                            # This ensures continuity with previous chunks
+                            remaining_waveform, decoder_state = decode_audio_streaming(
+                                runtime, aligned_remaining, decoder_state
+                            )
 
                             if remaining_waveform.numel() > 0:
                                 wav_bytes = _encode_wav_chunk(remaining_waveform, runtime.mimi.sample_rate)
@@ -1072,6 +1278,7 @@ __all__ = [
     "build_initial_state",
     "run_generation_loop",
     "run_streaming_generation_loop",
+    "run_seed_warmup",
     "decode_audio",
     "warmup_with_prefix",
     "GenerationState",

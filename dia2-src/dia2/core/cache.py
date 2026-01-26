@@ -37,6 +37,12 @@ class CacheSlot:
     def reset(self) -> None:
         self.length.zero_()
 
+    def clone(self) -> "CacheSlot":
+        """Create a deep copy of this cache slot."""
+        cloned = CacheSlot(self.keys.clone(), self.values.clone())
+        cloned.length.copy_(self.length)
+        return cloned
+
     # Due to many CacheSlot instances being used in a model, we disable
     # compilation for this method to avoid excessive compile times.
     @torch.compiler.disable
@@ -104,6 +110,10 @@ class KVCache:
             slot.reset()
 
     clear = reset
+
+    def clone(self) -> "KVCache":
+        """Create a deep copy of this KV cache."""
+        return KVCache([slot.clone() for slot in self.slots])
 
 
 __all__ = ["CacheSlot", "KVCache"]

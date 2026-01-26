@@ -69,6 +69,7 @@
                     <span id="audio-duration">0.0s audio</span>
                     <span id="first-audio-time" class="first-audio-stat" hidden>First audio: --</span>
                     <span id="chunk-latency" class="latency-stat" hidden>Chunk latency: --</span>
+                    <span id="seed-display" class="seed-stat" hidden title="Click to copy">Seed: --</span>
                 </div>
                 <div class="chunk-timing-log" id="chunk-timing-log" hidden>
                     <h4>Chunk Timing</h4>
@@ -152,13 +153,25 @@
                         <div class="settings-grid">
                             <div class="setting">
                                 <label for="cfg-scale">CFG Scale:</label>
-                                <input type="number" id="cfg-scale" value="2.0" min="1.0" max="5.0" step="0.1">
-                                <span class="setting-hint">Guidance strength (1.0=disabled, 2.0=default)</span>
+                                <input type="number" id="cfg-scale" value="6.0" min="1.0" max="10.0" step="0.1">
+                                <span class="setting-hint">Guidance strength (1.0=disabled, 6.0=recommended)</span>
                             </div>
                             <div class="setting">
                                 <label for="cfg-filter-k">CFG Filter K:</label>
                                 <input type="number" id="cfg-filter-k" value="50" min="1" max="200" step="1">
                                 <span class="setting-hint">Top-K filter for guidance (1-200)</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Seed Settings -->
+                    <div class="settings-subsection">
+                        <h4>Random Seed</h4>
+                        <div class="settings-grid">
+                            <div class="setting">
+                                <label for="seed-input">Seed (optional):</label>
+                                <input type="text" id="seed-input" placeholder="Leave empty for random">
+                                <span class="setting-hint">Same seed = same voice. Copy from output to reuse.</span>
                             </div>
                         </div>
                     </div>
@@ -169,12 +182,12 @@
                         <div class="settings-grid">
                             <div class="setting">
                                 <label for="chunk-size">Chunk Size (frames):</label>
-                                <input type="number" id="chunk-size" value="19" min="19" max="64" step="1">
-                                <span class="setting-hint">Frames per chunk (min 19, ~0.25s per frame at 75fps)</span>
+                                <input type="number" id="chunk-size" value="1" min="1" max="64" step="1">
+                                <span class="setting-hint">Frames per chunk (1 = ~80ms audio per frame)</span>
                             </div>
                             <div class="setting">
                                 <label for="min-chunk-size">Min Chunk Size:</label>
-                                <input type="number" id="min-chunk-size" value="10" min="5" max="19" step="1">
+                                <input type="number" id="min-chunk-size" value="1" min="1" max="19" step="1">
                                 <span class="setting-hint">Minimum frames before emitting chunk</span>
                             </div>
                         </div>

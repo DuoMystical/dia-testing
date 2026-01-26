@@ -44,6 +44,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const chunkSizeInput = document.getElementById('chunk-size');
     const minChunkSizeInput = document.getElementById('min-chunk-size');
 
+    // Seed
+    const seedInput = document.getElementById('seed-input');
+    const seedDisplay = document.getElementById('seed-display');
+
     // Voice cloning
     const speaker1AudioInput = document.getElementById('speaker-1-audio');
     const speaker1Status = document.getElementById('speaker-1-status');
@@ -94,10 +98,27 @@ document.addEventListener('DOMContentLoaded', () => {
             onAudioChunk: handleAudioChunk,
             onStatus: handleStatus,
             onComplete: handleComplete,
-            onError: handleError
+            onError: handleError,
+            onSeed: handleSeed
         });
 
         wsClient.connect();
+    }
+
+    // Handle seed received from backend
+    function handleSeed(seed) {
+        seedDisplay.textContent = `Seed: ${seed}`;
+        seedDisplay.hidden = false;
+        seedDisplay.style.cursor = 'pointer';
+        seedDisplay.onclick = () => {
+            navigator.clipboard.writeText(seed.toString()).then(() => {
+                const original = seedDisplay.textContent;
+                seedDisplay.textContent = 'Copied!';
+                setTimeout(() => {
+                    seedDisplay.textContent = original;
+                }, 1000);
+            });
+        };
     }
 
     // Initialize Audio Streamer
@@ -357,6 +378,7 @@ document.addEventListener('DOMContentLoaded', () => {
         timingEntries.innerHTML = '';
         chunkTimingLog.hidden = true;
         chunkLatency.hidden = true;
+        seedDisplay.hidden = true;
 
         // Reset progress
         progressBar.style.width = '0%';
@@ -377,11 +399,13 @@ document.addEventListener('DOMContentLoaded', () => {
             textTemperature: parseFloat(textTempInput.value) || 0.6,
             textTopK: parseInt(textTopKInput.value) || 50,
             // CFG config
-            cfgScale: parseFloat(cfgScaleInput.value) || 2.0,
+            cfgScale: parseFloat(cfgScaleInput.value) || 6.0,
             cfgFilterK: parseInt(cfgFilterKInput.value) || 50,
             // Streaming config
-            chunkSizeFrames: parseInt(chunkSizeInput.value) || 19,
-            minChunkFrames: parseInt(minChunkSizeInput.value) || 10,
+            chunkSizeFrames: parseInt(chunkSizeInput.value) || 1,
+            minChunkFrames: parseInt(minChunkSizeInput.value) || 1,
+            // Seed (empty string = random)
+            seed: seedInput.value.trim(),
             // Voice cloning (base64 audio data)
             speaker1Audio: speaker1AudioData,
             speaker2Audio: speaker2AudioData

@@ -252,6 +252,20 @@ button {
     font-weight: 500;
 }
 
+.seed-stat {
+    color: var(--primary);
+    font-weight: 500;
+    font-family: monospace;
+    padding: 0.125rem 0.5rem;
+    background: var(--bg);
+    border-radius: 4px;
+    user-select: all;
+}
+
+.seed-stat:hover {
+    background: var(--bg-lighter);
+}
+
 /* Chunk Timing Log */
 .chunk-timing-log {
     margin-top: 1rem;

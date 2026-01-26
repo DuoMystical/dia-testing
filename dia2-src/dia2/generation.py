@@ -48,9 +48,9 @@ StreamGenerator = Generator[StreamEvent, None, None]
 @dataclass(frozen=True)
 class StreamingConfig:
     """Configuration for streaming audio generation."""
-    chunk_size_frames: int = 8  # ~0.1 seconds at 75fps
-    min_chunk_frames: int = 4  # Minimum frames before yielding
-    emit_status_every: int = 5  # Emit status every N chunks
+    chunk_size_frames: int = 1  # Stream each frame as it's generated (~80ms audio per frame)
+    min_chunk_frames: int = 1  # Minimum frames before yielding
+    emit_status_every: int = 20  # Emit status every N chunks
     enable_early_audio: bool = True  # Start decoding as soon as possible
 
 
@@ -79,9 +79,9 @@ class PrefixConfig:
 class GenerationConfig:
     text: SamplingConfig = field(default_factory=_default_text_sampling)
     audio: SamplingConfig = field(default_factory=_default_audio_sampling)
-    cfg_scale: float = 2.0
+    cfg_scale: float = 6.0  # Official Dia2 recommendation
     cfg_filter_k: int = 50
-    initial_padding: int = 2
+    initial_padding: int = 19  # Must be >= max_delay (18) for seed caching to work
     prefix: Optional["PrefixConfig"] = None
     use_cuda_graph: bool = False
     use_torch_compile: bool = False

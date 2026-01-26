@@ -15,11 +15,43 @@ import json
 import sys
 import base64
 import signal
+import random
+from collections import OrderedDict
+
+import torch
 
 # Global model state
 _model = None
 _device = None
 _model_size = None
+
+# LRU seed cache for fast generation with known seeds
+# Maps seed -> GenerationState (after warmup)
+# Using OrderedDict for LRU behavior - most recently used at end
+_seed_cache = OrderedDict()
+_MAX_SEED_CACHE_SIZE = 10  # Limit to avoid OOM
+
+
+def _cache_get(seed: int):
+    """Get from cache with LRU update (move to end if exists)."""
+    if seed in _seed_cache:
+        _seed_cache.move_to_end(seed)
+        return _seed_cache[seed]
+    return None
+
+
+def _cache_put(seed: int, state):
+    """Put in cache with LRU eviction."""
+    if seed in _seed_cache:
+        _seed_cache.move_to_end(seed)
+    else:
+        if len(_seed_cache) >= _MAX_SEED_CACHE_SIZE:
+            # Remove oldest (first) item
+            oldest_seed = next(iter(_seed_cache))
+            print(f"[CACHE] Evicting seed {oldest_seed} from cache", file=sys.stderr)
+            del _seed_cache[oldest_seed]
+        _seed_cache[seed] = state
+    print(f"[CACHE] Cached seed {seed}, cache size: {len(_seed_cache)}", file=sys.stderr)
 
 
 def emit_event(event: dict):
@@ -102,9 +134,10 @@ def load_model(model_size: str):
 
 
 def process_request(request: dict):
-    """Process a single TTS request."""
+    """Process a single TTS request with seed caching for fast repeated generations."""
     import tempfile
     import os
+    import time as time_module
     from dia2 import (
         GenerationConfig,
         SamplingConfig,
@@ -113,7 +146,17 @@ def process_request(request: dict):
         StatusEvent,
         CompleteEvent,
         ErrorEvent,
+        normalize_script,
     )
+    from dia2.runtime.generator import (
+        build_initial_state,
+        run_seed_warmup,
+        run_streaming_generation_loop,
+    )
+    from dia2.runtime.voice_clone import build_prefix_plan
+    from dia2.generation import PrefixConfig, merge_generation_config
+    from dia2.script import parse_script
+    from dia2.runtime.logger import RuntimeLogger
 
     text = request.get("text", "")
     model_size = request.get("model_size", "2b")
@@ -134,7 +177,6 @@ def process_request(request: dict):
         speaker_2_audio = config_overrides.get("speaker_2_audio")
 
         if speaker_1_audio:
-            # Decode base64 and write to temp file
             audio_bytes = base64.b64decode(speaker_1_audio)
             fd, path = tempfile.mkstemp(suffix=".wav")
             os.write(fd, audio_bytes)
@@ -152,10 +194,27 @@ def process_request(request: dict):
             temp_files.append(path)
             print(f"[INFO] Voice cloning: Speaker 2 audio saved to {path} ({len(audio_bytes)} bytes)", file=sys.stderr)
 
-        # Load model (will be fast if already loaded)
+        # Load model
         model = load_model(model_size)
+        runtime = model._ensure_runtime()
 
-        emit_status("Starting generation...", 0.2)
+        # Handle random seed
+        seed = config_overrides.get("seed")
+        if seed is None or seed == "":
+            seed = random.randint(0, 2**32 - 1)
+        else:
+            seed = int(seed)
+
+        # Set seeds for reproducibility
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+        print(f"[INFO] Using seed: {seed}", file=sys.stderr)
+
+        # Emit the seed so frontend can display it
+        emit_event({"type": "seed", "seed": seed})
 
         # Build generation config
         gen_config = GenerationConfig(
@@ -167,46 +226,104 @@ def process_request(request: dict):
                 temperature=config_overrides.get("audio_temperature", 0.8),
                 top_k=config_overrides.get("audio_top_k", 50),
             ),
-            cfg_scale=config_overrides.get("cfg_scale", 2.0),
+            cfg_scale=config_overrides.get("cfg_scale", 6.0),
             cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
+            initial_padding=19,  # Must be >= max_delay (18) for caching
             use_cuda_graph=True,
             use_torch_compile=False,
         )
 
-        # Streaming config - chunk_size must be larger than max audio delay (18 frames)
-        # Using 19 frames (~0.25s at 75fps) for minimum latency
-        chunk_size = config_overrides.get("chunk_size_frames", 19)
-        min_chunk = config_overrides.get("min_chunk_frames", 10)
-
+        # Streaming config
+        chunk_size = config_overrides.get("chunk_size_frames", 1)
+        min_chunk = config_overrides.get("min_chunk_frames", 1)
         streaming_config = StreamingConfig(
             chunk_size_frames=chunk_size,
             min_chunk_frames=min_chunk,
-            emit_status_every=config_overrides.get("emit_status_every", 5),
+            emit_status_every=config_overrides.get("emit_status_every", 20),
         )
 
         print(f"[CONFIG] chunk_size_frames={chunk_size}, min_chunk_frames={min_chunk}", file=sys.stderr)
 
-        # Generate with streaming (include voice cloning if provided)
-        import time as time_module
         generation_start = time_module.time()
+
+        # Check seed cache (only for non-voice-cloning requests)
+        cached_state = None
+        use_cache = not (prefix_speaker_1 or prefix_speaker_2)  # Don't cache voice cloning
+
+        if use_cache:
+            cached_state = _cache_get(seed)
+
+        if cached_state is not None:
+            # FAST PATH: Restore from cache
+            print(f"[CACHE] HIT - Restoring state for seed {seed}", file=sys.stderr)
+            emit_status("Using cached voice...", 0.1)
+            gen_state = cached_state.clone()
+            start_step = gen_config.initial_padding
+        else:
+            # SLOW PATH: Build initial state and run warmup
+            print(f"[CACHE] MISS - Running warmup for seed {seed}", file=sys.stderr)
+            emit_status("Warming up voice...", 0.1)
+
+            # Build prefix plan for voice cloning
+            prefix_config = None
+            if prefix_speaker_1 or prefix_speaker_2:
+                prefix_config = PrefixConfig(
+                    speaker_1=prefix_speaker_1,
+                    speaker_2=prefix_speaker_2,
+                    include_audio=False,
+                )
+            prefix_plan = build_prefix_plan(runtime, prefix_config)
+
+            # Build initial state
+            gen_state = build_initial_state(runtime, prefix=prefix_plan)
+
+            # Run warmup (seed-dependent, text-independent)
+            gen_state = run_seed_warmup(
+                runtime,
+                gen_state,
+                gen_config,
+                num_steps=gen_config.initial_padding,
+            )
+            start_step = gen_config.initial_padding
+
+            # Cache the warmed-up state (only if not voice cloning)
+            if use_cache:
+                _cache_put(seed, gen_state.clone())
+
+        warmup_time = time_module.time() - generation_start
+        print(f"[TIMING] Warmup/restore took {warmup_time*1000:.0f}ms", file=sys.stderr)
+
+        emit_status("Generating audio...", 0.2)
+
+        # Parse script and create state machine
+        text_normalized = normalize_script(text)
+        entries = parse_script([text_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+
+        # Set initial_padding to 0 since warmup is done
+        runtime.machine.initial_padding = 0
+        state = runtime.machine.new_state(entries)
+        # Reset forced_padding since warmup already consumed it
+        state.forced_padding = 0
+
+        # Run streaming generation
+        logger = RuntimeLogger(verbose=False)
         event_count = 0
         audio_chunk_count = 0
         first_audio_time = None
-        print(f"Starting generate_stream with text: {text[:50]}...", file=sys.stderr)
-        if prefix_speaker_1 or prefix_speaker_2:
-            print(f"  Voice cloning enabled: S1={prefix_speaker_1}, S2={prefix_speaker_2}", file=sys.stderr)
 
-        for event in model.generate_stream(
-            text,
+        print(f"Starting generation with text: {text[:50]}...", file=sys.stderr)
+
+        for event in run_streaming_generation_loop(
+            runtime,
+            state=state,
+            generation=gen_state,
             config=gen_config,
             streaming_config=streaming_config,
-            prefix_speaker_1=prefix_speaker_1,
-            prefix_speaker_2=prefix_speaker_2,
-            verbose=False,  # Must be False - verbose=True outputs to stdout and corrupts JSON protocol
+            start_step=start_step,
+            logger=logger,
         ):
             event_count += 1
             event_type = type(event).__name__
-            print(f"Received event #{event_count}: {event_type}", file=sys.stderr)
 
             if isinstance(event, AudioChunkEvent):
                 audio_chunk_count += 1
@@ -217,29 +334,25 @@ def process_request(request: dict):
                     first_audio_time = elapsed
                     print(f"[TIMING] First audio chunk at {first_audio_time*1000:.0f}ms", file=sys.stderr)
 
-                # Calculate chunk duration from bytes (24kHz, 16-bit mono = 48000 bytes/sec)
-                # WAV header is 44 bytes
                 audio_bytes = len(event.audio_data) - 44
                 chunk_duration_ms = (audio_bytes / 48000) * 1000
-
-                print(f"  AudioChunk #{audio_chunk_count}: {len(event.audio_data)} bytes ({chunk_duration_ms:.0f}ms audio), index={event.chunk_index}, elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
+                print(f"  AudioChunk #{audio_chunk_count}: {len(event.audio_data)} bytes ({chunk_duration_ms:.0f}ms audio), elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
                 emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
+
             elif isinstance(event, StatusEvent):
-                elapsed = time_module.time() - generation_start
-                print(f"  Status: {event.message}, progress={event.progress}, elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
                 emit_status(event.message, event.progress)
+
             elif isinstance(event, CompleteEvent):
                 elapsed = time_module.time() - generation_start
                 print(f"[TIMING] Complete: {event.total_chunks} chunks, {event.total_duration_ms:.0f}ms audio, total_time={elapsed*1000:.0f}ms", file=sys.stderr)
                 emit_complete(event.total_chunks, event.total_duration_ms)
+
             elif isinstance(event, ErrorEvent):
                 print(f"  Error: {event.error}", file=sys.stderr)
                 emit_error(event.error)
-            else:
-                print(f"  Unknown event type: {event}", file=sys.stderr)
 
         elapsed = time_module.time() - generation_start
-        print(f"[TIMING] Generation loop finished. Total events: {event_count}, Audio chunks: {audio_chunk_count}, total_time={elapsed*1000:.0f}ms", file=sys.stderr)
+        print(f"[TIMING] Generation finished. Events: {event_count}, Chunks: {audio_chunk_count}, Time: {elapsed*1000:.0f}ms", file=sys.stderr)
 
     except Exception as e:
         import traceback
@@ -247,14 +360,12 @@ def process_request(request: dict):
         print(traceback.format_exc(), file=sys.stderr)
 
     finally:
-        # Clean up temp files for voice cloning
         import os
         for temp_file in temp_files:
             try:
                 os.unlink(temp_file)
-                print(f"[INFO] Cleaned up temp file: {temp_file}", file=sys.stderr)
-            except Exception as cleanup_err:
-                print(f"[WARN] Failed to clean up {temp_file}: {cleanup_err}", file=sys.stderr)
+            except Exception:
+                pass
 
 
 def main():

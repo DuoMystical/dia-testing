@@ -23,6 +23,7 @@ class WebSocketClient {
         this.onAudioChunk = options.onAudioChunk || (() => {});
         this.onStatus = options.onStatus || (() => {});
         this.onComplete = options.onComplete || (() => {});
+        this.onSeed = options.onSeed || (() => {});
 
         // Bind methods
         this._handleOpen = this._handleOpen.bind(this);
@@ -117,11 +118,13 @@ class WebSocketClient {
             text_temperature: options.textTemperature || 0.6,
             text_top_k: options.textTopK || 50,
             // CFG parameters
-            cfg_scale: options.cfgScale || 2.0,
+            cfg_scale: options.cfgScale || 6.0,
             cfg_filter_k: options.cfgFilterK || 50,
             // Streaming parameters
-            chunk_size_frames: options.chunkSizeFrames || 19,
-            min_chunk_frames: options.minChunkFrames || 10
+            chunk_size_frames: options.chunkSizeFrames || 1,
+            min_chunk_frames: options.minChunkFrames || 1,
+            // Seed (empty string = random)
+            seed: options.seed || ''
         };
 
         // Add voice cloning audio if provided
@@ -219,6 +222,10 @@ class WebSocketClient {
                         totalChunks: data.total_chunks,
                         totalDurationMs: data.total_duration_ms
                     });
+                    break;
+
+                case 'seed':
+                    this.onSeed(data.seed);
                     break;
 
                 case 'error':
