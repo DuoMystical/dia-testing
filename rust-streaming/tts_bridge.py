@@ -173,17 +173,25 @@ def process_request(request: dict):
             use_torch_compile=False,
         )
 
-        # Streaming config - chunk_size must be larger than max audio delay (~12-16 frames)
-        # Using 32 frames (~0.4s at 75fps) to ensure chunks have actual audio after undelaying
+        # Streaming config - chunk_size must be larger than max audio delay (18 frames)
+        # Using 19 frames (~0.25s at 75fps) for minimum latency
+        chunk_size = config_overrides.get("chunk_size_frames", 19)
+        min_chunk = config_overrides.get("min_chunk_frames", 10)
+
         streaming_config = StreamingConfig(
-            chunk_size_frames=config_overrides.get("chunk_size_frames", 32),
-            min_chunk_frames=config_overrides.get("min_chunk_frames", 16),
+            chunk_size_frames=chunk_size,
+            min_chunk_frames=min_chunk,
             emit_status_every=config_overrides.get("emit_status_every", 5),
         )
 
+        print(f"[CONFIG] chunk_size_frames={chunk_size}, min_chunk_frames={min_chunk}", file=sys.stderr)
+
         # Generate with streaming (include voice cloning if provided)
+        import time as time_module
+        generation_start = time_module.time()
         event_count = 0
         audio_chunk_count = 0
+        first_audio_time = None
         print(f"Starting generate_stream with text: {text[:50]}...", file=sys.stderr)
         if prefix_speaker_1 or prefix_speaker_2:
             print(f"  Voice cloning enabled: S1={prefix_speaker_1}, S2={prefix_speaker_2}", file=sys.stderr)
@@ -202,13 +210,27 @@ def process_request(request: dict):
 
             if isinstance(event, AudioChunkEvent):
                 audio_chunk_count += 1
-                print(f"  AudioChunk #{audio_chunk_count}: {len(event.audio_data)} bytes, index={event.chunk_index}", file=sys.stderr)
+                now = time_module.time()
+                elapsed = now - generation_start
+
+                if first_audio_time is None:
+                    first_audio_time = elapsed
+                    print(f"[TIMING] First audio chunk at {first_audio_time*1000:.0f}ms", file=sys.stderr)
+
+                # Calculate chunk duration from bytes (24kHz, 16-bit mono = 48000 bytes/sec)
+                # WAV header is 44 bytes
+                audio_bytes = len(event.audio_data) - 44
+                chunk_duration_ms = (audio_bytes / 48000) * 1000
+
+                print(f"  AudioChunk #{audio_chunk_count}: {len(event.audio_data)} bytes ({chunk_duration_ms:.0f}ms audio), index={event.chunk_index}, elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
                 emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
             elif isinstance(event, StatusEvent):
-                print(f"  Status: {event.message}, progress={event.progress}", file=sys.stderr)
+                elapsed = time_module.time() - generation_start
+                print(f"  Status: {event.message}, progress={event.progress}, elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
                 emit_status(event.message, event.progress)
             elif isinstance(event, CompleteEvent):
-                print(f"  Complete: {event.total_chunks} chunks, {event.total_duration_ms}ms", file=sys.stderr)
+                elapsed = time_module.time() - generation_start
+                print(f"[TIMING] Complete: {event.total_chunks} chunks, {event.total_duration_ms:.0f}ms audio, total_time={elapsed*1000:.0f}ms", file=sys.stderr)
                 emit_complete(event.total_chunks, event.total_duration_ms)
             elif isinstance(event, ErrorEvent):
                 print(f"  Error: {event.error}", file=sys.stderr)
@@ -216,7 +238,8 @@ def process_request(request: dict):
             else:
                 print(f"  Unknown event type: {event}", file=sys.stderr)
 
-        print(f"Generation loop finished. Total events: {event_count}, Audio chunks: {audio_chunk_count}", file=sys.stderr)
+        elapsed = time_module.time() - generation_start
+        print(f"[TIMING] Generation loop finished. Total events: {event_count}, Audio chunks: {audio_chunk_count}, total_time={elapsed*1000:.0f}ms", file=sys.stderr)
 
     except Exception as e:
         import traceback

@@ -53,6 +53,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // Timer elements
     const generationTimer = document.getElementById('generation-timer');
     const firstAudioTime = document.getElementById('first-audio-time');
+    const chunkLatency = document.getElementById('chunk-latency');
+    const chunkTimingLog = document.getElementById('chunk-timing-log');
+    const timingEntries = document.getElementById('timing-entries');
 
     // State
     let isGenerating = false;
@@ -67,6 +70,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // Voice cloning state (base64 encoded audio)
     let speaker1AudioData = null;
     let speaker2AudioData = null;
+
+    // Chunk timing state
+    let lastChunkReceiveTime = null;
+    let chunkTimings = [];
 
     // Initialize WebSocket client
     function initWebSocket() {
@@ -152,10 +159,41 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Handle audio chunk received
     async function handleAudioChunk(chunk) {
+        const receiveTime = performance.now();
+
         // Record time to first chunk
         recordFirstChunk();
 
+        // Calculate inter-chunk latency
+        let interChunkLatency = 0;
+        if (lastChunkReceiveTime !== null) {
+            interChunkLatency = receiveTime - lastChunkReceiveTime;
+        }
+        lastChunkReceiveTime = receiveTime;
+
         const duration = await audioStreamer.addChunk(chunk.data, chunk.chunkIndex);
+
+        // Calculate chunk audio duration in ms
+        const chunkAudioMs = duration * 1000;
+
+        // Track timing
+        const timingData = {
+            index: chunk.chunkIndex,
+            receiveTime: receiveTime - generationStartTime,
+            interChunkLatency: interChunkLatency,
+            audioDurationMs: chunkAudioMs,
+            bytesReceived: chunk.data.byteLength
+        };
+        chunkTimings.push(timingData);
+
+        // Add timing entry to log
+        addTimingEntry(timingData);
+
+        // Update latency display
+        if (interChunkLatency > 0) {
+            chunkLatency.textContent = `Chunk gap: ${interChunkLatency.toFixed(0)}ms`;
+            chunkLatency.hidden = false;
+        }
 
         // Update UI
         chunksCount.textContent = `${audioStreamer.getChunkCount()} chunks`;
@@ -165,6 +203,22 @@ document.addEventListener('DOMContentLoaded', () => {
         addChunkToList(chunk.chunkIndex, duration);
 
         playPauseBtn.disabled = false;
+    }
+
+    // Add timing entry to the log
+    function addTimingEntry(timing) {
+        chunkTimingLog.hidden = false;
+        const entry = document.createElement('div');
+        entry.className = 'timing-entry';
+        entry.innerHTML = `
+            <span class="chunk-num">#${timing.index}</span>
+            @ ${(timing.receiveTime/1000).toFixed(2)}s |
+            <span class="duration">${timing.audioDurationMs.toFixed(0)}ms audio</span> |
+            <span class="latency">gap: ${timing.interChunkLatency.toFixed(0)}ms</span> |
+            ${(timing.bytesReceived/1024).toFixed(1)}KB
+        `;
+        timingEntries.appendChild(entry);
+        timingEntries.scrollTop = timingEntries.scrollHeight;
     }
 
     // Handle status update
@@ -297,6 +351,13 @@ document.addEventListener('DOMContentLoaded', () => {
         audioStreamer.reset();
         chunkList.innerHTML = '';
 
+        // Reset timing state
+        lastChunkReceiveTime = null;
+        chunkTimings = [];
+        timingEntries.innerHTML = '';
+        chunkTimingLog.hidden = true;
+        chunkLatency.hidden = true;
+
         // Reset progress
         progressBar.style.width = '0%';
         progressText.textContent = 'Starting...';
@@ -319,8 +380,8 @@ document.addEventListener('DOMContentLoaded', () => {
             cfgScale: parseFloat(cfgScaleInput.value) || 2.0,
             cfgFilterK: parseInt(cfgFilterKInput.value) || 50,
             // Streaming config
-            chunkSizeFrames: parseInt(chunkSizeInput.value) || 32,
-            minChunkFrames: parseInt(minChunkSizeInput.value) || 16,
+            chunkSizeFrames: parseInt(chunkSizeInput.value) || 19,
+            minChunkFrames: parseInt(minChunkSizeInput.value) || 10,
             // Voice cloning (base64 audio data)
             speaker1Audio: speaker1AudioData,
             speaker2Audio: speaker2AudioData

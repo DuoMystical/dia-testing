@@ -247,6 +247,52 @@ button {
     font-weight: 500;
 }
 
+.latency-stat {
+    color: var(--warning);
+    font-weight: 500;
+}
+
+/* Chunk Timing Log */
+.chunk-timing-log {
+    margin-top: 1rem;
+    padding: 0.75rem;
+    background: var(--bg);
+    border-radius: 8px;
+    max-height: 150px;
+    overflow-y: auto;
+}
+
+.chunk-timing-log h4 {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
+}
+
+.timing-entry {
+    font-family: monospace;
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    padding: 0.125rem 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.timing-entry:last-child {
+    border-bottom: none;
+}
+
+.timing-entry .chunk-num {
+    color: var(--primary);
+    font-weight: 600;
+}
+
+.timing-entry .duration {
+    color: var(--success);
+}
+
+.timing-entry .latency {
+    color: var(--warning);
+}
+
 .progress-bar-container {
     width: 100%;
     height: 8px;

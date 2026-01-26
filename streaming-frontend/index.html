@@ -68,6 +68,11 @@
                     <span id="chunks-count">0 chunks</span>
                     <span id="audio-duration">0.0s audio</span>
                     <span id="first-audio-time" class="first-audio-stat" hidden>First audio: --</span>
+                    <span id="chunk-latency" class="latency-stat" hidden>Chunk latency: --</span>
+                </div>
+                <div class="chunk-timing-log" id="chunk-timing-log" hidden>
+                    <h4>Chunk Timing</h4>
+                    <div id="timing-entries"></div>
                 </div>
             </section>
 
@@ -164,12 +169,12 @@
                         <div class="settings-grid">
                             <div class="setting">
                                 <label for="chunk-size">Chunk Size (frames):</label>
-                                <input type="number" id="chunk-size" value="32" min="16" max="64" step="1">
-                                <span class="setting-hint">Frames per audio chunk (must be > audio delay ~12-16)</span>
+                                <input type="number" id="chunk-size" value="19" min="19" max="64" step="1">
+                                <span class="setting-hint">Frames per chunk (min 19, ~0.25s per frame at 75fps)</span>
                             </div>
                             <div class="setting">
                                 <label for="min-chunk-size">Min Chunk Size:</label>
-                                <input type="number" id="min-chunk-size" value="16" min="8" max="32" step="1">
+                                <input type="number" id="min-chunk-size" value="10" min="5" max="19" step="1">
                                 <span class="setting-hint">Minimum frames before emitting chunk</span>
                             </div>
                         </div>

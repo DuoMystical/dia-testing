@@ -120,8 +120,8 @@ class WebSocketClient {
             cfg_scale: options.cfgScale || 2.0,
             cfg_filter_k: options.cfgFilterK || 50,
             // Streaming parameters
-            chunk_size_frames: options.chunkSizeFrames || 32,
-            min_chunk_frames: options.minChunkFrames || 16
+            chunk_size_frames: options.chunkSizeFrames || 19,
+            min_chunk_frames: options.minChunkFrames || 10
         };
 
         // Add voice cloning audio if provided
