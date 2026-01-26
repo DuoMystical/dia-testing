@@ -14,6 +14,7 @@ from .generation import (
     StreamEvent,
     StreamGenerator,
     StreamingConfig,
+    normalize_script,
 )
 
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "StreamEvent",
     "StreamGenerator",
     "StreamingConfig",
+    "normalize_script",
 ]
