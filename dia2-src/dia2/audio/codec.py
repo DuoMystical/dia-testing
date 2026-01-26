@@ -10,8 +10,9 @@ from transformers import MimiModel
 
 DEFAULT_MIMI_MODEL_ID = "kyutai/mimi"
 
-# Type alias for decoder state (Cache object from transformers)
-DecoderState = Any  # transformers.Cache, but we don't want to import it
+# Type alias for decoder state
+# For streaming, this is a tuple of (kv_cache, padding_cache)
+DecoderState = Any
 
 
 @dataclass(frozen=True)
@@ -21,12 +22,18 @@ class MimiConfig:
 
 
 class MimiCodec(nn.Module):
-    """Thin wrapper around transformers' MimiModel for decoding audio tokens."""
+    """Thin wrapper around transformers' MimiModel for decoding audio tokens.
 
-    def __init__(self, model: MimiModel, device: torch.device) -> None:
+    Supports streaming decode with full state preservation including:
+    - Transformer KV cache (for attention continuity)
+    - Decoder convolutional padding cache (for seamless audio at chunk boundaries)
+    """
+
+    def __init__(self, model: MimiModel, device: torch.device, streaming_enabled: bool = False) -> None:
         super().__init__()
         self.model = model
         self.device = device
+        self.streaming_enabled = streaming_enabled
         cfg = getattr(model, "config", None)
         self.sample_rate = getattr(cfg, "sampling_rate", 24000)
         self.frame_rate = getattr(cfg, "frame_rate", 12.5)
@@ -39,6 +46,7 @@ class MimiCodec(nn.Module):
         *,
         device: torch.device,
         dtype: Optional[torch.dtype] = None,
+        enable_streaming: bool = True,
     ) -> "MimiCodec":
         model = MimiModel.from_pretrained(
             model_id,
@@ -48,9 +56,20 @@ class MimiCodec(nn.Module):
         model = model.to(device)
         model.eval()
         # Enable use_cache so decoder returns past_key_values for streaming
-        # Without this, decode_with_state won't preserve state between chunks
         model.config.use_cache = True
-        return cls(model, device)
+
+        streaming_enabled = False
+        if enable_streaming:
+            try:
+                from .mimi_streaming import enable_streaming_decode
+                enable_streaming_decode(model)
+                streaming_enabled = True
+                print("[MimiCodec] Streaming decode enabled with convolutional padding cache")
+            except Exception as e:
+                print(f"[MimiCodec] Warning: Could not enable streaming decode: {e}")
+                print("[MimiCodec] Falling back to KV-cache-only streaming")
+
+        return cls(model, device, streaming_enabled)
 
     def decode(
         self,
@@ -81,9 +100,14 @@ class MimiCodec(nn.Module):
         This method maintains decoder state across calls, enabling smooth
         transitions between audio chunks without boundary artifacts.
 
+        When streaming is enabled, the decoder state includes both:
+        - Transformer KV cache (for attention continuity)
+        - Convolutional padding cache (for seamless audio boundaries)
+
         Args:
             codes: Audio codes tensor of shape (batch, num_codebooks, seq_len)
             decoder_state: Previous decoder state from last call, or None for first chunk
+                          Format: (kv_cache, padding_cache) if streaming enabled, else just kv_cache
 
         Returns:
             Tuple of (audio_waveform, new_decoder_state)
@@ -91,13 +115,35 @@ class MimiCodec(nn.Module):
             - new_decoder_state: State to pass to next decode_with_state() call
         """
         codes = codes.to(self.device)
-        with torch.inference_mode():
-            audio, new_state = self.model.decode(
-                codes,
-                decoder_past_key_values=decoder_state,
-                return_dict=False,
-            )
-            return torch.clamp(audio, -1.0, 1.0), new_state
+
+        # Unpack state
+        if self.streaming_enabled:
+            if decoder_state is not None:
+                kv_cache, padding_cache = decoder_state
+            else:
+                kv_cache = None
+                # Create new padding cache for this decode session
+                from .mimi_streaming import MimiDecoderPaddingCache
+                padding_cache = MimiDecoderPaddingCache(self.model)
+
+            with torch.inference_mode():
+                audio, new_kv_cache = self.model.decode(
+                    codes,
+                    decoder_past_key_values=kv_cache,
+                    decoder_padding_cache=padding_cache,
+                    return_dict=False,
+                )
+                new_state = (new_kv_cache, padding_cache)
+                return torch.clamp(audio, -1.0, 1.0), new_state
+        else:
+            # Fallback: KV cache only (original behavior)
+            with torch.inference_mode():
+                audio, new_state = self.model.decode(
+                    codes,
+                    decoder_past_key_values=decoder_state,
+                    return_dict=False,
+                )
+                return torch.clamp(audio, -1.0, 1.0), new_state
 
     def encode(self, audio: torch.Tensor, *, return_dict: bool = False):
         audio = audio.to(self.device)
