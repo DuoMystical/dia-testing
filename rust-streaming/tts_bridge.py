@@ -142,20 +142,37 @@ def process_request(request: dict):
         )
 
         # Generate with streaming
+        event_count = 0
+        audio_chunk_count = 0
+        print(f"Starting generate_stream with text: {text[:50]}...", file=sys.stderr)
+
         for event in model.generate_stream(
             text,
             config=gen_config,
             streaming_config=streaming_config,
-            verbose=False,
+            verbose=True,  # Enable verbose for debugging
         ):
+            event_count += 1
+            event_type = type(event).__name__
+            print(f"Received event #{event_count}: {event_type}", file=sys.stderr)
+
             if isinstance(event, AudioChunkEvent):
+                audio_chunk_count += 1
+                print(f"  AudioChunk #{audio_chunk_count}: {len(event.audio_data)} bytes, index={event.chunk_index}", file=sys.stderr)
                 emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
             elif isinstance(event, StatusEvent):
+                print(f"  Status: {event.message}, progress={event.progress}", file=sys.stderr)
                 emit_status(event.message, event.progress)
             elif isinstance(event, CompleteEvent):
+                print(f"  Complete: {event.total_chunks} chunks, {event.total_duration_ms}ms", file=sys.stderr)
                 emit_complete(event.total_chunks, event.total_duration_ms)
             elif isinstance(event, ErrorEvent):
+                print(f"  Error: {event.error}", file=sys.stderr)
                 emit_error(event.error)
+            else:
+                print(f"  Unknown event type: {event}", file=sys.stderr)
+
+        print(f"Generation loop finished. Total events: {event_count}, Audio chunks: {audio_chunk_count}", file=sys.stderr)
 
     except Exception as e:
         import traceback
