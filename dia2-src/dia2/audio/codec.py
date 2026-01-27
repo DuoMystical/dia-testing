@@ -65,10 +65,12 @@ class MimiCodec(nn.Module):
                 from .mimi_streaming import enable_streaming_decode
                 enable_streaming_decode(model)
                 streaming_enabled = True
-                print("[MimiCodec] Streaming decode enabled with convolutional padding cache")
+                import sys
+                print("[MimiCodec] Streaming decode enabled with convolutional padding cache", file=sys.stderr)
             except Exception as e:
-                print(f"[MimiCodec] Warning: Could not enable streaming decode: {e}")
-                print("[MimiCodec] Falling back to KV-cache-only streaming")
+                import sys
+                print(f"[MimiCodec] Warning: Could not enable streaming decode: {e}", file=sys.stderr)
+                print("[MimiCodec] Falling back to KV-cache-only streaming", file=sys.stderr)
 
         return cls(model, device, streaming_enabled)
 
