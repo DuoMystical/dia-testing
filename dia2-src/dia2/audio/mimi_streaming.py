@@ -68,11 +68,41 @@ class MimiDecoderPaddingCache:
         """Initialize cache from a MimiModel instance."""
         self.layer_caches: List[ConvLayerCache] = []
 
-        # Get decoder from model
-        decoder = getattr(model, 'decoder', model)
+        # Analyze the upsample layer (it's a MimiConvTranspose1d that needs caching!)
+        upsample = getattr(model, 'upsample', None)
+        if upsample is not None:
+            self._analyze_upsample(upsample)
 
-        # Analyze decoder layers and create cache entries
+        # Get decoder from model and analyze its layers
+        decoder = getattr(model, 'decoder', model)
         self._analyze_decoder(decoder)
+
+    def _analyze_upsample(self, upsample: nn.Module):
+        """Analyze the upsample layer (MimiConvTranspose1d) for caching."""
+        from transformers.models.mimi.modeling_mimi import MimiConvTranspose1d
+
+        if not isinstance(upsample, MimiConvTranspose1d):
+            return
+
+        # Get the actual conv parameters
+        conv = upsample.conv
+        kernel_size = conv.kernel_size[0]
+        stride = conv.stride[0]
+
+        # Cache size: number of input samples that affect boundary outputs
+        cache_size = kernel_size - 1
+
+        # Output trim: when we prepend cache_size inputs, we get
+        # cache_size * stride extra output samples
+        output_trim = cache_size * stride
+
+        self.layer_caches.append(ConvLayerCache(
+            cache_size=cache_size,
+            output_trim=output_trim,
+            is_transpose=True,
+            stride=stride,
+        ))
+        upsample._streaming_layer_idx = 0  # Upsample is always layer 0
 
     def _analyze_decoder(self, decoder: nn.Module):
         """Analyze decoder layers to determine caching requirements."""
@@ -82,7 +112,8 @@ class MimiDecoderPaddingCache:
             MimiResnetBlock,
         )
 
-        layer_idx = 0
+        # Start indexing after upsample (if present)
+        layer_idx = len(self.layer_caches)
 
         def process_conv1d(layer: MimiConv1d) -> int:
             """Process a Conv1d layer, return its assigned index."""
@@ -340,7 +371,12 @@ def _patched_decode_frame(
 ):
     """Patched _decode_frame with padding cache support."""
     embeddings = self.quantizer.decode(codes)
-    embeddings = self.upsample(embeddings)
+
+    # Upsample with padding cache support (it's a MimiConvTranspose1d!)
+    if decoder_padding_cache is not None and hasattr(self.upsample, '_streaming_layer_idx'):
+        embeddings = self.upsample(embeddings, padding_cache=decoder_padding_cache)
+    else:
+        embeddings = self.upsample(embeddings)
 
     decoder_outputs = self.decoder_transformer(
         embeddings.transpose(1, 2),
