@@ -522,6 +522,175 @@ def decode_audio_streaming(
         return pcm[0, 0], new_state
 
 
+# Module-level tracking for cross-chunk boundary analysis
+_last_chunk_end_samples = None
+_chunk_diagnostics_enabled = True
+_chunk_counter = 0
+
+# Debug mode for saving raw audio chunks
+_debug_save_chunks = False
+_debug_output_dir = None
+_debug_all_samples = None  # Accumulate all samples for concatenated file
+
+
+def reset_chunk_diagnostics():
+    """Reset chunk diagnostics for a new generation session."""
+    global _last_chunk_end_samples, _chunk_counter, _debug_all_samples
+    _last_chunk_end_samples = None
+    _chunk_counter = 0
+    _debug_all_samples = []
+
+
+def enable_debug_chunk_save(output_dir: str):
+    """Enable saving raw audio chunks to files for offline analysis.
+
+    Each chunk will be saved as chunk_NNNN.wav in the output directory.
+    A concatenated file (all_chunks.wav) will also be saved at the end.
+
+    Args:
+        output_dir: Directory to save chunk files (will be created if needed)
+    """
+    import os
+    import sys
+    global _debug_save_chunks, _debug_output_dir, _debug_all_samples
+
+    _debug_save_chunks = True
+    _debug_output_dir = output_dir
+    _debug_all_samples = []
+
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"[DEBUG] Audio chunk saving enabled. Output dir: {output_dir}", file=sys.stderr)
+
+
+def disable_debug_chunk_save():
+    """Disable saving raw audio chunks."""
+    global _debug_save_chunks, _debug_output_dir
+    _debug_save_chunks = False
+    _debug_output_dir = None
+
+
+def save_debug_concatenated():
+    """Save all accumulated samples as a single concatenated WAV file."""
+    import sys
+    import os
+    import io
+    import wave
+    import numpy as np
+    global _debug_all_samples, _debug_output_dir
+
+    if not _debug_save_chunks or _debug_output_dir is None or not _debug_all_samples:
+        return
+
+    all_samples = np.concatenate(_debug_all_samples)
+    all_samples = np.clip(all_samples, -1.0, 1.0)
+    pcm16 = (all_samples * 32767.0).astype(np.int16)
+
+    output_path = os.path.join(_debug_output_dir, "all_chunks_concatenated.wav")
+    with wave.open(output_path, 'wb') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(24000)  # Assuming 24kHz
+        wav_file.writeframes(pcm16.tobytes())
+
+    print(f"[DEBUG] Saved concatenated audio: {output_path} ({len(all_samples)} samples, {len(all_samples)/24000:.2f}s)", file=sys.stderr)
+
+
+def _analyze_audio_chunk(audio_np, chunk_index: int, sample_rate: int):
+    """Analyze an audio chunk for anomalies that could cause pops/clicks.
+
+    Checks for:
+    - Spikes at start/end (sudden amplitude changes)
+    - DC offset
+    - Discontinuities at chunk boundaries
+    - Abnormal sample values
+    """
+    import sys
+    import os
+    import io
+    import wave
+    import numpy as np
+    global _last_chunk_end_samples, _debug_save_chunks, _debug_output_dir, _debug_all_samples
+
+    num_samples = len(audio_np)
+    if num_samples == 0:
+        return
+
+    # Compute basic stats
+    max_abs = np.max(np.abs(audio_np))
+    mean_val = np.mean(audio_np)
+    rms = np.sqrt(np.mean(audio_np ** 2))
+
+    # Analyze start/end of chunk (first/last 10 samples)
+    boundary_size = min(10, num_samples // 2)
+    start_samples = audio_np[:boundary_size]
+    end_samples = audio_np[-boundary_size:]
+
+    start_max = np.max(np.abs(start_samples))
+    end_max = np.max(np.abs(end_samples))
+
+    # Calculate sample-to-sample differences to detect sudden jumps
+    if num_samples > 1:
+        diffs = np.abs(np.diff(audio_np))
+        max_diff = np.max(diffs)
+        # Find where the big jumps are (if any)
+        jump_threshold = 0.1  # 10% of full scale
+        big_jumps = np.where(diffs > jump_threshold)[0]
+    else:
+        max_diff = 0
+        big_jumps = []
+
+    # Check for discontinuity at chunk boundary (vs previous chunk)
+    boundary_discontinuity = None
+    if _last_chunk_end_samples is not None and len(_last_chunk_end_samples) > 0:
+        prev_last = _last_chunk_end_samples[-1]
+        curr_first = audio_np[0]
+        boundary_discontinuity = abs(curr_first - prev_last)
+
+    # Save end samples for next chunk comparison
+    _last_chunk_end_samples = end_samples.copy()
+
+    # Log diagnostics
+    print(f"[AUDIO_DIAG] Chunk {chunk_index}: {num_samples} samples ({num_samples/sample_rate*1000:.1f}ms)", file=sys.stderr)
+    print(f"  Stats: max_abs={max_abs:.4f}, mean={mean_val:.6f}, rms={rms:.4f}", file=sys.stderr)
+    print(f"  Boundaries: start_max={start_max:.4f}, end_max={end_max:.4f}", file=sys.stderr)
+    print(f"  First 5 samples: {audio_np[:5].tolist()}", file=sys.stderr)
+    print(f"  Last 5 samples: {audio_np[-5:].tolist()}", file=sys.stderr)
+
+    if boundary_discontinuity is not None:
+        # Flag if discontinuity is large (potential click source)
+        flag = " *** POSSIBLE CLICK ***" if boundary_discontinuity > 0.05 else ""
+        print(f"  Boundary jump from prev chunk: {boundary_discontinuity:.4f}{flag}", file=sys.stderr)
+
+    print(f"  Max sample-to-sample diff: {max_diff:.4f}", file=sys.stderr)
+
+    if len(big_jumps) > 0:
+        # Show where the big jumps occur
+        jump_positions = big_jumps[:5]  # First 5 big jumps
+        print(f"  Big jumps (>{jump_threshold}) at samples: {jump_positions.tolist()}", file=sys.stderr)
+        for pos in jump_positions[:3]:
+            if pos > 0 and pos < num_samples - 1:
+                print(f"    Sample {pos}: {audio_np[pos-1]:.4f} -> {audio_np[pos]:.4f} -> {audio_np[pos+1]:.4f} (diff={diffs[pos]:.4f})", file=sys.stderr)
+
+    # Save chunk to file if debug mode is enabled
+    if _debug_save_chunks and _debug_output_dir is not None:
+        # Save individual chunk
+        chunk_path = os.path.join(_debug_output_dir, f"chunk_{chunk_index:04d}.wav")
+        chunk_clipped = np.clip(audio_np, -1.0, 1.0)
+        pcm16 = (chunk_clipped * 32767.0).astype(np.int16)
+
+        with wave.open(chunk_path, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(pcm16.tobytes())
+
+        print(f"  [DEBUG] Saved: {chunk_path}", file=sys.stderr)
+
+        # Accumulate for concatenated file
+        if _debug_all_samples is not None:
+            _debug_all_samples.append(audio_np.copy())
+
+
 def _encode_wav_chunk(
     waveform: torch.Tensor,
     sample_rate: int,
@@ -529,9 +698,18 @@ def _encode_wav_chunk(
     """Encode a waveform tensor to WAV bytes."""
     import io
     import wave
+    import struct
     import numpy as np
+    import sys
+    global _chunk_counter
 
     audio_np = waveform.detach().cpu().numpy()
+
+    # Run diagnostics before any processing
+    if _chunk_diagnostics_enabled:
+        _analyze_audio_chunk(audio_np, _chunk_counter, sample_rate)
+        _chunk_counter += 1
+
     audio_np = np.clip(audio_np, -1.0, 1.0)
     pcm16 = (audio_np * 32767.0).astype(np.int16)
 
@@ -542,7 +720,31 @@ def _encode_wav_chunk(
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(pcm16.tobytes())
 
-    return buffer.getvalue()
+    wav_bytes = buffer.getvalue()
+
+    # Verify WAV structure
+    if _chunk_diagnostics_enabled:
+        expected_data_size = len(pcm16) * 2  # 16-bit = 2 bytes per sample
+        expected_total = 44 + expected_data_size  # 44-byte header + data
+        actual_total = len(wav_bytes)
+
+        # Parse WAV header to verify
+        data_view = wav_bytes[40:44]
+        data_chunk_size = struct.unpack('<I', data_view)[0]
+
+        # Check last few PCM samples (as int16)
+        last_pcm = pcm16[-5:].tolist() if len(pcm16) >= 5 else pcm16.tolist()
+
+        print(f"  [WAV] samples={len(pcm16)}, sample_rate={sample_rate}Hz", file=sys.stderr)
+        print(f"  [WAV] expected_size={expected_total}, actual_size={actual_total}, data_chunk={data_chunk_size}", file=sys.stderr)
+        print(f"  [WAV] last 5 PCM int16: {last_pcm}", file=sys.stderr)
+
+        if actual_total != expected_total:
+            print(f"  [WAV] *** SIZE MISMATCH! ***", file=sys.stderr)
+        if data_chunk_size != expected_data_size:
+            print(f"  [WAV] *** DATA CHUNK SIZE MISMATCH! expected={expected_data_size}, got={data_chunk_size} ***", file=sys.stderr)
+
+    return wav_bytes
 
 
 def run_seed_warmup(
@@ -839,6 +1041,15 @@ def run_streaming_generation_loop(
     cuda_graph_captured = False
 
     print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}", file=sys.stderr)
+
+    # Reset chunk diagnostics for this generation session
+    reset_chunk_diagnostics()
+
+    # Check for debug mode via environment variable
+    import os
+    debug_dir = os.environ.get("DIA_DEBUG_AUDIO_DIR")
+    if debug_dir:
+        enable_debug_chunk_save(debug_dir)
 
     yield StatusEvent(message="Starting generation", progress=0.0)
 
@@ -1291,6 +1502,9 @@ def run_streaming_generation_loop(
                 yield ErrorEvent(error=f"Final chunk decode error: {e}")
                 return
 
+        # Save concatenated debug audio if enabled
+        save_debug_concatenated()
+
         # Emit completion event
         yield CompleteEvent(
             total_chunks=chunk_index,
@@ -1367,4 +1581,8 @@ __all__ = [
     "decode_audio",
     "warmup_with_prefix",
     "GenerationState",
+    "reset_chunk_diagnostics",
+    "enable_debug_chunk_save",
+    "disable_debug_chunk_save",
+    "save_debug_concatenated",
 ]

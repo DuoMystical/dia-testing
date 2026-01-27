@@ -39,6 +39,147 @@ class AudioStreamer {
 
         // Animation frame for updates
         this.animationFrame = null;
+
+        // Diagnostics for audio click debugging
+        this.diagnosticsEnabled = true;
+        this.lastChunkEndSamples = null; // Last N samples of previous chunk for boundary analysis
+        this.chunkDiagnostics = []; // Store diagnostics for all chunks
+    }
+
+    /**
+     * Analyze an AudioBuffer for anomalies that could cause clicks/pops
+     */
+    _analyzeChunk(audioBuffer, chunkIndex) {
+        if (!this.diagnosticsEnabled) return;
+
+        const channelData = audioBuffer.getChannelData(0);
+        const numSamples = channelData.length;
+        const sampleRate = audioBuffer.sampleRate;
+
+        if (numSamples === 0) return;
+
+        // Compute basic stats
+        let maxAbs = 0;
+        let sum = 0;
+        let sumSq = 0;
+        for (let i = 0; i < numSamples; i++) {
+            const val = channelData[i];
+            const absVal = Math.abs(val);
+            if (absVal > maxAbs) maxAbs = absVal;
+            sum += val;
+            sumSq += val * val;
+        }
+        const mean = sum / numSamples;
+        const rms = Math.sqrt(sumSq / numSamples);
+
+        // Analyze boundaries (first/last 10 samples)
+        const boundarySize = Math.min(10, Math.floor(numSamples / 2));
+        let startMax = 0;
+        let endMax = 0;
+        const startSamples = [];
+        const endSamples = [];
+
+        for (let i = 0; i < boundarySize; i++) {
+            const startVal = Math.abs(channelData[i]);
+            const endVal = Math.abs(channelData[numSamples - boundarySize + i]);
+            if (startVal > startMax) startMax = startVal;
+            if (endVal > endMax) endMax = endVal;
+            startSamples.push(channelData[i]);
+            endSamples.push(channelData[numSamples - boundarySize + i]);
+        }
+
+        // Calculate max sample-to-sample difference
+        let maxDiff = 0;
+        const bigJumps = [];
+        const jumpThreshold = 0.1; // 10% of full scale
+        for (let i = 1; i < numSamples; i++) {
+            const diff = Math.abs(channelData[i] - channelData[i - 1]);
+            if (diff > maxDiff) maxDiff = diff;
+            if (diff > jumpThreshold && bigJumps.length < 5) {
+                bigJumps.push({ pos: i, diff, before: channelData[i - 1], after: channelData[i] });
+            }
+        }
+
+        // Check boundary discontinuity with previous chunk
+        let boundaryDiscontinuity = null;
+        if (this.lastChunkEndSamples !== null && this.lastChunkEndSamples.length > 0) {
+            const prevLast = this.lastChunkEndSamples[this.lastChunkEndSamples.length - 1];
+            const currFirst = channelData[0];
+            boundaryDiscontinuity = Math.abs(currFirst - prevLast);
+        }
+
+        // Save end samples for next chunk
+        this.lastChunkEndSamples = endSamples.slice();
+
+        // Build diagnostics object
+        const diag = {
+            chunkIndex,
+            numSamples,
+            durationMs: (numSamples / sampleRate) * 1000,
+            maxAbs,
+            mean,
+            rms,
+            startMax,
+            endMax,
+            startSamples: startSamples.slice(0, 5),
+            endSamples: endSamples.slice(-5),
+            maxDiff,
+            bigJumps,
+            boundaryDiscontinuity,
+            possibleClick: boundaryDiscontinuity !== null && boundaryDiscontinuity > 0.05
+        };
+
+        this.chunkDiagnostics.push(diag);
+
+        // Log to console
+        console.log(`[AUDIO_DIAG] Chunk ${chunkIndex}: ${numSamples} samples (${diag.durationMs.toFixed(1)}ms)`);
+        console.log(`  Stats: max_abs=${maxAbs.toFixed(4)}, mean=${mean.toFixed(6)}, rms=${rms.toFixed(4)}`);
+        console.log(`  Boundaries: start_max=${startMax.toFixed(4)}, end_max=${endMax.toFixed(4)}`);
+        console.log(`  First 5 samples:`, startSamples.slice(0, 5).map(v => v.toFixed(4)));
+        console.log(`  Last 5 samples:`, endSamples.slice(-5).map(v => v.toFixed(4)));
+
+        if (boundaryDiscontinuity !== null) {
+            const flag = diag.possibleClick ? ' *** POSSIBLE CLICK ***' : '';
+            console.log(`  Boundary jump from prev chunk: ${boundaryDiscontinuity.toFixed(4)}${flag}`);
+        }
+
+        console.log(`  Max sample-to-sample diff: ${maxDiff.toFixed(4)}`);
+
+        if (bigJumps.length > 0) {
+            console.log(`  Big jumps (>${jumpThreshold}) at samples:`, bigJumps.map(j => j.pos));
+            bigJumps.slice(0, 3).forEach(j => {
+                console.log(`    Sample ${j.pos}: ${j.before.toFixed(4)} -> ${j.after.toFixed(4)} (diff=${j.diff.toFixed(4)})`);
+            });
+        }
+
+        // Specifically check the VERY LAST sample - this is what causes pop when playback stops
+        const lastSample = channelData[numSamples - 1];
+        const lastSampleAbs = Math.abs(lastSample);
+        if (lastSampleAbs > 0.01) {
+            console.log(`  *** LAST SAMPLE NON-ZERO: ${lastSample.toFixed(6)} (abs=${lastSampleAbs.toFixed(4)}) - THIS CAUSES END POP ***`);
+        } else {
+            console.log(`  Last sample: ${lastSample.toFixed(6)} (OK - near zero)`);
+        }
+
+        return diag;
+    }
+
+    /**
+     * Get all chunk diagnostics (for debugging)
+     */
+    getDiagnostics() {
+        return {
+            chunks: this.chunkDiagnostics,
+            possibleClicks: this.chunkDiagnostics.filter(d => d.possibleClick)
+        };
+    }
+
+    /**
+     * Reset diagnostics for new generation
+     */
+    resetDiagnostics() {
+        this.lastChunkEndSamples = null;
+        this.chunkDiagnostics = [];
     }
 
     async init() {
@@ -89,7 +230,17 @@ class AudioStreamer {
             // Decode the WAV data
             const audioBuffer = await this.audioContext.decodeAudioData(wavData.slice(0));
 
-            console.log(`[AudioStreamer] Chunk ${chunkIndex} decoded: ${audioBuffer.duration.toFixed(3)}s, ${audioBuffer.sampleRate}Hz`);
+            // Check for sample rate mismatch (potential resampling)
+            const contextSampleRate = this.audioContext.sampleRate;
+            const bufferSampleRate = audioBuffer.sampleRate;
+            const wasResampled = contextSampleRate !== bufferSampleRate;
+
+            console.log(`[AudioStreamer] Chunk ${chunkIndex} decoded: ${audioBuffer.duration.toFixed(3)}s`);
+            console.log(`  Buffer: ${audioBuffer.numberOfChannels}ch, ${bufferSampleRate}Hz, ${audioBuffer.length} samples`);
+            console.log(`  Context: ${contextSampleRate}Hz ${wasResampled ? '*** RESAMPLED! ***' : '(no resample)'}`);
+
+            // Analyze chunk for audio anomalies (before storing)
+            this._analyzeChunk(audioBuffer, chunkIndex);
 
             // Store by index for proper ordering
             this.chunkBuffers.set(chunkIndex, audioBuffer);
@@ -340,6 +491,8 @@ class AudioStreamer {
         this.nextPlayTime = 0;
         this.playbackStartTime = 0;
         this.totalScheduledDuration = 0;
+        // Reset diagnostics for new generation
+        this.resetDiagnostics();
     }
 
     /**
