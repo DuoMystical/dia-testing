@@ -481,17 +481,20 @@ def decode_audio_streaming(
     tokens: torch.Tensor,
     decoder_state=None,
 ):
-    """Decode audio tokens to waveform with state preservation for streaming.
+    """Decode audio tokens to waveform with overlap-add for seamless streaming.
 
-    This maintains decoder state across chunks for seamless audio transitions.
+    Uses the MimiCodec's overlap-add method to ensure smooth audio transitions
+    between chunks without boundary artifacts.
 
     Args:
         runtime: Runtime context containing the mimi codec
-        tokens: Audio tokens to decode
-        decoder_state: Previous decoder state, or None for first chunk
+        tokens: Audio tokens to decode (batch, codebooks, frames)
+        decoder_state: Previous StreamingDecoderState, or None for first chunk
 
     Returns:
         Tuple of (waveform, new_decoder_state)
+        - waveform: 1D tensor of audio samples
+        - new_decoder_state: State to pass to next call
     """
     if tokens.shape[-1] == 0:
         return torch.zeros(0, device=runtime.device), decoder_state
