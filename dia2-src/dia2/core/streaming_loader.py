@@ -239,36 +239,3 @@ def streaming_load_safetensors(
     missing = set(tensor_info.keys()) - loaded_tensors
     if missing:
         print(f"[STREAMING] Warning: {len(missing)} tensors not in model state dict (expected for some architectures)", file=sys.stderr)
-
-
-def check_cache_and_stream(
-    repo_id: str,
-    filename: str,
-    model: torch.nn.Module,
-    device: torch.device,
-    **kwargs
-) -> bool:
-    """
-    Check if file is cached, otherwise stream it.
-
-    Returns True if loaded from cache (fast), False if streamed (slow).
-    """
-    from huggingface_hub import try_to_load_from_cache
-
-    cached_path = try_to_load_from_cache(repo_id, filename)
-
-    if cached_path is not None:
-        # File is cached - use fast safetensors loading
-        print(f"[STREAMING] Using cached file: {cached_path}", file=sys.stderr)
-        from safetensors import safe_open
-
-        state_dict = model.state_dict()
-        with safe_open(cached_path, framework="pt", device=str(device)) as f:
-            for key in f.keys():
-                if key in state_dict:
-                    state_dict[key].copy_(f.get_tensor(key))
-        return True
-    else:
-        # Not cached - stream from network
-        streaming_load_safetensors(repo_id, filename, model, device, **kwargs)
-        return False

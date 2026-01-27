@@ -114,11 +114,11 @@ def build_runtime(
     model = Dia2Model(config, precision, device=device_obj)
     print(f"[TIMING] Dia2Model init: {time_module.time() - t0:.2f}s", file=sys.stderr)
 
-    # Load weights - use streaming if not cached
+    # Load weights
+    t0 = time_module.time()
     if weights_repo_id and weights_filename:
         # Stream weights directly to GPU during download
         print(f"[TIMING] Streaming weights from {weights_repo_id}/{weights_filename}...", file=sys.stderr)
-        t0 = time_module.time()
         from ..core.streaming_loader import streaming_load_safetensors
         streaming_load_safetensors(
             weights_repo_id,
@@ -126,13 +126,11 @@ def build_runtime(
             model,
             device_obj,
         )
-        print(f"[TIMING] Streaming weight load: {time_module.time() - t0:.2f}s", file=sys.stderr)
     else:
-        # Load from cached local file
+        # Load from local file (for local development with explicit paths)
         print(f"[TIMING] Loading weights from {weights_path}...", file=sys.stderr)
-        t0 = time_module.time()
         load_file_into_model(model, str(weights_path), device=device)
-        print(f"[TIMING] Weight loading: {time_module.time() - t0:.2f}s", file=sys.stderr)
+    print(f"[TIMING] Weight loading: {time_module.time() - t0:.2f}s", file=sys.stderr)
 
     tokenizer_ref = tokenizer_id or config.assets.tokenizer or repo_id
     if tokenizer_ref is None:
