@@ -698,7 +698,9 @@ def _encode_wav_chunk(
     """Encode a waveform tensor to WAV bytes."""
     import io
     import wave
+    import struct
     import numpy as np
+    import sys
     global _chunk_counter
 
     audio_np = waveform.detach().cpu().numpy()
@@ -718,7 +720,31 @@ def _encode_wav_chunk(
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(pcm16.tobytes())
 
-    return buffer.getvalue()
+    wav_bytes = buffer.getvalue()
+
+    # Verify WAV structure
+    if _chunk_diagnostics_enabled:
+        expected_data_size = len(pcm16) * 2  # 16-bit = 2 bytes per sample
+        expected_total = 44 + expected_data_size  # 44-byte header + data
+        actual_total = len(wav_bytes)
+
+        # Parse WAV header to verify
+        data_view = wav_bytes[40:44]
+        data_chunk_size = struct.unpack('<I', data_view)[0]
+
+        # Check last few PCM samples (as int16)
+        last_pcm = pcm16[-5:].tolist() if len(pcm16) >= 5 else pcm16.tolist()
+
+        print(f"  [WAV] samples={len(pcm16)}, sample_rate={sample_rate}Hz", file=sys.stderr)
+        print(f"  [WAV] expected_size={expected_total}, actual_size={actual_total}, data_chunk={data_chunk_size}", file=sys.stderr)
+        print(f"  [WAV] last 5 PCM int16: {last_pcm}", file=sys.stderr)
+
+        if actual_total != expected_total:
+            print(f"  [WAV] *** SIZE MISMATCH! ***", file=sys.stderr)
+        if data_chunk_size != expected_data_size:
+            print(f"  [WAV] *** DATA CHUNK SIZE MISMATCH! expected={expected_data_size}, got={data_chunk_size} ***", file=sys.stderr)
+
+    return wav_bytes
 
 
 def run_seed_warmup(

@@ -152,6 +152,15 @@ class AudioStreamer {
             });
         }
 
+        // Specifically check the VERY LAST sample - this is what causes pop when playback stops
+        const lastSample = channelData[numSamples - 1];
+        const lastSampleAbs = Math.abs(lastSample);
+        if (lastSampleAbs > 0.01) {
+            console.log(`  *** LAST SAMPLE NON-ZERO: ${lastSample.toFixed(6)} (abs=${lastSampleAbs.toFixed(4)}) - THIS CAUSES END POP ***`);
+        } else {
+            console.log(`  Last sample: ${lastSample.toFixed(6)} (OK - near zero)`);
+        }
+
         return diag;
     }
 
@@ -221,7 +230,14 @@ class AudioStreamer {
             // Decode the WAV data
             const audioBuffer = await this.audioContext.decodeAudioData(wavData.slice(0));
 
-            console.log(`[AudioStreamer] Chunk ${chunkIndex} decoded: ${audioBuffer.duration.toFixed(3)}s, ${audioBuffer.sampleRate}Hz`);
+            // Check for sample rate mismatch (potential resampling)
+            const contextSampleRate = this.audioContext.sampleRate;
+            const bufferSampleRate = audioBuffer.sampleRate;
+            const wasResampled = contextSampleRate !== bufferSampleRate;
+
+            console.log(`[AudioStreamer] Chunk ${chunkIndex} decoded: ${audioBuffer.duration.toFixed(3)}s`);
+            console.log(`  Buffer: ${audioBuffer.numberOfChannels}ch, ${bufferSampleRate}Hz, ${audioBuffer.length} samples`);
+            console.log(`  Context: ${contextSampleRate}Hz ${wasResampled ? '*** RESAMPLED! ***' : '(no resample)'}`);
 
             // Analyze chunk for audio anomalies (before storing)
             this._analyzeChunk(audioBuffer, chunkIndex);
