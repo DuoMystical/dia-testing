@@ -18,6 +18,9 @@ class AssetBundle:
     tokenizer_id: Optional[str]
     mimi_id: Optional[str]
     repo_id: Optional[str]
+    # For streaming: if weights aren't cached, these let us stream instead of wait
+    weights_repo_id: Optional[str] = None
+    weights_filename: Optional[str] = None
 
 
 def resolve_assets(
@@ -26,7 +29,17 @@ def resolve_assets(
     config_path: Optional[str | Path],
     weights_path: Optional[str | Path],
     manifest_name: Optional[str] = None,
+    enable_streaming: bool = True,
 ) -> AssetBundle:
+    """
+    Resolve model assets from repo or local paths.
+
+    If enable_streaming=True and weights aren't cached, returns streaming info
+    instead of blocking on download. The caller can then use streaming_loader
+    to load weights directly to GPU as they download.
+    """
+    from huggingface_hub import try_to_load_from_cache
+
     repo_id = repo
     manifest_name = manifest_name or ASSET_MANIFEST
     if repo_id and (config_path or weights_path):
@@ -37,14 +50,38 @@ def resolve_assets(
         manifest = load_manifest(repo_id, manifest_name)
         config_name = manifest.get("config", "config.json")
         weights_name = manifest.get("weights", "model.safetensors")
+
+        # Config is small, always download it
         config_local = hf_hub_download(repo_id, config_name)
-        weights_local = hf_hub_download(repo_id, weights_name)
+
+        # For weights, check cache first
+        weights_local = None
+        weights_repo = None
+        weights_file = None
+
+        if enable_streaming:
+            # Check if weights are already cached
+            cached = try_to_load_from_cache(repo_id, weights_name)
+            if cached is not None:
+                # Cached - use local file
+                weights_local = cached
+            else:
+                # Not cached - provide streaming info
+                weights_repo = repo_id
+                weights_file = weights_name
+                weights_local = ""  # Placeholder, streaming loader will handle it
+        else:
+            # Streaming disabled - block on download
+            weights_local = hf_hub_download(repo_id, weights_name)
+
         return AssetBundle(
             config_path=config_local,
             weights_path=weights_local,
             tokenizer_id=manifest.get("tokenizer") or repo_id,
             mimi_id=manifest.get("mimi"),
             repo_id=repo_id,
+            weights_repo_id=weights_repo,
+            weights_filename=weights_file,
         )
     return AssetBundle(str(config_path), str(weights_path), None, None, repo_id)
 

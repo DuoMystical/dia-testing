@@ -431,10 +431,24 @@ def main():
     try:
         import torch
         from dia2 import Dia2
-        print("TTS Bridge ready", file=sys.stderr)
+        print("TTS Bridge modules imported", file=sys.stderr)
     except ImportError as e:
         emit_error(f"Failed to import required modules: {e}")
         return
+
+    # Pre-load the model at startup (not on first request)
+    # This ensures the model is ready when the first request arrives
+    print("[STARTUP] Pre-loading model...", file=sys.stderr)
+    try:
+        load_model("2b")  # Default model size
+        print("[STARTUP] Model pre-loaded and ready", file=sys.stderr)
+    except Exception as e:
+        import traceback
+        print(f"[STARTUP] Warning: Failed to pre-load model: {e}", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
+        # Don't exit - model will be loaded on first request as fallback
+
+    print("TTS Bridge ready", file=sys.stderr)
 
     # Main request loop
     while True:

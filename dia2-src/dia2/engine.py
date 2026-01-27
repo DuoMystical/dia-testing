@@ -53,6 +53,9 @@ class Dia2:
         self._tokenizer_id = (str(tokenizer_id) if tokenizer_id else None) or bundle.tokenizer_id
         self._repo_id = bundle.repo_id
         self._mimi_id = mimi_id or bundle.mimi_id
+        # Streaming info (only set if weights aren't cached)
+        self._weights_repo_id = bundle.weights_repo_id
+        self._weights_filename = bundle.weights_filename
         self.device = device
         self._dtype_pref = dtype or "auto"
         self.default_config = default_config or GenerationConfig()
@@ -327,7 +330,12 @@ class Dia2:
             mimi_id=self._mimi_id,
             device=self.device,
             dtype_pref=self._dtype_pref,
+            weights_repo_id=self._weights_repo_id,
+            weights_filename=self._weights_filename,
         )
         self._tokenizer_id = tokenizer_ref
         self._mimi_id = mimi_ref
+        # Clear streaming info after use (weights are now loaded)
+        self._weights_repo_id = None
+        self._weights_filename = None
         return runtime
