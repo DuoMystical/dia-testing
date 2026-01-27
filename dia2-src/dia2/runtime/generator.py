@@ -480,29 +480,45 @@ def decode_audio_streaming(
     runtime: RuntimeContext,
     tokens: torch.Tensor,
     decoder_state=None,
+    lookahead_tokens: torch.Tensor = None,
 ):
-    """Decode audio tokens to waveform with overlap-add for seamless streaming.
+    """Decode audio tokens to waveform with optional lookahead for seamless streaming.
 
-    Uses the MimiCodec's overlap-add method to ensure smooth audio transitions
+    Uses the MimiCodec's overlap decode to ensure smooth audio transitions
     between chunks without boundary artifacts.
 
     Args:
         runtime: Runtime context containing the mimi codec
         tokens: Audio tokens to decode (batch, codebooks, frames)
         decoder_state: Previous StreamingDecoderState, or None for first chunk
+        lookahead_tokens: Optional lookahead tokens for forward context.
+                         If provided, these are appended to tokens but only
+                         tokens' audio is output (lookahead provides forward context).
 
     Returns:
         Tuple of (waveform, new_decoder_state)
-        - waveform: 1D tensor of audio samples
+        - waveform: 1D tensor of audio samples (for tokens only, not lookahead)
         - new_decoder_state: State to pass to next call
     """
     if tokens.shape[-1] == 0:
         return torch.zeros(0, device=runtime.device), decoder_state
+
     with torch.inference_mode():
-        pcm, new_state = runtime.mimi.decode_with_state(
-            tokens.to(runtime.device),
-            decoder_state=decoder_state,
-        )
+        if lookahead_tokens is not None and lookahead_tokens.shape[-1] > 0:
+            # Overlap decode: combine tokens with lookahead for forward context
+            combined = torch.cat([tokens, lookahead_tokens], dim=-1)
+            output_frames = tokens.shape[-1]
+            pcm, new_state = runtime.mimi.decode_with_lookahead(
+                combined.to(runtime.device),
+                output_frames=output_frames,
+                decoder_state=decoder_state,
+            )
+        else:
+            # Regular decode without lookahead
+            pcm, new_state = runtime.mimi.decode_with_state(
+                tokens.to(runtime.device),
+                decoder_state=decoder_state,
+            )
         return pcm[0, 0], new_state
 
 
@@ -534,19 +550,21 @@ def run_seed_warmup(
     generation: GenerationState,
     config: GenerationConfig,
     num_steps: int,
+    warmup_state: Optional[State] = None,
 ) -> GenerationState:
     """
     Run warmup steps to establish seed-dependent state.
 
-    This runs num_steps of generation with only pad tokens (no text influence),
-    building up the KV cache and audio buffer based purely on the random seed.
-    The resulting state can be cached and reused for any text with the same seed.
+    This runs num_steps of generation with a fixed warmup phrase, building up
+    the KV cache and audio buffer. The warmup phrase ensures consistent behavior
+    across different user texts when using the same seed.
 
     Args:
         runtime: Runtime context
         generation: Initial generation state
         config: Generation configuration
         num_steps: Number of warmup steps (should be >= max_delay)
+        warmup_state: State with warmup phrase entries (created by caller)
 
     Returns:
         The generation state after warmup, ready for caching
@@ -621,15 +639,20 @@ def run_seed_warmup(
                         transformer_step, buffers,
                     )
 
-            # Sample text token (but we'll force pad anyway during warmup)
+            # Sample text token
             guided_text = apply_classifier_guidance(buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k)
             if guided_text.shape[0] > 1:
                 guided_text = guided_text[:1]
-            _ = sample_token_fn(guided_text, temp=config.text.temperature, top_k=config.text.top_k).item()
+            text_token = sample_token_fn(guided_text, temp=config.text.temperature, top_k=config.text.top_k).item()
 
-            # During warmup, always output pad (no text influence)
-            main_token = token_ids.pad
-            second_token = token_ids.pad
+            # Process through state machine with warmup phrase (or use pad if no state)
+            if warmup_state is not None:
+                main_token, aux_token, _ = runtime.machine.process(t, warmup_state, text_token)
+                second_token = aux_token if aux_token != -1 else token_ids.pad
+            else:
+                # Fallback: use pad tokens (old behavior)
+                main_token = token_ids.pad
+                second_token = token_ids.pad
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = second_token
 
@@ -787,6 +810,11 @@ def run_streaming_generation_loop(
     # This preserves the Mimi decoder's internal state (key-value cache) across chunks,
     # eliminating boundary artifacts that occur when decoding chunks independently
     decoder_state = None
+
+    # Held chunk for overlap decode (provides forward context to eliminate end-of-chunk pops)
+    # When a new chunk arrives, we decode [held_chunk, new_chunk] but only output held_chunk's audio
+    # This gives held_chunk forward context from new_chunk's data
+    held_aligned_chunk = None
 
     # Track aligned frames we've already emitted (after undelay)
     # undelay output length = input_length - max_delay
@@ -1093,22 +1121,32 @@ def run_streaming_generation_loop(
                         aligned_chunk = aligned_full[:, :, last_aligned_emitted:current_aligned_end]
 
                         if aligned_chunk.shape[-1] > 0:
+                            # OVERLAP DECODE: Hold one chunk and use next as lookahead
+                            # This gives each chunk forward context to eliminate end-of-chunk pops
+                            if held_aligned_chunk is None:
+                                # First chunk - hold it, wait for next chunk for lookahead
+                                held_aligned_chunk = aligned_chunk
+                                last_aligned_emitted = current_aligned_end
+                                continue  # Skip decode, wait for lookahead
+
                             try:
-                                # Step 3: Start decode on separate stream (async)
-                                # Use decode_audio_streaming to maintain decoder state across chunks
+                                # Step 3: Decode held chunk with current chunk as lookahead
+                                # held_aligned_chunk gets forward context from aligned_chunk
                                 t0 = time.time()
                                 if decode_stream is not None:
                                     with torch.cuda.stream(decode_stream):
                                         chunk_waveform, decoder_state = decode_audio_streaming(
-                                            runtime, aligned_chunk, decoder_state
+                                            runtime, held_aligned_chunk, decoder_state,
+                                            lookahead_tokens=aligned_chunk
                                         )
                                     # Store for next iteration - decode runs async
                                     pending_decode = (chunk_waveform, chunk_index, total_audio_ms)
                                     chunk_index += 1
                                 else:
-                                    # No CUDA - decode synchronously with state preservation
+                                    # No CUDA - decode synchronously with lookahead
                                     chunk_waveform, decoder_state = decode_audio_streaming(
-                                        runtime, aligned_chunk, decoder_state
+                                        runtime, held_aligned_chunk, decoder_state,
+                                        lookahead_tokens=aligned_chunk
                                     )
                                     if chunk_waveform.numel() > 0:
                                         wav_bytes = _encode_wav_chunk(chunk_waveform, runtime.mimi.sample_rate)
@@ -1123,6 +1161,9 @@ def run_streaming_generation_loop(
 
                                 t1 = time.time()
                                 # Only count decode launch time here (actual decode is async)
+
+                                # Current chunk becomes the new held chunk
+                                held_aligned_chunk = aligned_chunk
 
                             except Exception as e:
                                 if logger:
@@ -1166,6 +1207,8 @@ def run_streaming_generation_loop(
             pending_decode = None
 
         # Handle any remaining frames (same fix: undelay full buffer, slice result)
+        # With overlap decode, we may have a held chunk that needs to be decoded
+        aligned_remaining = None
         if last_step >= 0:
             remaining_end = min(last_step + 2, audio_buf.shape[-1])
 
@@ -1182,32 +1225,71 @@ def run_streaming_generation_loop(
                 if current_aligned_end > last_aligned_emitted:
                     aligned_remaining = aligned_full[:, :, last_aligned_emitted:current_aligned_end]
 
-                    if aligned_remaining.shape[-1] > 0:
-                        try:
-                            # Final chunk - decode synchronously with state preservation
-                            # This ensures continuity with previous chunks
-                            remaining_waveform, decoder_state = decode_audio_streaming(
-                                runtime, aligned_remaining, decoder_state
-                            )
+        # OVERLAP DECODE FINALIZATION:
+        # If we have a held chunk, decode it with remaining frames as lookahead (if any)
+        if held_aligned_chunk is not None:
+            try:
+                # Decode held chunk with remaining as lookahead
+                if aligned_remaining is not None and aligned_remaining.shape[-1] > 0:
+                    # Use remaining frames as lookahead for held chunk
+                    held_waveform, decoder_state = decode_audio_streaming(
+                        runtime, held_aligned_chunk, decoder_state,
+                        lookahead_tokens=aligned_remaining
+                    )
+                else:
+                    # No remaining frames - decode held chunk without lookahead
+                    # (This is the very end, so any pop at the end is acceptable)
+                    held_waveform, decoder_state = decode_audio_streaming(
+                        runtime, held_aligned_chunk, decoder_state
+                    )
 
-                            if remaining_waveform.numel() > 0:
-                                wav_bytes = _encode_wav_chunk(remaining_waveform, runtime.mimi.sample_rate)
-                                chunk_duration_ms = (remaining_waveform.numel() / runtime.mimi.sample_rate) * 1000
+                if held_waveform.numel() > 0:
+                    wav_bytes = _encode_wav_chunk(held_waveform, runtime.mimi.sample_rate)
+                    chunk_duration_ms = (held_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
-                                yield AudioChunkEvent(
-                                    audio_data=wav_bytes,
-                                    chunk_index=chunk_index,
-                                    timestamp_ms=total_audio_ms,
-                                )
+                    yield AudioChunkEvent(
+                        audio_data=wav_bytes,
+                        chunk_index=chunk_index,
+                        timestamp_ms=total_audio_ms,
+                    )
+                    total_audio_ms += chunk_duration_ms
+                    chunk_index += 1
 
-                                total_audio_ms += chunk_duration_ms
-                                chunk_index += 1
+                # Remaining frames become the new held chunk
+                held_aligned_chunk = aligned_remaining
 
-                        except Exception as e:
-                            if logger:
-                                logger.event(f"Final chunk decode error: {e}")
-                            yield ErrorEvent(error=f"Final chunk decode error: {e}")
-                            return
+            except Exception as e:
+                if logger:
+                    logger.event(f"Held chunk decode error: {e}")
+                yield ErrorEvent(error=f"Held chunk decode error: {e}")
+                return
+
+        # Final chunk: decode any remaining held chunk without lookahead
+        if held_aligned_chunk is not None and held_aligned_chunk.shape[-1] > 0:
+            try:
+                # Final chunk - no lookahead available (end of audio)
+                final_waveform, decoder_state = decode_audio_streaming(
+                    runtime, held_aligned_chunk, decoder_state
+                )
+
+                if final_waveform.numel() > 0:
+                    wav_bytes = _encode_wav_chunk(final_waveform, runtime.mimi.sample_rate)
+                    chunk_duration_ms = (final_waveform.numel() / runtime.mimi.sample_rate) * 1000
+
+                    yield AudioChunkEvent(
+                        audio_data=wav_bytes,
+                        chunk_index=chunk_index,
+                        timestamp_ms=total_audio_ms,
+                    )
+
+                    total_audio_ms += chunk_duration_ms
+                    chunk_index += 1
+
+            except Exception as e:
+                if logger:
+                    logger.event(f"Final chunk decode error: {e}")
+                yield ErrorEvent(error=f"Final chunk decode error: {e}")
+                return
 
         # Emit completion event
         yield CompleteEvent(

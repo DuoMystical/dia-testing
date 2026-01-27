@@ -320,12 +320,19 @@ def process_request(request: dict):
             # Build initial state
             gen_state = build_initial_state(runtime, prefix=prefix_plan)
 
-            # Run warmup (seed-dependent, text-independent)
+            # Create warmup state with a fixed phrase (not user's text)
+            # This ensures consistent warmup behavior for seed caching
+            WARMUP_PHRASE = "[S1] Hello, how are you today?"
+            warmup_entries = parse_script([WARMUP_PHRASE], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+            warmup_state = runtime.machine.new_state(warmup_entries)
+
+            # Run warmup with the fixed phrase (seed-dependent, text-independent)
             gen_state = run_seed_warmup(
                 runtime,
                 gen_state,
                 gen_config,
                 num_steps=gen_config.initial_padding,
+                warmup_state=warmup_state,
             )
             start_step = gen_config.initial_padding
 

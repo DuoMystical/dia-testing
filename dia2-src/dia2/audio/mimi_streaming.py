@@ -183,6 +183,7 @@ class MimiDecoderPaddingCache:
         self,
         layer_idx: int,
         input_tensor: torch.Tensor,
+        real_input_len: Optional[int] = None,
     ) -> tuple[Optional[torch.Tensor], int]:
         """
         Get cached input to prepend, and update cache with current input.
@@ -190,6 +191,8 @@ class MimiDecoderPaddingCache:
         Args:
             layer_idx: Index of the layer
             input_tensor: Current input tensor (batch, channels, time)
+            real_input_len: If set, only cache the first real_input_len samples
+                           (rest is lookahead for forward context, not cached)
 
         Returns:
             Tuple of (cached_input_to_prepend, output_samples_to_trim)
@@ -212,18 +215,25 @@ class MimiDecoderPaddingCache:
         if cache.is_transpose and not cache.is_first_chunk and cached_to_prepend is not None:
             output_trim = cache.output_trim
 
-        # Update cache with the last cache_size samples from current input
-        seq_len = input_tensor.shape[-1]
+        # Determine what portion of input to cache
+        # If real_input_len is set, only cache from the "real" portion (not lookahead)
+        if real_input_len is not None:
+            input_for_cache = input_tensor[..., :real_input_len]
+        else:
+            input_for_cache = input_tensor
+
+        # Update cache with the last cache_size samples from the cacheable input
+        seq_len = input_for_cache.shape[-1]
         if seq_len >= cache.cache_size:
-            cache.cached_input = input_tensor[..., -cache.cache_size:].clone()
+            cache.cached_input = input_for_cache[..., -cache.cache_size:].clone()
         else:
             # Input shorter than cache size - combine with existing cache
             if cache.cached_input is not None:
-                combined = torch.cat([cache.cached_input, input_tensor], dim=-1)
+                combined = torch.cat([cache.cached_input, input_for_cache], dim=-1)
                 cache.cached_input = combined[..., -cache.cache_size:].clone()
             else:
                 # First chunk and input is too short - just cache what we have
-                cache.cached_input = input_tensor.clone()
+                cache.cached_input = input_for_cache.clone()
 
         # Mark that we've processed at least one chunk
         cache.is_first_chunk = False
@@ -241,16 +251,26 @@ def _patched_conv1d_forward(
     self,
     hidden_states: torch.Tensor,
     padding_cache: Optional[MimiDecoderPaddingCache] = None,
+    real_input_len: Optional[int] = None,
 ) -> torch.Tensor:
-    """Patched forward for MimiConv1d with streaming support."""
+    """Patched forward for MimiConv1d with streaming support.
+
+    Args:
+        hidden_states: Input tensor (batch, channels, time)
+        padding_cache: Cache for streaming state
+        real_input_len: If set, only this much of the input is "real" -
+                       the rest is lookahead context for forward-looking convs.
+                       Cache is updated only with real input, output is trimmed.
+    """
     layer_idx = getattr(self, '_streaming_layer_idx', None)
+    input_len = hidden_states.shape[-1]
 
     # Get extra padding needed for alignment
     extra_padding = self._get_extra_padding_for_conv1d(hidden_states)
 
     if padding_cache is not None and layer_idx is not None:
         # Streaming mode - use cached input for left context
-        cached_input, _ = padding_cache.get_and_update(layer_idx, hidden_states)
+        cached_input, _ = padding_cache.get_and_update(layer_idx, hidden_states, real_input_len)
 
         if cached_input is not None:
             # Prepend cached input - this provides the left context the conv needs
@@ -261,10 +281,17 @@ def _patched_conv1d_forward(
                 if extra_padding > 0:
                     hidden_states = self._pad1d(hidden_states, (0, extra_padding), self.pad_mode)
             else:
-                # Non-causal: add right padding (we have past context from cache, but no future)
-                hidden_states = self._pad1d(
-                    hidden_states, (0, self.padding_right + extra_padding), self.pad_mode
-                )
+                # Non-causal: lookahead is provided by the input itself (if real_input_len set)
+                # Only add extra padding if needed for alignment
+                if real_input_len is not None:
+                    # Lookahead is in the input, just add extra padding if needed
+                    if extra_padding > 0:
+                        hidden_states = self._pad1d(hidden_states, (0, extra_padding), self.pad_mode)
+                else:
+                    # No lookahead, add right padding
+                    hidden_states = self._pad1d(
+                        hidden_states, (0, self.padding_right + extra_padding), self.pad_mode
+                    )
         else:
             # First chunk - use normal padding
             if self.causal:
@@ -272,11 +299,17 @@ def _patched_conv1d_forward(
                     hidden_states, (self.padding_total, extra_padding), self.pad_mode
                 )
             else:
-                hidden_states = self._pad1d(
-                    hidden_states,
-                    (self.padding_left, self.padding_right + extra_padding),
-                    self.pad_mode,
-                )
+                if real_input_len is not None:
+                    # Lookahead provided in input, add left padding and extra
+                    hidden_states = self._pad1d(
+                        hidden_states, (self.padding_left, extra_padding), self.pad_mode
+                    )
+                else:
+                    hidden_states = self._pad1d(
+                        hidden_states,
+                        (self.padding_left, self.padding_right + extra_padding),
+                        self.pad_mode,
+                    )
     elif self.causal:
         # No cache, use normal causal padding
         hidden_states = self._pad1d(
@@ -291,6 +324,11 @@ def _patched_conv1d_forward(
         )
 
     hidden_states = self.conv(hidden_states)
+
+    # If real_input_len was set, trim output to match real input length
+    if real_input_len is not None and padding_cache is not None:
+        hidden_states = hidden_states[..., :real_input_len]
+
     return hidden_states
 
 
@@ -298,14 +336,23 @@ def _patched_conv_transpose1d_forward(
     self,
     hidden_states: torch.Tensor,
     padding_cache: Optional[MimiDecoderPaddingCache] = None,
+    real_input_len: Optional[int] = None,
 ) -> torch.Tensor:
-    """Patched forward for MimiConvTranspose1d with streaming support."""
+    """Patched forward for MimiConvTranspose1d with streaming support.
+
+    Args:
+        hidden_states: Input tensor (batch, channels, time)
+        padding_cache: Cache for streaming state
+        real_input_len: If set, only this much of the input is "real" -
+                       the rest is lookahead context. Output is trimmed accordingly.
+    """
     layer_idx = getattr(self, '_streaming_layer_idx', None)
+    stride = self.conv.stride[0]
 
     # Get cached input and output trim amount
     output_trim = 0
     if padding_cache is not None and layer_idx is not None:
-        cached_input, output_trim = padding_cache.get_and_update(layer_idx, hidden_states)
+        cached_input, output_trim = padding_cache.get_and_update(layer_idx, hidden_states, real_input_len)
 
         if cached_input is not None:
             # Prepend cached input for context
@@ -319,6 +366,12 @@ def _patched_conv_transpose1d_forward(
 
     # Calculate start position: normal padding_left PLUS any streaming trim
     start = self.padding_left + output_trim
+
+    # If real_input_len was set, limit output to real input's worth
+    # For transpose conv, output_len = input_len * stride (approximately)
+    if real_input_len is not None and padding_cache is not None:
+        real_output_len = real_input_len * stride
+        end = min(end, start + real_output_len)
 
     # Ensure we don't trim more than we have
     if start >= end:
@@ -334,21 +387,27 @@ def _patched_resnet_block_forward(
     self,
     hidden_states: torch.Tensor,
     padding_cache: Optional[MimiDecoderPaddingCache] = None,
+    real_input_len: Optional[int] = None,
 ) -> torch.Tensor:
     """Patched forward for MimiResnetBlock with streaming support."""
     residual = hidden_states
 
     for layer in self.block:
         if hasattr(layer, '_streaming_layer_idx'):
-            hidden_states = layer(hidden_states, padding_cache=padding_cache)
+            hidden_states = layer(hidden_states, padding_cache=padding_cache, real_input_len=real_input_len)
         else:
             hidden_states = layer(hidden_states)
 
     if self.shortcut is not None:
         if hasattr(self.shortcut, '_streaming_layer_idx'):
-            residual = self.shortcut(residual, padding_cache=padding_cache)
+            residual = self.shortcut(residual, padding_cache=padding_cache, real_input_len=real_input_len)
         else:
             residual = self.shortcut(residual)
+
+    # If real_input_len was set, ensure residual and hidden_states match in length
+    if real_input_len is not None:
+        residual = residual[..., :real_input_len]
+        hidden_states = hidden_states[..., :real_input_len]
 
     return residual + hidden_states
 
@@ -357,6 +416,7 @@ def _patched_decoder_forward(
     self,
     hidden_states: torch.Tensor,
     padding_cache: Optional[MimiDecoderPaddingCache] = None,
+    real_input_len: Optional[int] = None,
 ) -> torch.Tensor:
     """Patched forward for MimiDecoder with streaming support."""
     from transformers.models.mimi.modeling_mimi import (
@@ -367,9 +427,9 @@ def _patched_decoder_forward(
 
     for layer in self.layers:
         if isinstance(layer, (MimiConv1d, MimiConvTranspose1d)):
-            hidden_states = layer(hidden_states, padding_cache=padding_cache)
+            hidden_states = layer(hidden_states, padding_cache=padding_cache, real_input_len=real_input_len)
         elif isinstance(layer, MimiResnetBlock):
-            hidden_states = layer(hidden_states, padding_cache=padding_cache)
+            hidden_states = layer(hidden_states, padding_cache=padding_cache, real_input_len=real_input_len)
         else:
             hidden_states = layer(hidden_states)
 
@@ -381,16 +441,39 @@ def _patched_decode_frame(
     codes: torch.Tensor,
     decoder_past_key_values: Optional[Any] = None,
     decoder_padding_cache: Optional[MimiDecoderPaddingCache] = None,
+    output_frames: Optional[int] = None,
     return_dict: Optional[bool] = None,
 ):
-    """Patched _decode_frame with padding cache support."""
+    """Patched _decode_frame with padding cache support.
+
+    Args:
+        codes: Audio codes (batch, codebooks, frames)
+        decoder_past_key_values: KV cache from previous decode
+        decoder_padding_cache: Conv padding cache for streaming
+        output_frames: If set, only produce output for this many frames.
+                      Remaining frames are lookahead context only.
+    """
+    num_input_frames = codes.shape[-1]
     embeddings = self.quantizer.decode(codes)
+
+    # Calculate real_input_len for each stage if output_frames is set
+    # This limits how much output we produce while still using lookahead for context
+    upsample_real_len = None
+    if output_frames is not None and output_frames < num_input_frames:
+        upsample_real_len = output_frames  # At embedding level, 1 frame = 1 timestep
 
     # Upsample with padding cache support (it's a MimiConvTranspose1d!)
     if decoder_padding_cache is not None and hasattr(self.upsample, '_streaming_layer_idx'):
-        embeddings = self.upsample(embeddings, padding_cache=decoder_padding_cache)
+        embeddings = self.upsample(embeddings, padding_cache=decoder_padding_cache, real_input_len=upsample_real_len)
     else:
         embeddings = self.upsample(embeddings)
+
+    # Calculate real_input_len for transformer output
+    # After upsample, the length is scaled by the upsample stride
+    transformer_real_len = None
+    if output_frames is not None and output_frames < num_input_frames:
+        # embeddings length after upsample corresponds to output_frames worth
+        transformer_real_len = embeddings.shape[-1]  # Already trimmed by upsample
 
     decoder_outputs = self.decoder_transformer(
         embeddings.transpose(1, 2),
@@ -401,7 +484,8 @@ def _patched_decode_frame(
     embeddings = decoder_outputs.last_hidden_state.transpose(1, 2)
 
     # Use patched decoder forward with padding cache
-    outputs = self.decoder(embeddings, padding_cache=decoder_padding_cache)
+    # Pass real_input_len to limit output
+    outputs = self.decoder(embeddings, padding_cache=decoder_padding_cache, real_input_len=transformer_real_len)
 
     return outputs, decoder_past_key_values
 
@@ -412,15 +496,27 @@ def _patched_decode(
     padding_mask: Optional[torch.Tensor] = None,
     decoder_past_key_values: Optional[Any] = None,
     decoder_padding_cache: Optional[MimiDecoderPaddingCache] = None,
+    output_frames: Optional[int] = None,
     return_dict: Optional[bool] = None,
 ):
-    """Patched decode method with padding cache support."""
+    """Patched decode method with padding cache support.
+
+    Args:
+        audio_codes: Audio codes (batch, codebooks, frames)
+        padding_mask: Optional padding mask
+        decoder_past_key_values: KV cache from previous decode
+        decoder_padding_cache: Conv padding cache for streaming
+        output_frames: If set, only produce output for this many frames.
+                      Remaining input frames are lookahead context only.
+        return_dict: Whether to return a dict or tuple
+    """
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
     audio_values, decoder_past_key_values = self._decode_frame(
         audio_codes,
         decoder_past_key_values=decoder_past_key_values,
         decoder_padding_cache=decoder_padding_cache,
+        output_frames=output_frames,
     )
 
     if not return_dict:
