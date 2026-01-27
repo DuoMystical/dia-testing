@@ -48,12 +48,13 @@ class MimiCodec(nn.Module):
         dtype: Optional[torch.dtype] = None,
         enable_streaming: bool = True,
     ) -> "MimiCodec":
+        # Load directly to GPU with device_map to avoid CPU->GPU copy
         model = MimiModel.from_pretrained(
             model_id,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
+            device_map={"": device},  # Load directly to target device
         )
-        model = model.to(device)
         model.eval()
         # Enable use_cache so decoder returns past_key_values for streaming
         model.config.use_cache = True

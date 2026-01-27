@@ -56,7 +56,11 @@ def _cache_put(seed: int, state):
 
 def emit_event(event: dict):
     """Emit a JSON event to stdout."""
-    print(json.dumps(event), flush=True)
+    try:
+        print(json.dumps(event), flush=True)
+    except BrokenPipeError:
+        # Rust side closed the pipe - exit gracefully
+        sys.exit(0)
 
 
 def emit_status(message: str, progress: float):
@@ -96,6 +100,7 @@ def load_model(model_size: str):
     global _model, _device, _model_size
 
     import torch
+    import os
     from dia2 import Dia2
 
     # Determine device
@@ -115,6 +120,10 @@ def load_model(model_size: str):
 
     # Get model repo
     model_repo = f"nari-labs/Dia2-{model_size.upper()}"
+
+    # Redirect tqdm/progress bars to stderr to avoid corrupting JSON protocol on stdout
+    # HF_HUB_DISABLE_PROGRESS_BARS disables them entirely
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
     # Load model
     model = Dia2.from_repo(model_repo, device=device, dtype=dtype)
