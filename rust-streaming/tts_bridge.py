@@ -101,6 +101,7 @@ def load_model(model_size: str):
 
     import torch
     import os
+    import time as time_module
     from dia2 import Dia2
 
     # Determine device
@@ -110,23 +111,44 @@ def load_model(model_size: str):
     # Check if model needs to be loaded
     if _model is not None and _model_size == model_size and _device == device:
         emit_status("Model already loaded", 0.2)
-        # Log max_delay for debugging/optimization
         runtime = _model._ensure_runtime()
         max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
         print(f"[INFO] Model max_delay: {max_delay} frames (chunk_size must be > {max_delay})", file=sys.stderr)
         return _model
 
+    load_start = time_module.time()
     emit_status(f"Loading Dia2-{model_size.upper()} on {device}...", 0.1)
 
     # Get model repo
     model_repo = f"nari-labs/Dia2-{model_size.upper()}"
 
-    # Redirect tqdm/progress bars to stderr to avoid corrupting JSON protocol on stdout
-    # HF_HUB_DISABLE_PROGRESS_BARS disables them entirely
+    # Disable ALL progress bars to avoid corrupting JSON protocol on stdout
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+    os.environ["ACCELERATE_DISABLE_RICH"] = "1"
 
-    # Load model
+    # Also suppress tqdm globally
+    import tqdm
+    original_init = tqdm.tqdm.__init__
+    def patched_init(self, *args, **kwargs):
+        kwargs['file'] = sys.stderr
+        kwargs['disable'] = True
+        return original_init(self, *args, **kwargs)
+    tqdm.tqdm.__init__ = patched_init
+
+    # Load model with timing
+    print(f"[TIMING] Starting Dia2.from_repo...", file=sys.stderr)
+    t0 = time_module.time()
     model = Dia2.from_repo(model_repo, device=device, dtype=dtype)
+    print(f"[TIMING] Dia2.from_repo: {time_module.time() - t0:.2f}s", file=sys.stderr)
+
+    # Force runtime initialization to measure it separately
+    print(f"[TIMING] Starting _ensure_runtime...", file=sys.stderr)
+    t0 = time_module.time()
+    runtime = model._ensure_runtime()
+    print(f"[TIMING] _ensure_runtime (includes Mimi): {time_module.time() - t0:.2f}s", file=sys.stderr)
+
+    print(f"[TIMING] Total load time: {time_module.time() - load_start:.2f}s", file=sys.stderr)
 
     # Store globally
     _model = model

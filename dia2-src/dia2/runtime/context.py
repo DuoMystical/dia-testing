@@ -76,6 +76,9 @@ def build_runtime(
     device: str,
     dtype_pref: str,
 ) -> tuple[RuntimeContext, str, str]:
+    import time as time_module
+    import sys
+
     device_obj = torch.device(device)
     if device_obj.type == "cuda":
         cuda_matmul = torch.backends.cuda.matmul
@@ -100,22 +103,38 @@ def build_runtime(
                 torch.backends.cudnn.allow_tf32 = True
         else:  # pragma: no cover
             torch.backends.cudnn.allow_tf32 = True
+
     precision = resolve_precision(dtype_pref, device_obj)
     config = load_config(config_path)
+
+    print(f"[TIMING] Creating Dia2Model...", file=sys.stderr)
+    t0 = time_module.time()
     model = Dia2Model(config, precision, device=device_obj)
+    print(f"[TIMING] Dia2Model init: {time_module.time() - t0:.2f}s", file=sys.stderr)
+
+    print(f"[TIMING] Loading weights from {weights_path}...", file=sys.stderr)
+    t0 = time_module.time()
     load_file_into_model(model, str(weights_path), device=device)
+    print(f"[TIMING] Weight loading: {time_module.time() - t0:.2f}s", file=sys.stderr)
 
     tokenizer_ref = tokenizer_id or config.assets.tokenizer or repo_id
     if tokenizer_ref is None:
         raise ValueError("Tokenizer id is missing. Provide --tokenizer or add assets.tokenizer to the config.")
+
+    print(f"[TIMING] Loading tokenizer...", file=sys.stderr)
+    t0 = time_module.time()
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_ref,
         use_fast=False,
         trust_remote_code=True,
     )
+    print(f"[TIMING] Tokenizer: {time_module.time() - t0:.2f}s", file=sys.stderr)
 
     mimi_ref = mimi_id or config.assets.mimi or DEFAULT_MIMI_MODEL_ID
+    print(f"[TIMING] Loading Mimi codec...", file=sys.stderr)
+    t0 = time_module.time()
     mimi = MimiCodec.from_pretrained(mimi_ref, device=device_obj)
+    print(f"[TIMING] Mimi codec: {time_module.time() - t0:.2f}s", file=sys.stderr)
 
     data_cfg = config.data
     constants = TokenIds(
