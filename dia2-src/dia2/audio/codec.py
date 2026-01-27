@@ -10,11 +10,6 @@ from transformers import MimiModel
 
 DEFAULT_MIMI_MODEL_ID = "kyutai/mimi"
 
-# Overlap frames for streaming decode (provides context for conv layers)
-# This determines how many frames from the previous chunk we include when decoding
-# 8 frames at 12.5Hz = 640ms of context, enough for most conv receptive fields
-STREAMING_OVERLAP_FRAMES = 8
-
 
 @dataclass(frozen=True)
 class MimiConfig:
@@ -24,33 +19,37 @@ class MimiConfig:
 
 @dataclass
 class StreamingDecoderState:
-    """State for streaming audio decode with overlap-add."""
-    # Last N frames of tokens from previous chunk (for context)
-    overlap_tokens: Optional[torch.Tensor] = None
-    # Number of audio samples already emitted (for trimming overlap)
-    samples_emitted: int = 0
+    """State for streaming audio decode.
+
+    Contains both the transformer KV cache and the conv padding cache
+    for proper stateful streaming.
+    """
+    # Transformer KV cache for attention continuity
+    kv_cache: Optional[Any] = None
+    # Conv padding cache for seamless audio boundaries
+    padding_cache: Optional[Any] = None
 
 
 class MimiCodec(nn.Module):
     """Thin wrapper around transformers' MimiModel for decoding audio tokens.
 
-    Supports streaming decode via overlap-add:
-    - Prepend overlapping frames from previous chunk for context
-    - Decode combined chunk
-    - Trim overlapping samples from output
+    Supports streaming decode with full state preservation:
+    - Transformer KV cache (for attention continuity)
+    - Conv padding cache (for seamless audio at chunk boundaries)
 
-    This approach is simpler and more reliable than patching conv layer internals.
+    The conv padding cache properly handles both Conv1d and ConvTranspose1d
+    layers by caching input samples and trimming redundant output.
     """
 
-    def __init__(self, model: MimiModel, device: torch.device) -> None:
+    def __init__(self, model: MimiModel, device: torch.device, streaming_enabled: bool = False) -> None:
         super().__init__()
         self.model = model
         self.device = device
+        self.streaming_enabled = streaming_enabled
         cfg = getattr(model, "config", None)
         self.sample_rate = getattr(cfg, "sampling_rate", 24000)
         self.frame_rate = getattr(cfg, "frame_rate", 12.5)
         self.samples_per_frame = int(round(self.sample_rate / self.frame_rate)) if self.frame_rate else 0
-        self.overlap_frames = STREAMING_OVERLAP_FRAMES
 
     @classmethod
     def from_pretrained(
@@ -59,7 +58,7 @@ class MimiCodec(nn.Module):
         *,
         device: torch.device,
         dtype: Optional[torch.dtype] = None,
-        enable_streaming: bool = True,  # Kept for API compatibility, always uses overlap-add now
+        enable_streaming: bool = True,
     ) -> "MimiCodec":
         import sys
 
@@ -71,10 +70,21 @@ class MimiCodec(nn.Module):
             device_map={"": device},  # Load directly to target device
         )
         model.eval()
+        # Enable use_cache for transformer KV cache
+        model.config.use_cache = True
 
-        print(f"[MimiCodec] Loaded with overlap-add streaming ({STREAMING_OVERLAP_FRAMES} frame overlap)", file=sys.stderr)
+        streaming_enabled = False
+        if enable_streaming:
+            try:
+                from .mimi_streaming import enable_streaming_decode
+                enable_streaming_decode(model)
+                streaming_enabled = True
+                print("[MimiCodec] Streaming decode enabled with conv state caching", file=sys.stderr)
+            except Exception as e:
+                print(f"[MimiCodec] Warning: Could not enable streaming decode: {e}", file=sys.stderr)
+                print("[MimiCodec] Falling back to KV-cache-only streaming", file=sys.stderr)
 
-        return cls(model, device)
+        return cls(model, device, streaming_enabled)
 
     def decode(
         self,
@@ -98,65 +108,55 @@ class MimiCodec(nn.Module):
         codes: torch.Tensor,
         decoder_state: Optional[StreamingDecoderState] = None,
     ) -> Tuple[torch.Tensor, StreamingDecoderState]:
-        """Decode audio codes to waveform with overlap-add for seamless streaming.
+        """Decode audio codes to waveform with state preservation for streaming.
 
-        This method uses overlap-add to ensure smooth audio transitions:
-        1. Prepend overlapping frames from previous chunk (provides conv context)
-        2. Decode the combined tokens
-        3. Trim the overlapping audio samples from output
+        This method maintains both transformer KV cache and conv padding cache
+        across calls, enabling smooth transitions between audio chunks.
 
         Args:
             codes: Audio codes tensor of shape (batch, num_codebooks, seq_len)
-            decoder_state: Previous state from last call, or None for first chunk
+            decoder_state: Previous StreamingDecoderState, or None for first chunk
 
         Returns:
             Tuple of (audio_waveform, new_decoder_state)
-            - audio_waveform: Decoded audio tensor (only NEW samples, overlap trimmed)
+            - audio_waveform: Decoded audio tensor
             - new_decoder_state: State to pass to next decode_with_state() call
         """
         codes = codes.to(self.device)
-        num_new_frames = codes.shape[-1]
 
         # Initialize state if needed
         if decoder_state is None:
             decoder_state = StreamingDecoderState()
 
         with torch.inference_mode():
-            # Prepend overlap tokens from previous chunk (if available)
-            if decoder_state.overlap_tokens is not None:
-                # Combine: [overlap_tokens | new_tokens]
-                combined_codes = torch.cat([decoder_state.overlap_tokens, codes], dim=-1)
-                overlap_samples = decoder_state.overlap_tokens.shape[-1] * self.samples_per_frame
+            if self.streaming_enabled:
+                # Create padding cache if needed
+                if decoder_state.padding_cache is None:
+                    from .mimi_streaming import MimiDecoderPaddingCache
+                    decoder_state.padding_cache = MimiDecoderPaddingCache(self.model)
+
+                # Decode with both KV cache and padding cache
+                audio, new_kv_cache = self.model.decode(
+                    codes,
+                    decoder_past_key_values=decoder_state.kv_cache,
+                    decoder_padding_cache=decoder_state.padding_cache,
+                    return_dict=False,
+                )
+
+                new_state = StreamingDecoderState(
+                    kv_cache=new_kv_cache,
+                    padding_cache=decoder_state.padding_cache,  # Same cache object, updated in place
+                )
             else:
-                combined_codes = codes
-                overlap_samples = 0
+                # Fallback: KV cache only
+                audio, new_kv_cache = self.model.decode(
+                    codes,
+                    decoder_past_key_values=decoder_state.kv_cache,
+                    return_dict=False,
+                )
+                new_state = StreamingDecoderState(kv_cache=new_kv_cache)
 
-            # Decode the combined chunk
-            audio, _ = self.model.decode(combined_codes, return_dict=False)
-            audio = torch.clamp(audio, -1.0, 1.0)
-
-            # Trim the overlap samples from the start (already emitted in previous chunk)
-            if overlap_samples > 0 and audio.shape[-1] > overlap_samples:
-                audio = audio[..., overlap_samples:]
-
-            # Save the last N frames as overlap for next chunk
-            if num_new_frames >= self.overlap_frames:
-                new_overlap = codes[..., -self.overlap_frames:]
-            else:
-                # Not enough new frames - combine with existing overlap
-                if decoder_state.overlap_tokens is not None:
-                    combined = torch.cat([decoder_state.overlap_tokens, codes], dim=-1)
-                    new_overlap = combined[..., -self.overlap_frames:]
-                else:
-                    new_overlap = codes
-
-            # Update state
-            new_state = StreamingDecoderState(
-                overlap_tokens=new_overlap,
-                samples_emitted=decoder_state.samples_emitted + audio.shape[-1],
-            )
-
-            return audio, new_state
+            return torch.clamp(audio, -1.0, 1.0), new_state
 
     def encode(self, audio: torch.Tensor, *, return_dict: bool = False):
         audio = audio.to(self.device)

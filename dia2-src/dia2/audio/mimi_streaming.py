@@ -5,6 +5,13 @@ This module patches the HuggingFace transformers Mimi implementation to support
 stateful streaming decoding. The decoder's convolutional layers need to maintain
 state across chunks to avoid boundary artifacts.
 
+The approach:
+- For BOTH Conv1d and ConvTranspose1d: cache INPUT samples
+- Prepend cached input when processing new chunk (provides context)
+- For ConvTranspose1d: trim redundant output samples (they were already emitted)
+
+This is simpler and more correct than trying to cache/blend outputs.
+
 Usage:
     from dia2.audio.mimi_streaming import enable_streaming_decode, MimiDecoderPaddingCache
 
@@ -15,57 +22,59 @@ Usage:
     cache = MimiDecoderPaddingCache(model)
 
     # Decode with state
-    audio1, cache = model.decode(codes1, decoder_padding_cache=cache, return_dict=False)
-    audio2, cache = model.decode(codes2, decoder_padding_cache=cache, return_dict=False)
+    audio1, kv = model.decode(codes1, decoder_padding_cache=cache, return_dict=False)
+    audio2, kv = model.decode(codes2, decoder_past_key_values=kv, decoder_padding_cache=cache, return_dict=False)
 """
 
 from __future__ import annotations
 
-import math
-from typing import Optional, Tuple, List, Any
-from dataclasses import dataclass
+from typing import Optional, List, Any
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
 
 
 @dataclass
-class ConvLayerCacheEntry:
-    """Cache entry for a single convolutional layer."""
-    padding_left: int
-    padding_mode: str
-    cached_states: Optional[torch.Tensor] = None
+class ConvLayerCache:
+    """Cache entry for a single convolutional layer.
+
+    For both Conv1d and ConvTranspose1d, we cache INPUT samples.
+    This provides the context needed for correct boundary handling.
+    """
+    # Number of input samples to cache (receptive field - 1)
+    cache_size: int
+    # For ConvTranspose1d: how many output samples to trim (cache_size * stride)
+    output_trim: int = 0
+    # Whether this is a transpose conv (affects output trimming)
+    is_transpose: bool = False
+    # The stride (for transpose conv output trim calculation)
+    stride: int = 1
+    # Cached input samples from previous chunk
+    cached_input: Optional[torch.Tensor] = None
+    # Track if this is the first chunk (no trimming needed)
+    is_first_chunk: bool = True
 
 
 class MimiDecoderPaddingCache:
     """
     Padding cache for streaming Mimi decoder.
 
-    Manages cached states for both regular Conv1d and ConvTranspose1d layers
-    in the decoder to enable seamless chunk-by-chunk decoding.
+    Manages input caching for all Conv1d and ConvTranspose1d layers
+    to enable seamless chunk-by-chunk decoding.
     """
 
     def __init__(self, model: Any):
-        """
-        Initialize cache from a MimiModel instance.
-
-        Args:
-            model: A MimiModel instance (or its decoder attribute)
-        """
-        self.layer_caches: List[ConvLayerCacheEntry] = []
-        self._initialized = False
+        """Initialize cache from a MimiModel instance."""
+        self.layer_caches: List[ConvLayerCache] = []
 
         # Get decoder from model
         decoder = getattr(model, 'decoder', model)
-        config = getattr(model, 'config', None) or getattr(decoder, 'config', None)
-
-        if config is None:
-            raise ValueError("Could not find config on model")
 
         # Analyze decoder layers and create cache entries
-        self._analyze_decoder(decoder, config)
+        self._analyze_decoder(decoder)
 
-    def _analyze_decoder(self, decoder: nn.Module, config: Any):
+    def _analyze_decoder(self, decoder: nn.Module):
         """Analyze decoder layers to determine caching requirements."""
         from transformers.models.mimi.modeling_mimi import (
             MimiConv1d,
@@ -74,118 +83,127 @@ class MimiDecoderPaddingCache:
         )
 
         layer_idx = 0
+
+        def process_conv1d(layer: MimiConv1d) -> int:
+            """Process a Conv1d layer, return its assigned index."""
+            nonlocal layer_idx
+
+            # For causal conv, we need padding_total input samples as context
+            if layer.causal:
+                cache_size = layer.padding_total
+            else:
+                cache_size = layer.padding_left
+
+            self.layer_caches.append(ConvLayerCache(
+                cache_size=cache_size,
+                output_trim=0,  # Conv1d doesn't need output trimming
+                is_transpose=False,
+                stride=1,
+            ))
+            layer._streaming_layer_idx = layer_idx
+            idx = layer_idx
+            layer_idx += 1
+            return idx
+
+        def process_conv_transpose1d(layer: MimiConvTranspose1d) -> int:
+            """Process a ConvTranspose1d layer, return its assigned index."""
+            nonlocal layer_idx
+
+            # Get the actual conv parameters
+            conv = layer.conv
+            kernel_size = conv.kernel_size[0]
+            stride = conv.stride[0]
+
+            # Cache size: number of input samples that affect boundary outputs
+            # For transpose conv, kernel_size - 1 inputs affect the boundary
+            cache_size = kernel_size - 1
+
+            # Output trim: when we prepend cache_size inputs, we get
+            # cache_size * stride extra output samples that were already emitted
+            output_trim = cache_size * stride
+
+            self.layer_caches.append(ConvLayerCache(
+                cache_size=cache_size,
+                output_trim=output_trim,
+                is_transpose=True,
+                stride=stride,
+            ))
+            layer._streaming_layer_idx = layer_idx
+            idx = layer_idx
+            layer_idx += 1
+            return idx
+
+        # Process all layers in the decoder
         for layer in decoder.layers:
             if isinstance(layer, MimiConv1d):
-                # Regular conv needs left padding cache
-                padding_left = getattr(layer, 'padding_left', 0)
-                padding_total = getattr(layer, 'padding_total', padding_left)
-                if layer.causal:
-                    padding_left = padding_total
-                self.layer_caches.append(ConvLayerCacheEntry(
-                    padding_left=padding_left,
-                    padding_mode='replicate' if config.pad_mode == 'replicate' else 'constant',
-                ))
-                layer._streaming_layer_idx = layer_idx
-                layer_idx += 1
-
+                process_conv1d(layer)
             elif isinstance(layer, MimiConvTranspose1d):
-                # Transpose conv needs output tail cache
-                # The amount to cache is padding_left (what gets trimmed from left)
-                padding_left = getattr(layer, 'padding_left', 0)
-                self.layer_caches.append(ConvLayerCacheEntry(
-                    padding_left=padding_left,
-                    padding_mode='constant',
-                ))
-                layer._streaming_layer_idx = layer_idx
-                layer_idx += 1
-
+                process_conv_transpose1d(layer)
             elif isinstance(layer, MimiResnetBlock):
-                # ResnetBlock contains Conv1d layers that need caching
-                for sublayer_name, sublayer in layer.named_modules():
+                # ResnetBlock contains Conv1d layers
+                for sublayer in layer.block:
                     if isinstance(sublayer, MimiConv1d):
-                        padding_left = getattr(sublayer, 'padding_left', 0)
-                        padding_total = getattr(sublayer, 'padding_total', padding_left)
-                        if sublayer.causal:
-                            padding_left = padding_total
-                        self.layer_caches.append(ConvLayerCacheEntry(
-                            padding_left=padding_left,
-                            padding_mode='replicate' if config.pad_mode == 'replicate' else 'constant',
-                        ))
-                        sublayer._streaming_layer_idx = layer_idx
-                        layer_idx += 1
+                        process_conv1d(sublayer)
+                # Check shortcut too
+                if layer.shortcut is not None and isinstance(layer.shortcut, MimiConv1d):
+                    process_conv1d(layer.shortcut)
 
-    def get_cache(self, layer_idx: int) -> Optional[torch.Tensor]:
-        """Get cached states for a layer."""
-        if layer_idx < len(self.layer_caches):
-            return self.layer_caches[layer_idx].cached_states
-        return None
-
-    def update_cache(
+    def get_and_update(
         self,
         layer_idx: int,
-        hidden_states: torch.Tensor,
-        is_transpose: bool = False
-    ) -> Optional[torch.Tensor]:
+        input_tensor: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], int]:
         """
-        Update cache for a layer and return the padding to prepend.
-
-        For regular Conv1d: cache input states, return cached input to prepend
-        For ConvTranspose1d: cache output tail, return cached output to prepend
+        Get cached input to prepend, and update cache with current input.
 
         Args:
             layer_idx: Index of the layer
-            hidden_states: Current states (input for Conv1d, output for ConvTranspose1d)
-            is_transpose: Whether this is a transpose convolution
+            input_tensor: Current input tensor (batch, channels, time)
 
         Returns:
-            Cached states to prepend (or None if no caching needed)
+            Tuple of (cached_input_to_prepend, output_samples_to_trim)
+            - cached_input_to_prepend: Tensor to prepend, or None if first chunk
+            - output_samples_to_trim: Number of output samples to trim (for transpose conv)
         """
         if layer_idx >= len(self.layer_caches):
-            return None
+            return None, 0
 
-        entry = self.layer_caches[layer_idx]
-        padding_left = entry.padding_left
+        cache = self.layer_caches[layer_idx]
 
-        if padding_left == 0:
-            return None
+        if cache.cache_size == 0:
+            return None, 0
 
-        batch_size = hidden_states.shape[0]
-        channels = hidden_states.shape[1]
-        seq_len = hidden_states.shape[2]
-        device = hidden_states.device
-        dtype = hidden_states.dtype
+        # Get current cache to prepend (None for first chunk)
+        cached_to_prepend = cache.cached_input
 
-        # Get or initialize cache
-        if entry.cached_states is None:
-            # Initialize with zeros or replicated values
-            if entry.padding_mode == 'replicate':
-                entry.cached_states = hidden_states[:, :, :1].expand(-1, -1, padding_left).clone()
-            else:
-                entry.cached_states = torch.zeros(
-                    batch_size, channels, padding_left,
-                    device=device, dtype=dtype
-                )
+        # Calculate output trim (only for transpose conv, and not on first chunk)
+        output_trim = 0
+        if cache.is_transpose and not cache.is_first_chunk and cached_to_prepend is not None:
+            output_trim = cache.output_trim
 
-        # Get the cache to return (for prepending)
-        cache_to_prepend = entry.cached_states.clone()
-
-        # Update cache with new states (take the rightmost padding_left samples)
-        if seq_len >= padding_left:
-            entry.cached_states = hidden_states[:, :, -padding_left:].clone()
+        # Update cache with the last cache_size samples from current input
+        seq_len = input_tensor.shape[-1]
+        if seq_len >= cache.cache_size:
+            cache.cached_input = input_tensor[..., -cache.cache_size:].clone()
         else:
-            # Not enough new states - combine old cache tail with new states
-            shortfall = padding_left - seq_len
-            entry.cached_states = torch.cat([
-                entry.cached_states[:, :, -shortfall:],
-                hidden_states
-            ], dim=2)
+            # Input shorter than cache size - combine with existing cache
+            if cache.cached_input is not None:
+                combined = torch.cat([cache.cached_input, input_tensor], dim=-1)
+                cache.cached_input = combined[..., -cache.cache_size:].clone()
+            else:
+                # First chunk and input is too short - just cache what we have
+                cache.cached_input = input_tensor.clone()
 
-        return cache_to_prepend
+        # Mark that we've processed at least one chunk
+        cache.is_first_chunk = False
+
+        return cached_to_prepend, output_trim
 
     def reset(self):
-        """Reset all cached states."""
-        for entry in self.layer_caches:
-            entry.cached_states = None
+        """Reset all cached states for a new decode session."""
+        for cache in self.layer_caches:
+            cache.cached_input = None
+            cache.is_first_chunk = True
 
 
 def _patched_conv1d_forward(
@@ -194,30 +212,33 @@ def _patched_conv1d_forward(
     padding_cache: Optional[MimiDecoderPaddingCache] = None,
 ) -> torch.Tensor:
     """Patched forward for MimiConv1d with streaming support."""
-    # Get extra padding needed
-    extra_padding = self._get_extra_padding_for_conv1d(hidden_states)
-
     layer_idx = getattr(self, '_streaming_layer_idx', None)
 
-    if self.causal and padding_cache is not None and layer_idx is not None:
-        # Use cached states instead of zero padding
-        cached = padding_cache.update_cache(layer_idx, hidden_states, is_transpose=False)
-        if cached is not None:
-            hidden_states = torch.cat([cached, hidden_states], dim=2)
-            # Only add extra_padding on right if needed
+    # Get extra padding needed for alignment
+    extra_padding = self._get_extra_padding_for_conv1d(hidden_states)
+
+    if padding_cache is not None and layer_idx is not None and self.causal:
+        # Get cached input and update cache
+        cached_input, _ = padding_cache.get_and_update(layer_idx, hidden_states)
+
+        if cached_input is not None:
+            # Prepend cached input - this provides the context the conv needs
+            hidden_states = torch.cat([cached_input, hidden_states], dim=-1)
+            # Only add extra padding on the right if needed
             if extra_padding > 0:
-                hidden_states = self._pad1d(
-                    hidden_states, (0, extra_padding), self.pad_mode
-                )
+                hidden_states = self._pad1d(hidden_states, (0, extra_padding), self.pad_mode)
         else:
+            # First chunk - use normal padding
             hidden_states = self._pad1d(
                 hidden_states, (self.padding_total, extra_padding), self.pad_mode
             )
     elif self.causal:
+        # No cache, use normal causal padding
         hidden_states = self._pad1d(
             hidden_states, (self.padding_total, extra_padding), self.pad_mode
         )
     else:
+        # Non-causal conv
         hidden_states = self._pad1d(
             hidden_states,
             (self.padding_left, self.padding_right + extra_padding),
@@ -236,38 +257,31 @@ def _patched_conv_transpose1d_forward(
     """Patched forward for MimiConvTranspose1d with streaming support."""
     layer_idx = getattr(self, '_streaming_layer_idx', None)
 
+    # Get cached input and output trim amount
+    output_trim = 0
+    if padding_cache is not None and layer_idx is not None:
+        cached_input, output_trim = padding_cache.get_and_update(layer_idx, hidden_states)
+
+        if cached_input is not None:
+            # Prepend cached input for context
+            hidden_states = torch.cat([cached_input, hidden_states], dim=-1)
+
     # Run the transpose convolution
     hidden_states = self.conv(hidden_states)
 
-    # Standard trimming
+    # Standard end trimming
     end = hidden_states.shape[-1] - self.padding_right
 
-    if padding_cache is not None and layer_idx is not None and self.causal:
-        # Get cached output from previous chunk
-        cached = padding_cache.get_cache(layer_idx)
+    # Calculate start position: normal padding_left PLUS any streaming trim
+    start = self.padding_left + output_trim
 
-        if cached is not None:
-            # Prepend cached output (this fills in the "missing" left context)
-            # The cached values complete the transient at the start of this chunk
-            cache_len = cached.shape[-1]
-            # Blend the cached tail with the new start (overlap-add style)
-            if cache_len > 0 and self.padding_left > 0:
-                blend_len = min(cache_len, self.padding_left, hidden_states.shape[-1])
-                # Simple crossfade for smooth transition
-                fade_in = torch.linspace(0, 1, blend_len, device=hidden_states.device, dtype=hidden_states.dtype)
-                fade_out = 1 - fade_in
-                hidden_states[:, :, :blend_len] = (
-                    hidden_states[:, :, :blend_len] * fade_in +
-                    cached[:, :, -blend_len:] * fade_out
-                )
+    # Ensure we don't trim more than we have
+    if start >= end:
+        # Edge case: would trim everything. This shouldn't happen in normal use.
+        # Return at least 1 sample to avoid empty tensor issues
+        start = max(0, end - 1)
 
-        # Update cache with the tail that would normally be trimmed
-        # This is the "incomplete" output that depends on future input
-        if end < hidden_states.shape[-1]:
-            tail_to_cache = hidden_states[:, :, end:]
-            padding_cache.update_cache(layer_idx, tail_to_cache, is_transpose=True)
-
-    hidden_states = hidden_states[..., self.padding_left:end]
+    hidden_states = hidden_states[..., start:end]
     return hidden_states
 
 
@@ -281,7 +295,6 @@ def _patched_resnet_block_forward(
 
     for layer in self.block:
         if hasattr(layer, '_streaming_layer_idx'):
-            # This is a MimiConv1d that needs padding_cache
             hidden_states = layer(hidden_states, padding_cache=padding_cache)
         else:
             hidden_states = layer(hidden_states)
@@ -308,9 +321,7 @@ def _patched_decoder_forward(
     )
 
     for layer in self.layers:
-        if isinstance(layer, MimiConv1d):
-            hidden_states = layer(hidden_states, padding_cache=padding_cache)
-        elif isinstance(layer, MimiConvTranspose1d):
+        if isinstance(layer, (MimiConv1d, MimiConvTranspose1d)):
             hidden_states = layer(hidden_states, padding_cache=padding_cache)
         elif isinstance(layer, MimiResnetBlock):
             hidden_states = layer(hidden_states, padding_cache=padding_cache)
@@ -365,7 +376,6 @@ def _patched_decode(
     if not return_dict:
         return audio_values, decoder_past_key_values
 
-    # Return with both caches
     from transformers.models.mimi.modeling_mimi import MimiDecoderOutput
     return MimiDecoderOutput(
         audio_values=audio_values,
@@ -391,7 +401,6 @@ def enable_streaming_decode(model: Any) -> None:
         MimiConvTranspose1d,
         MimiResnetBlock,
         MimiDecoder,
-        MimiModel,
     )
 
     # Patch Conv1d
