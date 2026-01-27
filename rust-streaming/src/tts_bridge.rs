@@ -167,6 +167,24 @@ impl TTSBridge {
         }
     }
 
+    /// Pre-start the Python bridge to load the model at server startup.
+    /// This ensures the model is ready when the first request arrives.
+    pub async fn warmup(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut process_guard = self.process.write().await;
+
+        if process_guard.is_some() {
+            info!("Bridge already running, skipping warmup");
+            return Ok(());
+        }
+
+        info!("Warming up TTS bridge - spawning Python process to pre-load model");
+        let bridge = PersistentBridge::spawn(&self.bridge_path).await?;
+        *process_guard = Some(bridge);
+        info!("TTS bridge warmup complete - Python process started");
+
+        Ok(())
+    }
+
     pub async fn generate_stream(
         &self,
         request: TTSRequest,

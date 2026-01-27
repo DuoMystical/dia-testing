@@ -54,6 +54,19 @@ async fn main() {
 
     let state = Arc::new(RwLock::new(AppState::new(bridge_path)));
 
+    // Spawn warmup task to pre-load the model in the background
+    // This runs while the server starts accepting connections
+    let warmup_state = state.clone();
+    tokio::spawn(async move {
+        info!("Starting model warmup in background...");
+        let state_guard = warmup_state.read().await;
+        if let Err(e) = state_guard.tts_bridge.warmup().await {
+            error!("Failed to warmup TTS bridge: {}", e);
+        } else {
+            info!("Model warmup completed successfully");
+        }
+    });
+
     // CORS configuration
     let cors = CorsLayer::new()
         .allow_origin(Any)
