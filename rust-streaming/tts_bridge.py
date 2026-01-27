@@ -268,7 +268,7 @@ def process_request(request: dict):
             cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
             initial_padding=19,  # Must be >= max_delay (18) for caching
             use_cuda_graph=True,
-            use_torch_compile=False,
+            use_torch_compile=True,  # Enable torch.compile for faster inference
         )
 
         # Streaming config
