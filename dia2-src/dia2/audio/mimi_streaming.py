@@ -248,28 +248,42 @@ def _patched_conv1d_forward(
     # Get extra padding needed for alignment
     extra_padding = self._get_extra_padding_for_conv1d(hidden_states)
 
-    if padding_cache is not None and layer_idx is not None and self.causal:
-        # Get cached input and update cache
+    if padding_cache is not None and layer_idx is not None:
+        # Streaming mode - use cached input for left context
         cached_input, _ = padding_cache.get_and_update(layer_idx, hidden_states)
 
         if cached_input is not None:
-            # Prepend cached input - this provides the context the conv needs
+            # Prepend cached input - this provides the left context the conv needs
             hidden_states = torch.cat([cached_input, hidden_states], dim=-1)
-            # Only add extra padding on the right if needed
-            if extra_padding > 0:
-                hidden_states = self._pad1d(hidden_states, (0, extra_padding), self.pad_mode)
+
+            if self.causal:
+                # Causal: only add extra padding on the right if needed
+                if extra_padding > 0:
+                    hidden_states = self._pad1d(hidden_states, (0, extra_padding), self.pad_mode)
+            else:
+                # Non-causal: add right padding (we have past context from cache, but no future)
+                hidden_states = self._pad1d(
+                    hidden_states, (0, self.padding_right + extra_padding), self.pad_mode
+                )
         else:
             # First chunk - use normal padding
-            hidden_states = self._pad1d(
-                hidden_states, (self.padding_total, extra_padding), self.pad_mode
-            )
+            if self.causal:
+                hidden_states = self._pad1d(
+                    hidden_states, (self.padding_total, extra_padding), self.pad_mode
+                )
+            else:
+                hidden_states = self._pad1d(
+                    hidden_states,
+                    (self.padding_left, self.padding_right + extra_padding),
+                    self.pad_mode,
+                )
     elif self.causal:
         # No cache, use normal causal padding
         hidden_states = self._pad1d(
             hidden_states, (self.padding_total, extra_padding), self.pad_mode
         )
     else:
-        # Non-causal conv
+        # Non-causal conv, no cache
         hidden_states = self._pad1d(
             hidden_states,
             (self.padding_left, self.padding_right + extra_padding),

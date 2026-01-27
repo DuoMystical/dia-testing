@@ -88,20 +88,57 @@ class WebSocketClient {
 
     /**
      * Send text in chunks for bidirectional streaming
+     * @param {string} text - The full text to send
+     * @param {number} chunkSize - Size of each text chunk
+     * @param {object} options - Generation options (model, config, etc.)
      */
-    sendTextChunks(text, chunkSize = 50) {
+    sendTextChunks(text, chunkSize = 50, options = {}) {
         const chunks = [];
         for (let i = 0; i < text.length; i += chunkSize) {
             chunks.push(text.slice(i, i + chunkSize));
         }
 
+        // Build config for the final chunk
+        const config = {
+            // Sampling parameters
+            audio_temperature: options.audioTemperature || 0.8,
+            audio_top_k: options.audioTopK || 50,
+            text_temperature: options.textTemperature || 0.6,
+            text_top_k: options.textTopK || 50,
+            // CFG parameters
+            cfg_scale: options.cfgScale || 6.0,
+            cfg_filter_k: options.cfgFilterK || 50,
+            // Streaming parameters
+            chunk_size_frames: options.chunkSizeFrames || 1,
+            min_chunk_frames: options.minChunkFrames || 1,
+            // Seed (empty string = random)
+            seed: options.seed || ''
+        };
+
+        // Add voice cloning audio if provided
+        if (options.speaker1Audio) {
+            config.speaker_1_audio = options.speaker1Audio;
+        }
+        if (options.speaker2Audio) {
+            config.speaker_2_audio = options.speaker2Audio;
+        }
+
         chunks.forEach((chunk, index) => {
-            this.send({
+            const isFinal = index === chunks.length - 1;
+            const message = {
                 type: 'text_chunk',
                 text: chunk,
                 chunk_index: index,
-                final: index === chunks.length - 1
-            });
+                final: isFinal
+            };
+
+            // Include model and config in the final chunk
+            if (isFinal) {
+                message.model = options.model || '2b';
+                message.config = config;
+            }
+
+            this.send(message);
         });
 
         return chunks.length;

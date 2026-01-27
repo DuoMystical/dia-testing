@@ -282,11 +282,17 @@ document.addEventListener('DOMContentLoaded', () => {
         const item = document.createElement('div');
         item.className = 'chunk-item new';
         item.textContent = index + 1;
-        item.title = `Chunk ${index + 1}: ${duration.toFixed(2)}s`;
+        item.title = `Chunk ${index + 1}: ${duration.toFixed(2)}s (click to play)`;
         item.dataset.index = index;
 
-        item.addEventListener('click', () => {
-            // Could implement click-to-seek here
+        // Click to play single chunk (for debugging audio boundaries)
+        item.addEventListener('click', async () => {
+            const chunkIndex = parseInt(item.dataset.index, 10);
+            console.log(`Playing single chunk ${chunkIndex}`);
+            const played = await audioStreamer.playSingleChunk(chunkIndex);
+            if (played) {
+                playIcon.textContent = '\u23F8'; // Pause icon
+            }
         });
 
         chunkList.appendChild(item);
@@ -412,8 +418,8 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         if (streamInputCheckbox.checked) {
-            // Bidirectional streaming - send text in chunks
-            wsClient.sendTextChunks(text, 50);
+            // Bidirectional streaming - send text in chunks (with options in final chunk)
+            wsClient.sendTextChunks(text, 50, options);
         } else {
             // Direct generation
             wsClient.generate(text, options);

@@ -395,6 +395,70 @@ class AudioStreamer {
     }
 
     /**
+     * Play a single chunk by index (for debugging/testing)
+     * Stops any current playback and plays just the specified chunk
+     */
+    async playSingleChunk(chunkIndex) {
+        if (!this.audioContext) {
+            await this.init();
+        }
+
+        // Resume audio context if suspended
+        if (this.audioContext.state === 'suspended') {
+            await this.audioContext.resume();
+        }
+
+        // Check if chunk exists
+        if (!this.chunkBuffers.has(chunkIndex)) {
+            console.warn(`[AudioStreamer] Chunk ${chunkIndex} not found`);
+            return false;
+        }
+
+        // Stop any current playback
+        this.stop();
+
+        const buffer = this.chunkBuffers.get(chunkIndex);
+        const source = this.audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.gainNode);
+
+        console.log(`[AudioStreamer] Playing single chunk ${chunkIndex}: ${buffer.duration.toFixed(3)}s`);
+
+        // Track this source for cleanup
+        this.scheduledSources.push({
+            source,
+            chunkIndex,
+            startTime: this.audioContext.currentTime,
+            endTime: this.audioContext.currentTime + buffer.duration
+        });
+
+        source.start();
+        this.isPlaying = true;
+
+        // Notify chunk play
+        this.onChunkPlay(chunkIndex);
+
+        // Start update loop for visualizer
+        this._startUpdateLoop();
+
+        source.onended = () => {
+            this.scheduledSources = this.scheduledSources.filter(s => s.source !== source);
+            this.isPlaying = false;
+            this._stopUpdateLoop();
+            this.onPlaybackEnd();
+        };
+
+        return true;
+    }
+
+    /**
+     * Get a specific chunk's buffer (for inspection)
+     */
+    getChunkBuffer(chunkIndex) {
+        return this.chunkBuffers.get(chunkIndex) || null;
+    }
+
+    /**
      * Internal: Start update loop for time and visualizer
      */
     _startUpdateLoop() {
