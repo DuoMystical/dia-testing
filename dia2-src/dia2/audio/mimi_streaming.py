@@ -50,6 +50,9 @@ class ConvLayerCache:
     is_transpose: bool = False
     # The stride (for transpose conv output trim calculation)
     stride: int = 1
+    # Cumulative scale factor: how many samples at this layer = 1 frame at input
+    # Used to convert output_frames to layer-specific sample counts
+    cumulative_scale: int = 1
     # Cached input samples from previous chunk
     cached_input: Optional[torch.Tensor] = None
     # Track if this is the first chunk (no trimming needed)
@@ -67,6 +70,8 @@ class MimiDecoderPaddingCache:
     def __init__(self, model: Any):
         """Initialize cache from a MimiModel instance."""
         self.layer_caches: List[ConvLayerCache] = []
+        # Track cumulative scale as we analyze layers
+        self._current_scale: int = 1
 
         # Analyze the upsample layer (it's a MimiConvTranspose1d that needs caching!)
         upsample = getattr(model, 'upsample', None)
@@ -96,13 +101,20 @@ class MimiDecoderPaddingCache:
         # cache_size * stride extra output samples
         output_trim = cache_size * stride
 
+        # Scale factor at INPUT to this layer (before upsample)
+        input_scale = self._current_scale
+
         self.layer_caches.append(ConvLayerCache(
             cache_size=cache_size,
             output_trim=output_trim,
             is_transpose=True,
             stride=stride,
+            cumulative_scale=input_scale,  # Scale at this layer's INPUT
         ))
         upsample._streaming_layer_idx = 0  # Upsample is always layer 0
+
+        # After upsample, scale increases by stride factor
+        self._current_scale *= stride
 
     def _analyze_decoder(self, decoder: nn.Module):
         """Analyze decoder layers to determine caching requirements."""
@@ -125,11 +137,13 @@ class MimiDecoderPaddingCache:
             else:
                 cache_size = layer.padding_left
 
+            # Conv1d with stride=1 doesn't change the scale
             self.layer_caches.append(ConvLayerCache(
                 cache_size=cache_size,
                 output_trim=0,  # Conv1d doesn't need output trimming
                 is_transpose=False,
                 stride=1,
+                cumulative_scale=self._current_scale,  # Scale at this layer
             ))
             layer._streaming_layer_idx = layer_idx
             idx = layer_idx
@@ -153,15 +167,22 @@ class MimiDecoderPaddingCache:
             # cache_size * stride extra output samples that were already emitted
             output_trim = cache_size * stride
 
+            # Scale at INPUT to this layer (before this transpose conv)
+            input_scale = self._current_scale
+
             self.layer_caches.append(ConvLayerCache(
                 cache_size=cache_size,
                 output_trim=output_trim,
                 is_transpose=True,
                 stride=stride,
+                cumulative_scale=input_scale,  # Scale at this layer's INPUT
             ))
             layer._streaming_layer_idx = layer_idx
             idx = layer_idx
             layer_idx += 1
+
+            # After transpose conv, scale increases by stride factor
+            self._current_scale *= stride
             return idx
 
         # Process all layers in the decoder
@@ -179,33 +200,44 @@ class MimiDecoderPaddingCache:
                 if layer.shortcut is not None and isinstance(layer.shortcut, MimiConv1d):
                     process_conv1d(layer.shortcut)
 
+    def get_scale(self, layer_idx: int) -> int:
+        """Get the cumulative scale factor for a layer.
+
+        Returns how many samples at this layer correspond to 1 frame at input.
+        """
+        if layer_idx >= len(self.layer_caches):
+            return 1
+        return self.layer_caches[layer_idx].cumulative_scale
+
     def get_and_update(
         self,
         layer_idx: int,
         input_tensor: torch.Tensor,
-        real_input_len: Optional[int] = None,
-    ) -> tuple[Optional[torch.Tensor], int]:
+        output_frames: Optional[int] = None,
+    ) -> tuple[Optional[torch.Tensor], int, Optional[int]]:
         """
         Get cached input to prepend, and update cache with current input.
 
         Args:
             layer_idx: Index of the layer
             input_tensor: Current input tensor (batch, channels, time)
-            real_input_len: If set, only cache the first real_input_len samples
-                           (rest is lookahead for forward context, not cached)
+            output_frames: If set, number of OUTPUT FRAMES to produce.
+                          Converted to layer-specific sample count using cumulative_scale.
+                          Only this portion is cached; rest is lookahead.
 
         Returns:
-            Tuple of (cached_input_to_prepend, output_samples_to_trim)
+            Tuple of (cached_input_to_prepend, output_samples_to_trim, real_input_len)
             - cached_input_to_prepend: Tensor to prepend, or None if first chunk
             - output_samples_to_trim: Number of output samples to trim (for transpose conv)
+            - real_input_len: Number of input samples that are "real" (not lookahead)
         """
         if layer_idx >= len(self.layer_caches):
-            return None, 0
+            return None, 0, None
 
         cache = self.layer_caches[layer_idx]
 
         if cache.cache_size == 0:
-            return None, 0
+            return None, 0, None
 
         # Get current cache to prepend (None for first chunk)
         cached_to_prepend = cache.cached_input
@@ -214,6 +246,11 @@ class MimiDecoderPaddingCache:
         output_trim = 0
         if cache.is_transpose and not cache.is_first_chunk and cached_to_prepend is not None:
             output_trim = cache.output_trim
+
+        # Convert output_frames to layer-specific sample count
+        real_input_len = None
+        if output_frames is not None:
+            real_input_len = output_frames * cache.cumulative_scale
 
         # Determine what portion of input to cache
         # If real_input_len is set, only cache from the "real" portion (not lookahead)
@@ -238,7 +275,7 @@ class MimiDecoderPaddingCache:
         # Mark that we've processed at least one chunk
         cache.is_first_chunk = False
 
-        return cached_to_prepend, output_trim
+        return cached_to_prepend, output_trim, real_input_len
 
     def reset(self):
         """Reset all cached states for a new decode session."""
@@ -251,26 +288,30 @@ def _patched_conv1d_forward(
     self,
     hidden_states: torch.Tensor,
     padding_cache: Optional[MimiDecoderPaddingCache] = None,
-    real_input_len: Optional[int] = None,
+    output_frames: Optional[int] = None,
 ) -> torch.Tensor:
     """Patched forward for MimiConv1d with streaming support.
 
     Args:
         hidden_states: Input tensor (batch, channels, time)
         padding_cache: Cache for streaming state
-        real_input_len: If set, only this much of the input is "real" -
-                       the rest is lookahead context for forward-looking convs.
-                       Cache is updated only with real input, output is trimmed.
+        output_frames: If set, number of output FRAMES to produce.
+                      Converted to layer-specific sample count using cumulative_scale.
+                      Only this portion is cached; rest is lookahead. Output is trimmed.
     """
     layer_idx = getattr(self, '_streaming_layer_idx', None)
-    input_len = hidden_states.shape[-1]
 
     # Get extra padding needed for alignment
     extra_padding = self._get_extra_padding_for_conv1d(hidden_states)
 
+    real_input_len = None
     if padding_cache is not None and layer_idx is not None:
         # Streaming mode - use cached input for left context
-        cached_input, _ = padding_cache.get_and_update(layer_idx, hidden_states, real_input_len)
+        # get_and_update now returns (cached, trim, real_input_len) where real_input_len
+        # is computed from output_frames using the layer's cumulative_scale
+        cached_input, _, real_input_len = padding_cache.get_and_update(
+            layer_idx, hidden_states, output_frames
+        )
 
         if cached_input is not None:
             # Prepend cached input - this provides the left context the conv needs
@@ -281,9 +322,9 @@ def _patched_conv1d_forward(
                 if extra_padding > 0:
                     hidden_states = self._pad1d(hidden_states, (0, extra_padding), self.pad_mode)
             else:
-                # Non-causal: lookahead is provided by the input itself (if real_input_len set)
+                # Non-causal: lookahead is provided by the input itself (if output_frames set)
                 # Only add extra padding if needed for alignment
-                if real_input_len is not None:
+                if output_frames is not None:
                     # Lookahead is in the input, just add extra padding if needed
                     if extra_padding > 0:
                         hidden_states = self._pad1d(hidden_states, (0, extra_padding), self.pad_mode)
@@ -299,7 +340,7 @@ def _patched_conv1d_forward(
                     hidden_states, (self.padding_total, extra_padding), self.pad_mode
                 )
             else:
-                if real_input_len is not None:
+                if output_frames is not None:
                     # Lookahead provided in input, add left padding and extra
                     hidden_states = self._pad1d(
                         hidden_states, (self.padding_left, extra_padding), self.pad_mode
@@ -325,8 +366,9 @@ def _patched_conv1d_forward(
 
     hidden_states = self.conv(hidden_states)
 
-    # If real_input_len was set, trim output to match real input length
-    if real_input_len is not None and padding_cache is not None:
+    # STOP EARLY: Trim output to real_input_len (the "real" frames, not lookahead)
+    # For Conv1d with stride=1, output_len == input_len, so we trim to real_input_len
+    if real_input_len is not None:
         hidden_states = hidden_states[..., :real_input_len]
 
     return hidden_states
@@ -336,23 +378,27 @@ def _patched_conv_transpose1d_forward(
     self,
     hidden_states: torch.Tensor,
     padding_cache: Optional[MimiDecoderPaddingCache] = None,
-    real_input_len: Optional[int] = None,
+    output_frames: Optional[int] = None,
 ) -> torch.Tensor:
     """Patched forward for MimiConvTranspose1d with streaming support.
 
     Args:
         hidden_states: Input tensor (batch, channels, time)
         padding_cache: Cache for streaming state
-        real_input_len: If set, only this much of the input is "real" -
-                       the rest is lookahead context. Output is trimmed accordingly.
+        output_frames: If set, number of output FRAMES to produce.
+                      Converted to layer-specific sample count using cumulative_scale.
+                      Only this portion is cached; rest is lookahead. Output is trimmed.
     """
     layer_idx = getattr(self, '_streaming_layer_idx', None)
     stride = self.conv.stride[0]
 
     # Get cached input and output trim amount
     output_trim = 0
+    real_input_len = None
     if padding_cache is not None and layer_idx is not None:
-        cached_input, output_trim = padding_cache.get_and_update(layer_idx, hidden_states, real_input_len)
+        cached_input, output_trim, real_input_len = padding_cache.get_and_update(
+            layer_idx, hidden_states, output_frames
+        )
 
         if cached_input is not None:
             # Prepend cached input for context
@@ -367,9 +413,9 @@ def _patched_conv_transpose1d_forward(
     # Calculate start position: normal padding_left PLUS any streaming trim
     start = self.padding_left + output_trim
 
-    # If real_input_len was set, limit output to real input's worth
-    # For transpose conv, output_len = input_len * stride (approximately)
-    if real_input_len is not None and padding_cache is not None:
+    # STOP EARLY: Trim output to real portion only
+    # For ConvTranspose1d, output_len = input_len * stride, so real_output = real_input_len * stride
+    if real_input_len is not None:
         real_output_len = real_input_len * stride
         end = min(end, start + real_output_len)
 
@@ -387,28 +433,24 @@ def _patched_resnet_block_forward(
     self,
     hidden_states: torch.Tensor,
     padding_cache: Optional[MimiDecoderPaddingCache] = None,
-    real_input_len: Optional[int] = None,
+    output_frames: Optional[int] = None,
 ) -> torch.Tensor:
     """Patched forward for MimiResnetBlock with streaming support."""
     residual = hidden_states
 
     for layer in self.block:
         if hasattr(layer, '_streaming_layer_idx'):
-            hidden_states = layer(hidden_states, padding_cache=padding_cache, real_input_len=real_input_len)
+            hidden_states = layer(hidden_states, padding_cache=padding_cache, output_frames=output_frames)
         else:
             hidden_states = layer(hidden_states)
 
     if self.shortcut is not None:
         if hasattr(self.shortcut, '_streaming_layer_idx'):
-            residual = self.shortcut(residual, padding_cache=padding_cache, real_input_len=real_input_len)
+            residual = self.shortcut(residual, padding_cache=padding_cache, output_frames=output_frames)
         else:
             residual = self.shortcut(residual)
 
-    # If real_input_len was set, ensure residual and hidden_states match in length
-    if real_input_len is not None:
-        residual = residual[..., :real_input_len]
-        hidden_states = hidden_states[..., :real_input_len]
-
+    # The conv layers inside handle trimming - residual and hidden_states should match
     return residual + hidden_states
 
 
@@ -416,7 +458,7 @@ def _patched_decoder_forward(
     self,
     hidden_states: torch.Tensor,
     padding_cache: Optional[MimiDecoderPaddingCache] = None,
-    real_input_len: Optional[int] = None,
+    output_frames: Optional[int] = None,
 ) -> torch.Tensor:
     """Patched forward for MimiDecoder with streaming support."""
     from transformers.models.mimi.modeling_mimi import (
@@ -427,9 +469,9 @@ def _patched_decoder_forward(
 
     for layer in self.layers:
         if isinstance(layer, (MimiConv1d, MimiConvTranspose1d)):
-            hidden_states = layer(hidden_states, padding_cache=padding_cache, real_input_len=real_input_len)
+            hidden_states = layer(hidden_states, padding_cache=padding_cache, output_frames=output_frames)
         elif isinstance(layer, MimiResnetBlock):
-            hidden_states = layer(hidden_states, padding_cache=padding_cache, real_input_len=real_input_len)
+            hidden_states = layer(hidden_states, padding_cache=padding_cache, output_frames=output_frames)
         else:
             hidden_states = layer(hidden_states)
 
@@ -452,29 +494,28 @@ def _patched_decode_frame(
         decoder_padding_cache: Conv padding cache for streaming
         output_frames: If set, only produce output for this many frames.
                       Remaining frames are lookahead context only.
+                      Each layer uses its cumulative_scale to compute the correct
+                      sample count for caching and output trimming.
     """
     num_input_frames = codes.shape[-1]
     embeddings = self.quantizer.decode(codes)
 
-    # Calculate real_input_len for each stage if output_frames is set
-    # This limits how much output we produce while still using lookahead for context
-    upsample_real_len = None
+    # Determine effective output_frames for layers
+    # Only apply if we're actually limiting output (output_frames < total frames)
+    effective_output_frames = None
     if output_frames is not None and output_frames < num_input_frames:
-        upsample_real_len = output_frames  # At embedding level, 1 frame = 1 timestep
+        effective_output_frames = output_frames
 
     # Upsample with padding cache support (it's a MimiConvTranspose1d!)
+    # Each layer uses its cumulative_scale to convert output_frames to sample count
     if decoder_padding_cache is not None and hasattr(self.upsample, '_streaming_layer_idx'):
-        embeddings = self.upsample(embeddings, padding_cache=decoder_padding_cache, real_input_len=upsample_real_len)
+        embeddings = self.upsample(
+            embeddings, padding_cache=decoder_padding_cache, output_frames=effective_output_frames
+        )
     else:
         embeddings = self.upsample(embeddings)
 
-    # Calculate real_input_len for transformer output
-    # After upsample, the length is scaled by the upsample stride
-    transformer_real_len = None
-    if output_frames is not None and output_frames < num_input_frames:
-        # embeddings length after upsample corresponds to output_frames worth
-        transformer_real_len = embeddings.shape[-1]  # Already trimmed by upsample
-
+    # Transformer processes the (possibly trimmed) embeddings
     decoder_outputs = self.decoder_transformer(
         embeddings.transpose(1, 2),
         past_key_values=decoder_past_key_values,
@@ -483,9 +524,12 @@ def _patched_decode_frame(
     decoder_past_key_values = decoder_outputs.past_key_values
     embeddings = decoder_outputs.last_hidden_state.transpose(1, 2)
 
-    # Use patched decoder forward with padding cache
-    # Pass real_input_len to limit output
-    outputs = self.decoder(embeddings, padding_cache=decoder_padding_cache, real_input_len=transformer_real_len)
+    # Decoder conv stack - each layer trims output based on output_frames and its scale
+    outputs = self.decoder(
+        embeddings, padding_cache=decoder_padding_cache, output_frames=effective_output_frames
+    )
+
+    # No final trimming needed - the last conv layer already trimmed to the correct length
 
     return outputs, decoder_past_key_values
 
