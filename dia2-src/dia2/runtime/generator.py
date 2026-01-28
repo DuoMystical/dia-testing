@@ -983,6 +983,9 @@ def run_streaming_generation_loop(
     total_audio_ms = 0.0
     generation_start_time = time.time()
 
+    # Check if we're on CUDA for sync operations
+    is_cuda = runtime.device.type == "cuda"
+
     # Decoder state for maintaining continuity between audio chunks
     # This preserves the Mimi decoder's internal state (key-value cache) across chunks,
     # eliminating boundary artifacts that occur when decoding chunks independently
