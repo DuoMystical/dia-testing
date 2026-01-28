@@ -107,6 +107,40 @@ document.addEventListener('DOMContentLoaded', () => {
         // Expose for debugging from console
         window.wsClient = wsClient;
         window.audioStreamer = audioStreamer;
+
+        // Initialize seamless streamer (for testing)
+        window.seamlessStreamer = new SeamlessAudioStreamer({
+            volume: volumeSlider.value / 100,
+            onBufferLevel: (samples, seconds) => {
+                console.log(`[SeamlessStreamer] Buffer: ${samples} samples (${seconds.toFixed(2)}s)`);
+            },
+            onPlaybackStart: () => {
+                console.log('[SeamlessStreamer] Playback started');
+            },
+            onVisualizerData: (data) => {
+                if (window.useSeamlessStreamer) {
+                    drawVisualizer(data);
+                }
+            }
+        });
+
+        // Flag to switch between streamers
+        window.useSeamlessStreamer = false;
+
+        // Helper function to switch streamers
+        window.switchToSeamless = async () => {
+            window.useSeamlessStreamer = true;
+            await window.seamlessStreamer.init();
+            console.log('Switched to SeamlessAudioStreamer (AudioWorklet-based)');
+            console.log('Audio will now stream through continuous buffer - no pops!');
+        };
+
+        window.switchToChunked = () => {
+            window.useSeamlessStreamer = false;
+            console.log('Switched back to chunked AudioStreamer');
+        };
+
+        console.log('[App] To test seamless streaming, run: switchToSeamless()');
     }
 
     // Handle seed received from backend
@@ -196,7 +230,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         lastChunkReceiveTime = receiveTime;
 
-        const duration = await audioStreamer.addChunk(chunk.data, chunk.chunkIndex);
+        // Use seamless streamer if enabled, otherwise use chunked streamer
+        let duration;
+        if (window.useSeamlessStreamer && window.seamlessStreamer) {
+            duration = await window.seamlessStreamer.addChunk(chunk.data, chunk.chunkIndex);
+        } else {
+            duration = await audioStreamer.addChunk(chunk.data, chunk.chunkIndex);
+        }
 
         // Calculate chunk audio duration in ms
         const chunkAudioMs = duration * 1000;
@@ -380,6 +420,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Reset audio streamer
         audioStreamer.reset();
+        if (window.seamlessStreamer) {
+            window.seamlessStreamer.reset();
+        }
         chunkList.innerHTML = '';
 
         // Reset timing state
