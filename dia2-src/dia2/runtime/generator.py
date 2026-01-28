@@ -990,7 +990,9 @@ def run_streaming_generation_loop(
 
     # Track aligned frames we've already emitted (after undelay)
     # undelay output length = input_length - max_delay
-    last_aligned_emitted = 0
+    # Skip warmup frames - they were used to prime the pipeline and should be clipped
+    # warmup produces (start_step - max_delay) aligned frames that we don't emit
+    last_aligned_emitted = max(0, start_step - max_delay)
 
     # Calculate approximate frame rate for timing
     frame_rate = getattr(runtime, 'frame_rate', 75.0)
@@ -1226,14 +1228,11 @@ def run_streaming_generation_loop(
                     eos_cutoff = state.end_step + flush_tail
                     print(f"[TIMING] EOS detected at step {t}, eos_cutoff set to {eos_cutoff}", file=sys.stderr)
 
-                # FIX: Skip initial frames before first_word_frame (warmup/padding frames)
-                # This matches the crop behavior in non-streaming generate()
-                if not first_word_frame_applied and first_word_frame is not None:
-                    skip_to = max(first_word_frame, 0)
-                    if skip_to > last_aligned_emitted:
-                        print(f"[TIMING] Skipping initial frames: last_aligned_emitted {last_aligned_emitted} -> {skip_to}", file=sys.stderr)
-                        last_aligned_emitted = skip_to
-                    first_word_frame_applied = True
+                # NOTE: We no longer skip based on first_word_frame for streaming.
+                # With seed caching, the warmup frames are already accounted for in last_aligned_emitted
+                # (initialized to start_step - max_delay). Skipping based on first_word_frame caused
+                # the 450ms delay bug because it would wait for the first new_word token.
+                first_word_frame_applied = True
 
                 # Check if we have enough NEW aligned frames for a chunk
                 # aligned length = (t + 1) - max_delay, we've emitted last_aligned_emitted
