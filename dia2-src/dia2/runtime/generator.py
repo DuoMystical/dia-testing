@@ -747,6 +747,69 @@ def _encode_wav_chunk(
     return wav_bytes
 
 
+def _encode_opus_chunk(
+    waveform: torch.Tensor,
+    sample_rate: int,
+) -> bytes:
+    """Encode a waveform tensor to Opus/OGG bytes.
+
+    Opus is designed for streaming and handles packet boundaries gracefully,
+    eliminating the clicks/pops that occur with WAV when samples don't end at zero.
+    """
+    import io
+    import numpy as np
+    import soundfile as sf
+    import sys
+    global _chunk_counter
+
+    audio_np = waveform.detach().cpu().numpy()
+
+    # Run diagnostics before any processing
+    if _chunk_diagnostics_enabled:
+        _analyze_audio_chunk(audio_np, _chunk_counter, sample_rate)
+        _chunk_counter += 1
+
+    # Clip to valid range
+    audio_np = np.clip(audio_np, -1.0, 1.0)
+
+    # Ensure it's the right shape (1D array)
+    if audio_np.ndim > 1:
+        audio_np = audio_np.flatten()
+
+    # Encode to Opus in OGG container
+    buffer = io.BytesIO()
+    sf.write(buffer, audio_np, sample_rate, format='OGG', subtype='OPUS')
+    opus_bytes = buffer.getvalue()
+
+    if _chunk_diagnostics_enabled:
+        print(f"  [OPUS] samples={len(audio_np)}, sample_rate={sample_rate}Hz, size={len(opus_bytes)} bytes", file=sys.stderr)
+        print(f"  [OPUS] first 5 samples: {audio_np[:5].tolist()}", file=sys.stderr)
+        print(f"  [OPUS] last 5 samples: {audio_np[-5:].tolist()}", file=sys.stderr)
+
+    return opus_bytes
+
+
+def _encode_audio_chunk(
+    waveform: torch.Tensor,
+    sample_rate: int,
+    audio_format: str = "opus",
+) -> bytes:
+    """Encode a waveform tensor to the specified audio format.
+
+    Args:
+        waveform: Audio samples as a torch tensor
+        sample_rate: Sample rate in Hz
+        audio_format: "opus" (default) or "wav"
+
+    Returns:
+        Encoded audio bytes
+    """
+    if audio_format == "wav":
+        return _encode_wav_chunk(waveform, sample_rate)
+    else:
+        return _encode_opus_chunk(waveform, sample_rate)
+
+
 def run_seed_warmup(
     runtime: RuntimeContext,
     generation: GenerationState,
@@ -1294,7 +1357,7 @@ def run_streaming_generation_loop(
                             t0 = time.time()
                             if prev_waveform.numel() > 0:
                                 # Encode to WAV (runs on CPU)
-                                wav_bytes = _encode_wav_chunk(prev_waveform, runtime.mimi.sample_rate)
+                                wav_bytes = _encode_audio_chunk(prev_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
                                 chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                                 yield AudioChunkEvent(
@@ -1360,7 +1423,7 @@ def run_streaming_generation_loop(
                                         lookahead_tokens=aligned_chunk
                                     )
                                     if chunk_waveform.numel() > 0:
-                                        wav_bytes = _encode_wav_chunk(chunk_waveform, runtime.mimi.sample_rate)
+                                        wav_bytes = _encode_audio_chunk(chunk_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
                                         chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
                                         yield AudioChunkEvent(
                                             audio_data=wav_bytes,
@@ -1400,7 +1463,7 @@ def run_streaming_generation_loop(
                     decode_stream.synchronize()
 
                 if prev_waveform.numel() > 0:
-                    wav_bytes = _encode_wav_chunk(prev_waveform, runtime.mimi.sample_rate)
+                    wav_bytes = _encode_audio_chunk(prev_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
                     chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                     yield AudioChunkEvent(
@@ -1455,7 +1518,7 @@ def run_streaming_generation_loop(
                     )
 
                 if held_waveform.numel() > 0:
-                    wav_bytes = _encode_wav_chunk(held_waveform, runtime.mimi.sample_rate)
+                    wav_bytes = _encode_audio_chunk(held_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
                     chunk_duration_ms = (held_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                     yield AudioChunkEvent(
@@ -1484,7 +1547,7 @@ def run_streaming_generation_loop(
                 )
 
                 if final_waveform.numel() > 0:
-                    wav_bytes = _encode_wav_chunk(final_waveform, runtime.mimi.sample_rate)
+                    wav_bytes = _encode_audio_chunk(final_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
                     chunk_duration_ms = (final_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                     yield AudioChunkEvent(
