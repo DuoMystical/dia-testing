@@ -1011,8 +1011,10 @@ def run_streaming_generation_loop(
     }
     first_step_time = None
     cuda_graph_captured = False
+    first_chunk_emitted = False
+    first_chunk_timing = {}  # Detailed timing for first chunk
 
-    print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}", file=sys.stderr)
+    print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}, start_step={start_step}, last_aligned_emitted={last_aligned_emitted}", file=sys.stderr)
 
     # Reset chunk diagnostics for this generation session
     reset_chunk_diagnostics()
@@ -1249,14 +1251,17 @@ def run_streaming_generation_loop(
                     # IMMEDIATE DECODE: No lookahead, no pending - decode and emit right away
                     # This minimizes latency to first audio chunk
                     current_frame = t + 1
+                    is_first_chunk = not first_chunk_emitted
 
                     # Undelay the entire buffer up to current position
+                    t_undelay_start = time.time()
                     full_tokens = audio_buf[0, :, :current_frame + 1]
                     aligned_full = undelay_frames(
                         full_tokens,
                         runtime.audio_delays,
                         token_ids.audio_pad
                     ).unsqueeze(0)
+                    t_undelay_end = time.time()
 
                     current_aligned_end = aligned_full.shape[-1]
 
@@ -1265,14 +1270,17 @@ def run_streaming_generation_loop(
 
                         if aligned_chunk.shape[-1] > 0:
                             try:
-                                t0 = time.time()
+                                t_decode_start = time.time()
                                 # Decode immediately without lookahead
                                 chunk_waveform, decoder_state = decode_audio_streaming(
                                     runtime, aligned_chunk, decoder_state
                                 )
+                                t_decode_end = time.time()
 
                                 if chunk_waveform.numel() > 0:
+                                    t_encode_start = time.time()
                                     audio_bytes = _encode_opus_chunk(chunk_waveform, runtime.mimi.sample_rate)
+                                    t_encode_end = time.time()
                                     chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                                     yield AudioChunkEvent(
@@ -1280,11 +1288,36 @@ def run_streaming_generation_loop(
                                         chunk_index=chunk_index,
                                         timestamp_ms=total_audio_ms,
                                     )
+
+                                    # Print detailed timing for first chunk
+                                    if is_first_chunk:
+                                        first_chunk_emitted = True
+                                        total_time = time.time() - generation_start_time
+                                        steps_run = offset + 1
+                                        print(f"[TIMING] === FIRST CHUNK BREAKDOWN ===", file=sys.stderr)
+                                        print(f"[TIMING]   Step: {t} (offset={offset}, steps_run={steps_run})", file=sys.stderr)
+                                        print(f"[TIMING]   Aligned frames emitted: {last_aligned_emitted} -> {current_aligned_end}", file=sys.stderr)
+                                        print(f"[TIMING]   --- Generation steps ({steps_run} steps) ---", file=sys.stderr)
+                                        print(f"[TIMING]   Transformer: {timing_stats['transformer_step']*1000:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING]   Text sampling: {timing_stats['text_sampling']*1000:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING]   State machine: {timing_stats['machine_process']*1000:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING]   Audio sampling: {timing_stats['audio_sampling']*1000:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING]   Depformer: {timing_stats['depformer_stages']*1000:.1f}ms", file=sys.stderr)
+                                        if timing_stats['cuda_graph_capture'] > 0:
+                                            print(f"[TIMING]   CUDA graph capture: {timing_stats['cuda_graph_capture']*1000:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING]   --- Audio encoding ---", file=sys.stderr)
+                                        print(f"[TIMING]   Undelay: {(t_undelay_end - t_undelay_start)*1000:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING]   Mimi decode: {(t_decode_end - t_decode_start)*1000:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING]   Opus encode: {(t_encode_end - t_encode_start)*1000:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING]   --- Summary ---", file=sys.stderr)
+                                        print(f"[TIMING]   Chunk audio duration: {chunk_duration_ms:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING]   TOTAL time to first chunk: {total_time*1000:.1f}ms", file=sys.stderr)
+                                        print(f"[TIMING] ==============================", file=sys.stderr)
+
                                     total_audio_ms += chunk_duration_ms
                                     chunk_index += 1
 
-                                t1 = time.time()
-                                timing_stats['audio_decode'] += (t1 - t0)
+                                timing_stats['audio_decode'] += (t_decode_end - t_decode_start)
 
                             except Exception as e:
                                 if logger:
