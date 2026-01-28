@@ -32,6 +32,10 @@ class SeamlessAudioStreamer {
         // Animation frame for visualization
         this.animationFrame = null;
         this.onVisualizerData = options.onVisualizerData || (() => {});
+
+        // Store decoded chunks for debugging/single-chunk playback
+        this.storedChunks = new Map();
+        this.singleChunkSource = null;
     }
 
     async init() {
@@ -127,18 +131,28 @@ class SeamlessAudioStreamer {
             const audioBuffer = await this.audioContext.decodeAudioData(wavData.slice(0));
             const samples = audioBuffer.getChannelData(0);
 
-            // Send samples to worklet
-            // Note: We need to copy the data because it might be detached
-            const samplesCopy = new Float32Array(samples);
+            console.log(`[SeamlessStreamer] Decoded chunk ${chunkIndex}: ${samples.length} samples, first=${samples[0]?.toFixed(4)}, last=${samples[samples.length-1]?.toFixed(4)}`);
+
+            // Store the AudioBuffer for single-chunk playback debugging
+            this.storedChunks.set(chunkIndex, {
+                buffer: audioBuffer,
+                samples: samples,
+                wavData: wavData.slice(0)  // Store copy of original WAV
+            });
+
+            // Send samples to worklet - use regular array to avoid transfer issues
+            // Convert Float32Array to regular array for reliable cross-thread transfer
+            const samplesArray = Array.from(samples);
             this.workletNode.port.postMessage({
                 type: 'samples',
-                samples: samplesCopy
-            }, [samplesCopy.buffer]); // Transfer ownership for performance
+                samples: samplesArray
+            });
 
             this.chunksReceived++;
             this.totalSamplesDecoded += samples.length;
 
-            console.log(`[SeamlessStreamer] Added chunk ${chunkIndex}: ${samples.length} samples (${(samples.length / this.audioContext.sampleRate * 1000).toFixed(1)}ms)`);
+            // Verify samples were sent correctly
+            console.log(`[SeamlessStreamer] Sent chunk ${chunkIndex} to worklet (${samplesArray.length} samples), first 5: [${samplesArray.slice(0,5).map(s => s.toFixed(4)).join(', ')}]`);
 
             return audioBuffer.duration;
 
@@ -201,7 +215,16 @@ class SeamlessAudioStreamer {
         this.samplesBuffered = 0;
         this.chunksReceived = 0;
         this.totalSamplesDecoded = 0;
+        this.storedChunks.clear();
         this._stopVisualizerLoop();
+
+        // Stop any single-chunk playback
+        if (this.singleChunkSource) {
+            try {
+                this.singleChunkSource.stop();
+            } catch (e) {}
+            this.singleChunkSource = null;
+        }
 
         console.log('[SeamlessStreamer] Reset');
     }
@@ -214,6 +237,72 @@ class SeamlessAudioStreamer {
         if (this.gainNode) {
             this.gainNode.gain.value = this.volume;
         }
+    }
+
+    /**
+     * Play a single chunk directly (for debugging - bypasses the worklet)
+     * This helps isolate whether pops come from the source audio or the streaming
+     */
+    async playSingleChunk(chunkIndex) {
+        const chunk = this.storedChunks.get(chunkIndex);
+        if (!chunk) {
+            console.error(`[SeamlessStreamer] Chunk ${chunkIndex} not found. Available: ${Array.from(this.storedChunks.keys()).join(', ')}`);
+            return false;
+        }
+
+        if (!this.isInitialized) {
+            await this.init();
+        }
+
+        if (this.audioContext.state === 'suspended') {
+            await this.audioContext.resume();
+        }
+
+        // Stop any previous single-chunk playback
+        if (this.singleChunkSource) {
+            try {
+                this.singleChunkSource.stop();
+            } catch (e) {}
+            this.singleChunkSource = null;
+        }
+
+        // Create a new source node for this chunk
+        const source = this.audioContext.createBufferSource();
+        source.buffer = chunk.buffer;
+
+        // Connect directly to gain node (bypasses worklet)
+        source.connect(this.gainNode);
+
+        source.onended = () => {
+            console.log(`[SeamlessStreamer] Single chunk ${chunkIndex} finished`);
+            this.singleChunkSource = null;
+        };
+
+        this.singleChunkSource = source;
+        source.start(0);
+
+        console.log(`[SeamlessStreamer] Playing single chunk ${chunkIndex} (${chunk.buffer.duration.toFixed(3)}s, ${chunk.samples.length} samples)`);
+        console.log(`[SeamlessStreamer] Chunk ${chunkIndex} boundaries: first=${chunk.samples[0]?.toFixed(6)}, last=${chunk.samples[chunk.samples.length-1]?.toFixed(6)}`);
+
+        return true;
+    }
+
+    /**
+     * Get chunk count (for compatibility with chunked streamer)
+     */
+    getChunkCount() {
+        return this.storedChunks.size;
+    }
+
+    /**
+     * Get total duration (for compatibility with chunked streamer)
+     */
+    getTotalDuration() {
+        let total = 0;
+        for (const chunk of this.storedChunks.values()) {
+            total += chunk.buffer.duration;
+        }
+        return total;
     }
 
     /**
@@ -283,6 +372,77 @@ class SeamlessAudioStreamer {
 
         this.isInitialized = false;
         console.log('[SeamlessStreamer] Disposed');
+    }
+}
+
+    /**
+     * Test the worklet by sending a known-good sine wave
+     * Use this to verify the worklet is working correctly
+     */
+    async testWithSineWave(durationSeconds = 1.0, frequency = 440) {
+        if (!this.isInitialized) {
+            await this.init();
+        }
+
+        if (this.audioContext.state === 'suspended') {
+            await this.audioContext.resume();
+        }
+
+        const sampleRate = this.audioContext.sampleRate;
+        const numSamples = Math.floor(sampleRate * durationSeconds);
+        const samples = new Array(numSamples);
+
+        // Generate a sine wave that ends at zero (full period)
+        const periodsToGenerate = Math.floor(frequency * durationSeconds);
+        const actualDuration = periodsToGenerate / frequency;
+        const actualSamples = Math.floor(sampleRate * actualDuration);
+
+        for (let i = 0; i < actualSamples; i++) {
+            samples[i] = 0.3 * Math.sin(2 * Math.PI * frequency * i / sampleRate);
+        }
+
+        console.log(`[SeamlessStreamer] TEST: Sending ${actualSamples} sine wave samples (${actualDuration.toFixed(3)}s, ${frequency}Hz)`);
+        console.log(`[SeamlessStreamer] TEST: First sample=${samples[0].toFixed(6)}, last=${samples[actualSamples-1].toFixed(6)}`);
+
+        this.workletNode.port.postMessage({
+            type: 'samples',
+            samples: samples.slice(0, actualSamples)
+        });
+
+        // Auto-start if not playing
+        if (!this.isPlaying) {
+            setTimeout(() => this._startPlayback(), 100);
+        }
+
+        return actualDuration;
+    }
+
+    /**
+     * Test by adding raw samples directly (for debugging sample boundaries)
+     */
+    async testAddRawSamples(samples) {
+        if (!this.isInitialized) {
+            await this.init();
+        }
+
+        if (this.audioContext.state === 'suspended') {
+            await this.audioContext.resume();
+        }
+
+        const samplesArray = Array.isArray(samples) ? samples : Array.from(samples);
+
+        console.log(`[SeamlessStreamer] TEST: Adding ${samplesArray.length} raw samples`);
+        console.log(`[SeamlessStreamer] First 5: [${samplesArray.slice(0,5).map(s => s.toFixed(6)).join(', ')}]`);
+        console.log(`[SeamlessStreamer] Last 5: [${samplesArray.slice(-5).map(s => s.toFixed(6)).join(', ')}]`);
+
+        this.workletNode.port.postMessage({
+            type: 'samples',
+            samples: samplesArray
+        });
+
+        if (!this.isPlaying) {
+            setTimeout(() => this._startPlayback(), 100);
+        }
     }
 }
 

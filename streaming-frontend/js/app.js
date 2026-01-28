@@ -142,7 +142,29 @@ document.addEventListener('DOMContentLoaded', () => {
                     console.log('Switched back to chunked AudioStreamer');
                 };
 
+                // Test function to play sine wave through worklet
+                window.testWorklet = async (durationSeconds = 1.0, frequency = 440) => {
+                    if (!window.seamlessStreamer) {
+                        console.error('Seamless streamer not available');
+                        return;
+                    }
+                    console.log('Testing worklet with sine wave...');
+                    await window.seamlessStreamer.testWithSineWave(durationSeconds, frequency);
+                };
+
+                // Get worklet status
+                window.getWorkletStatus = () => {
+                    if (window.seamlessStreamer && window.seamlessStreamer.workletNode) {
+                        window.seamlessStreamer.workletNode.port.postMessage({ type: 'getStatus' });
+                        console.log('Status requested - check console for response');
+                    } else {
+                        console.error('Worklet not available');
+                    }
+                };
+
                 console.log('[App] To test seamless streaming, run: switchToSeamless()');
+                console.log('[App] To test worklet with sine wave, run: testWorklet(1.0, 440)');
+                console.log('[App] To get worklet status, run: getWorkletStatus()');
             } catch (e) {
                 console.warn('[App] SeamlessAudioStreamer failed to initialize:', e);
             }
@@ -268,9 +290,12 @@ document.addEventListener('DOMContentLoaded', () => {
             chunkLatency.hidden = false;
         }
 
-        // Update UI
-        chunksCount.textContent = `${audioStreamer.getChunkCount()} chunks`;
-        audioDuration.textContent = `${audioStreamer.getTotalDuration().toFixed(1)}s audio`;
+        // Update UI - use correct streamer for counts
+        const activeStreamer = (window.useSeamlessStreamer && window.seamlessStreamer)
+            ? window.seamlessStreamer
+            : audioStreamer;
+        chunksCount.textContent = `${activeStreamer.getChunkCount()} chunks`;
+        audioDuration.textContent = `${activeStreamer.getTotalDuration().toFixed(1)}s audio`;
 
         // Add chunk to list
         addChunkToList(chunk.chunkIndex, duration);
@@ -340,8 +365,16 @@ document.addEventListener('DOMContentLoaded', () => {
         // Click to play single chunk (for debugging audio boundaries)
         item.addEventListener('click', async () => {
             const chunkIndex = parseInt(item.dataset.index, 10);
-            console.log(`Playing single chunk ${chunkIndex}`);
-            const played = await audioStreamer.playSingleChunk(chunkIndex);
+            console.log(`Playing single chunk ${chunkIndex} (seamless mode: ${window.useSeamlessStreamer})`);
+
+            // Use the appropriate streamer based on current mode
+            let played;
+            if (window.useSeamlessStreamer && window.seamlessStreamer) {
+                played = await window.seamlessStreamer.playSingleChunk(chunkIndex);
+            } else {
+                played = await audioStreamer.playSingleChunk(chunkIndex);
+            }
+
             if (played) {
                 playIcon.textContent = '\u23F8'; // Pause icon
             }
