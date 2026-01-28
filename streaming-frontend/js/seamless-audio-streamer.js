@@ -113,10 +113,10 @@ class SeamlessAudioStreamer {
     }
 
     /**
-     * Add a WAV chunk to the stream
-     * The WAV is decoded and samples are sent to the worklet
+     * Add an audio chunk to the stream
+     * The audio is decoded and samples are sent to the worklet
      */
-    async addChunk(wavData, chunkIndex) {
+    async addChunk(audioData, chunkIndex) {
         if (!this.isInitialized) {
             await this.init();
         }
@@ -128,7 +128,7 @@ class SeamlessAudioStreamer {
 
         try {
             // Decode the WAV data
-            const audioBuffer = await this.audioContext.decodeAudioData(wavData.slice(0));
+            const audioBuffer = await this.audioContext.decodeAudioData(audioData.slice(0));
             const samples = audioBuffer.getChannelData(0);
 
             console.log(`[SeamlessStreamer] Decoded chunk ${chunkIndex}: ${samples.length} samples, first=${samples[0]?.toFixed(4)}, last=${samples[samples.length-1]?.toFixed(4)}`);
@@ -137,7 +137,7 @@ class SeamlessAudioStreamer {
             this.storedChunks.set(chunkIndex, {
                 buffer: audioBuffer,
                 samples: samples,
-                wavData: wavData.slice(0)  // Store copy of original WAV
+                audioData: audioData.slice(0)  // Store copy of original audio
             });
 
             // Send samples to worklet - use regular array to avoid transfer issues

@@ -52,7 +52,6 @@ class StreamingConfig:
     min_chunk_frames: int = 1  # Minimum frames before yielding
     emit_status_every: int = 20  # Emit status every N chunks
     enable_early_audio: bool = True  # Start decoding as soon as possible
-    audio_format: str = "opus"  # "wav" or "opus" - opus eliminates click/pop artifacts
 
 
 @dataclass(frozen=True)

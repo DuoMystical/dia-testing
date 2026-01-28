@@ -691,62 +691,6 @@ def _analyze_audio_chunk(audio_np, chunk_index: int, sample_rate: int):
             _debug_all_samples.append(audio_np.copy())
 
 
-def _encode_wav_chunk(
-    waveform: torch.Tensor,
-    sample_rate: int,
-) -> bytes:
-    """Encode a waveform tensor to WAV bytes."""
-    import io
-    import wave
-    import struct
-    import numpy as np
-    import sys
-    global _chunk_counter
-
-    audio_np = waveform.detach().cpu().numpy()
-
-    # Run diagnostics before any processing
-    if _chunk_diagnostics_enabled:
-        _analyze_audio_chunk(audio_np, _chunk_counter, sample_rate)
-        _chunk_counter += 1
-
-    audio_np = np.clip(audio_np, -1.0, 1.0)
-    pcm16 = (audio_np * 32767.0).astype(np.int16)
-
-    buffer = io.BytesIO()
-    with wave.open(buffer, 'wb') as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(pcm16.tobytes())
-
-    wav_bytes = buffer.getvalue()
-
-    # Verify WAV structure
-    if _chunk_diagnostics_enabled:
-        expected_data_size = len(pcm16) * 2  # 16-bit = 2 bytes per sample
-        expected_total = 44 + expected_data_size  # 44-byte header + data
-        actual_total = len(wav_bytes)
-
-        # Parse WAV header to verify
-        data_view = wav_bytes[40:44]
-        data_chunk_size = struct.unpack('<I', data_view)[0]
-
-        # Check last few PCM samples (as int16)
-        last_pcm = pcm16[-5:].tolist() if len(pcm16) >= 5 else pcm16.tolist()
-
-        print(f"  [WAV] samples={len(pcm16)}, sample_rate={sample_rate}Hz", file=sys.stderr)
-        print(f"  [WAV] expected_size={expected_total}, actual_size={actual_total}, data_chunk={data_chunk_size}", file=sys.stderr)
-        print(f"  [WAV] last 5 PCM int16: {last_pcm}", file=sys.stderr)
-
-        if actual_total != expected_total:
-            print(f"  [WAV] *** SIZE MISMATCH! ***", file=sys.stderr)
-        if data_chunk_size != expected_data_size:
-            print(f"  [WAV] *** DATA CHUNK SIZE MISMATCH! expected={expected_data_size}, got={data_chunk_size} ***", file=sys.stderr)
-
-    return wav_bytes
-
-
 def _encode_opus_chunk(
     waveform: torch.Tensor,
     sample_rate: int,
@@ -787,27 +731,6 @@ def _encode_opus_chunk(
         print(f"  [OPUS] last 5 samples: {audio_np[-5:].tolist()}", file=sys.stderr)
 
     return opus_bytes
-
-
-def _encode_audio_chunk(
-    waveform: torch.Tensor,
-    sample_rate: int,
-    audio_format: str = "opus",
-) -> bytes:
-    """Encode a waveform tensor to the specified audio format.
-
-    Args:
-        waveform: Audio samples as a torch tensor
-        sample_rate: Sample rate in Hz
-        audio_format: "opus" (default) or "wav"
-
-    Returns:
-        Encoded audio bytes
-    """
-    if audio_format == "wav":
-        return _encode_wav_chunk(waveform, sample_rate)
-    else:
-        return _encode_opus_chunk(waveform, sample_rate)
 
 
 def run_seed_warmup(
@@ -1053,17 +976,6 @@ def run_streaming_generation_loop(
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
 
-    # Check if we're on CUDA for sync operations
-    is_cuda = runtime.device.type == "cuda"
-
-    # Create separate CUDA stream for audio decoding (overlaps with generation)
-    # Decode runs async on decode_stream while next generation steps run on default stream
-    decode_stream = torch.cuda.Stream() if is_cuda else None
-
-    # Pending async decode state: (waveform_tensor, chunk_index, timestamp_ms)
-    # Waveform computation runs on decode_stream, we yield it at START of next chunk cycle
-    pending_decode = None
-
     # Streaming state
     chunk_size = streaming_config.chunk_size_frames
     min_chunk = streaming_config.min_chunk_frames
@@ -1076,14 +988,11 @@ def run_streaming_generation_loop(
     # eliminating boundary artifacts that occur when decoding chunks independently
     decoder_state = None
 
-    # Held chunk for overlap decode (provides forward context to eliminate end-of-chunk pops)
-    # When a new chunk arrives, we decode [held_chunk, new_chunk] but only output held_chunk's audio
-    # This gives held_chunk forward context from new_chunk's data
-    held_aligned_chunk = None
-
     # Track aligned frames we've already emitted (after undelay)
     # undelay output length = input_length - max_delay
-    last_aligned_emitted = 0
+    # Skip warmup frames - they were used to prime the pipeline and should be clipped
+    # warmup produces (start_step - max_delay) aligned frames that we don't emit
+    last_aligned_emitted = max(0, start_step - max_delay)
 
     # Calculate approximate frame rate for timing
     frame_rate = getattr(runtime, 'frame_rate', 75.0)
@@ -1319,14 +1228,11 @@ def run_streaming_generation_loop(
                     eos_cutoff = state.end_step + flush_tail
                     print(f"[TIMING] EOS detected at step {t}, eos_cutoff set to {eos_cutoff}", file=sys.stderr)
 
-                # FIX: Skip initial frames before first_word_frame (warmup/padding frames)
-                # This matches the crop behavior in non-streaming generate()
-                if not first_word_frame_applied and first_word_frame is not None:
-                    skip_to = max(first_word_frame, 0)
-                    if skip_to > last_aligned_emitted:
-                        print(f"[TIMING] Skipping initial frames: last_aligned_emitted {last_aligned_emitted} -> {skip_to}", file=sys.stderr)
-                        last_aligned_emitted = skip_to
-                    first_word_frame_applied = True
+                # NOTE: We no longer skip based on first_word_frame for streaming.
+                # With seed caching, the warmup frames are already accounted for in last_aligned_emitted
+                # (initialized to start_step - max_delay). Skipping based on first_word_frame caused
+                # the 450ms delay bug because it would wait for the first new_word token.
+                first_word_frame_applied = True
 
                 # Check if we have enough NEW aligned frames for a chunk
                 # aligned length = (t + 1) - max_delay, we've emitted last_aligned_emitted
@@ -1340,45 +1246,8 @@ def run_streaming_generation_loop(
                     should_emit_chunk = True
 
                 if should_emit_chunk:
-                    # ASYNC DECODE PIPELINE:
-                    # 1. First, yield any pending chunk from PREVIOUS async decode
-                    # 2. Start new decode on decode_stream (async)
-                    # 3. Store waveform for next iteration
-                    # This overlaps decode with generation of next steps
-
-                    # Step 1: Yield pending chunk from previous async decode
-                    if pending_decode is not None:
-                        prev_waveform, prev_idx, prev_ts = pending_decode
-                        try:
-                            # Wait for decode_stream to finish (if using async)
-                            if decode_stream is not None:
-                                decode_stream.synchronize()
-
-                            t0 = time.time()
-                            if prev_waveform.numel() > 0:
-                                # Encode to WAV (runs on CPU)
-                                wav_bytes = _encode_audio_chunk(prev_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
-                                chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
-
-                                yield AudioChunkEvent(
-                                    audio_data=wav_bytes,
-                                    chunk_index=prev_idx,
-                                    timestamp_ms=prev_ts,
-                                )
-                                total_audio_ms += chunk_duration_ms
-
-                            t1 = time.time()
-                            timing_stats['audio_decode'] += (t1 - t0)  # WAV encoding time
-                        except Exception as e:
-                            if logger:
-                                logger.event(f"Chunk encode error: {e}")
-                            yield ErrorEvent(error=f"Chunk encode error: {e}")
-                            return
-                        pending_decode = None
-
-                    # Step 2: Prepare new chunk for async decode
-                    # BUG FIX: undelay_frames assumes input starts from frame 0
-                    # We must undelay the FULL buffer, then slice the ALIGNED result
+                    # IMMEDIATE DECODE: No lookahead, no pending - decode and emit right away
+                    # This minimizes latency to first audio chunk
                     current_frame = t + 1
 
                     # Undelay the entire buffer up to current position
@@ -1395,49 +1264,27 @@ def run_streaming_generation_loop(
                         aligned_chunk = aligned_full[:, :, last_aligned_emitted:current_aligned_end]
 
                         if aligned_chunk.shape[-1] > 0:
-                            # OVERLAP DECODE: Hold one chunk and use next as lookahead
-                            # This gives each chunk forward context to eliminate end-of-chunk pops
-                            if held_aligned_chunk is None:
-                                # First chunk - hold it, wait for next chunk for lookahead
-                                held_aligned_chunk = aligned_chunk
-                                last_aligned_emitted = current_aligned_end
-                                continue  # Skip decode, wait for lookahead
-
                             try:
-                                # Step 3: Decode held chunk with current chunk as lookahead
-                                # held_aligned_chunk gets forward context from aligned_chunk
                                 t0 = time.time()
-                                if decode_stream is not None:
-                                    with torch.cuda.stream(decode_stream):
-                                        chunk_waveform, decoder_state = decode_audio_streaming(
-                                            runtime, held_aligned_chunk, decoder_state,
-                                            lookahead_tokens=aligned_chunk
-                                        )
-                                    # Store for next iteration - decode runs async
-                                    pending_decode = (chunk_waveform, chunk_index, total_audio_ms)
-                                    chunk_index += 1
-                                else:
-                                    # No CUDA - decode synchronously with lookahead
-                                    chunk_waveform, decoder_state = decode_audio_streaming(
-                                        runtime, held_aligned_chunk, decoder_state,
-                                        lookahead_tokens=aligned_chunk
+                                # Decode immediately without lookahead
+                                chunk_waveform, decoder_state = decode_audio_streaming(
+                                    runtime, aligned_chunk, decoder_state
+                                )
+
+                                if chunk_waveform.numel() > 0:
+                                    audio_bytes = _encode_opus_chunk(chunk_waveform, runtime.mimi.sample_rate)
+                                    chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
+
+                                    yield AudioChunkEvent(
+                                        audio_data=audio_bytes,
+                                        chunk_index=chunk_index,
+                                        timestamp_ms=total_audio_ms,
                                     )
-                                    if chunk_waveform.numel() > 0:
-                                        wav_bytes = _encode_audio_chunk(chunk_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
-                                        chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
-                                        yield AudioChunkEvent(
-                                            audio_data=wav_bytes,
-                                            chunk_index=chunk_index,
-                                            timestamp_ms=total_audio_ms,
-                                        )
-                                        total_audio_ms += chunk_duration_ms
-                                        chunk_index += 1
+                                    total_audio_ms += chunk_duration_ms
+                                    chunk_index += 1
 
                                 t1 = time.time()
-                                # Only count decode launch time here (actual decode is async)
-
-                                # Current chunk becomes the new held chunk
-                                held_aligned_chunk = aligned_chunk
+                                timing_stats['audio_decode'] += (t1 - t0)
 
                             except Exception as e:
                                 if logger:
@@ -1455,34 +1302,7 @@ def run_streaming_generation_loop(
                         progress=progress
                     )
 
-        # First, yield any pending async decode from the loop
-        if pending_decode is not None:
-            prev_waveform, prev_idx, prev_ts = pending_decode
-            try:
-                if decode_stream is not None:
-                    decode_stream.synchronize()
-
-                if prev_waveform.numel() > 0:
-                    wav_bytes = _encode_audio_chunk(prev_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
-                    chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
-
-                    yield AudioChunkEvent(
-                        audio_data=wav_bytes,
-                        chunk_index=prev_idx,
-                        timestamp_ms=prev_ts,
-                    )
-                    total_audio_ms += chunk_duration_ms
-
-            except Exception as e:
-                if logger:
-                    logger.event(f"Pending chunk encode error: {e}")
-                yield ErrorEvent(error=f"Pending chunk encode error: {e}")
-                return
-            pending_decode = None
-
-        # Handle any remaining frames (same fix: undelay full buffer, slice result)
-        # With overlap decode, we may have a held chunk that needs to be decoded
-        aligned_remaining = None
+        # Handle any remaining frames at end of generation
         if last_step >= 0:
             remaining_end = min(last_step + 2, audio_buf.shape[-1])
 
@@ -1499,71 +1319,29 @@ def run_streaming_generation_loop(
                 if current_aligned_end > last_aligned_emitted:
                     aligned_remaining = aligned_full[:, :, last_aligned_emitted:current_aligned_end]
 
-        # OVERLAP DECODE FINALIZATION:
-        # If we have a held chunk, decode it with remaining frames as lookahead (if any)
-        if held_aligned_chunk is not None:
-            try:
-                # Decode held chunk with remaining as lookahead
-                if aligned_remaining is not None and aligned_remaining.shape[-1] > 0:
-                    # Use remaining frames as lookahead for held chunk
-                    held_waveform, decoder_state = decode_audio_streaming(
-                        runtime, held_aligned_chunk, decoder_state,
-                        lookahead_tokens=aligned_remaining
-                    )
-                else:
-                    # No remaining frames - decode held chunk without lookahead
-                    # (This is the very end, so any pop at the end is acceptable)
-                    held_waveform, decoder_state = decode_audio_streaming(
-                        runtime, held_aligned_chunk, decoder_state
-                    )
+                    if aligned_remaining.shape[-1] > 0:
+                        try:
+                            final_waveform, decoder_state = decode_audio_streaming(
+                                runtime, aligned_remaining, decoder_state
+                            )
 
-                if held_waveform.numel() > 0:
-                    wav_bytes = _encode_audio_chunk(held_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
-                    chunk_duration_ms = (held_waveform.numel() / runtime.mimi.sample_rate) * 1000
+                            if final_waveform.numel() > 0:
+                                audio_bytes = _encode_opus_chunk(final_waveform, runtime.mimi.sample_rate)
+                                chunk_duration_ms = (final_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
-                    yield AudioChunkEvent(
-                        audio_data=wav_bytes,
-                        chunk_index=chunk_index,
-                        timestamp_ms=total_audio_ms,
-                    )
-                    total_audio_ms += chunk_duration_ms
-                    chunk_index += 1
+                                yield AudioChunkEvent(
+                                    audio_data=audio_bytes,
+                                    chunk_index=chunk_index,
+                                    timestamp_ms=total_audio_ms,
+                                )
+                                total_audio_ms += chunk_duration_ms
+                                chunk_index += 1
 
-                # Remaining frames become the new held chunk
-                held_aligned_chunk = aligned_remaining
-
-            except Exception as e:
-                if logger:
-                    logger.event(f"Held chunk decode error: {e}")
-                yield ErrorEvent(error=f"Held chunk decode error: {e}")
-                return
-
-        # Final chunk: decode any remaining held chunk without lookahead
-        if held_aligned_chunk is not None and held_aligned_chunk.shape[-1] > 0:
-            try:
-                # Final chunk - no lookahead available (end of audio)
-                final_waveform, decoder_state = decode_audio_streaming(
-                    runtime, held_aligned_chunk, decoder_state
-                )
-
-                if final_waveform.numel() > 0:
-                    wav_bytes = _encode_audio_chunk(final_waveform, runtime.mimi.sample_rate, streaming_config.audio_format)
-                    chunk_duration_ms = (final_waveform.numel() / runtime.mimi.sample_rate) * 1000
-
-                    yield AudioChunkEvent(
-                        audio_data=wav_bytes,
-                        chunk_index=chunk_index,
-                        timestamp_ms=total_audio_ms,
-                    )
-
-                    total_audio_ms += chunk_duration_ms
-                    chunk_index += 1
-
-            except Exception as e:
-                if logger:
-                    logger.event(f"Final chunk decode error: {e}")
-                yield ErrorEvent(error=f"Final chunk decode error: {e}")
-                return
+                        except Exception as e:
+                            if logger:
+                                logger.event(f"Final chunk decode error: {e}")
+                            yield ErrorEvent(error=f"Final chunk decode error: {e}")
+                            return
 
         # Save concatenated debug audio if enabled
         save_debug_concatenated()
