@@ -41,9 +41,28 @@ class SeamlessAudioStreamer {
             // Create AudioContext
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
-            // Load the worklet processor
-            const workletUrl = new URL('./audio-worklet-processor.js', import.meta.url).href;
-            await this.audioContext.audioWorklet.addModule(workletUrl);
+            // Load the worklet processor - try multiple paths
+            const workletPaths = [
+                '/js/audio-worklet-processor.js',
+                './js/audio-worklet-processor.js',
+                'js/audio-worklet-processor.js'
+            ];
+
+            let loaded = false;
+            for (const path of workletPaths) {
+                try {
+                    await this.audioContext.audioWorklet.addModule(path);
+                    console.log(`[SeamlessStreamer] Loaded worklet from: ${path}`);
+                    loaded = true;
+                    break;
+                } catch (e) {
+                    console.log(`[SeamlessStreamer] Failed to load from ${path}, trying next...`);
+                }
+            }
+
+            if (!loaded) {
+                throw new Error('Could not load audio worklet from any path');
+            }
 
             // Create the worklet node
             this.workletNode = new AudioWorkletNode(this.audioContext, 'streaming-audio-processor');
@@ -84,21 +103,8 @@ class SeamlessAudioStreamer {
 
         } catch (error) {
             console.error('[SeamlessStreamer] Failed to initialize:', error);
-
-            // Fallback: try loading worklet from different path
-            if (error.message.includes('module')) {
-                try {
-                    await this.audioContext.audioWorklet.addModule('/js/audio-worklet-processor.js');
-                    console.log('[SeamlessStreamer] Loaded worklet from fallback path');
-                } catch (fallbackError) {
-                    console.error('[SeamlessStreamer] Fallback also failed:', fallbackError);
-                    this.onError(fallbackError);
-                    throw fallbackError;
-                }
-            } else {
-                this.onError(error);
-                throw error;
-            }
+            this.onError(error);
+            throw error;
         }
     }
 

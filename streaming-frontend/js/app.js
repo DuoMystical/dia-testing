@@ -108,39 +108,47 @@ document.addEventListener('DOMContentLoaded', () => {
         window.wsClient = wsClient;
         window.audioStreamer = audioStreamer;
 
-        // Initialize seamless streamer (for testing)
-        window.seamlessStreamer = new SeamlessAudioStreamer({
-            volume: volumeSlider.value / 100,
-            onBufferLevel: (samples, seconds) => {
-                console.log(`[SeamlessStreamer] Buffer: ${samples} samples (${seconds.toFixed(2)}s)`);
-            },
-            onPlaybackStart: () => {
-                console.log('[SeamlessStreamer] Playback started');
-            },
-            onVisualizerData: (data) => {
-                if (window.useSeamlessStreamer) {
-                    drawVisualizer(data);
-                }
-            }
-        });
-
         // Flag to switch between streamers
         window.useSeamlessStreamer = false;
 
-        // Helper function to switch streamers
-        window.switchToSeamless = async () => {
-            window.useSeamlessStreamer = true;
-            await window.seamlessStreamer.init();
-            console.log('Switched to SeamlessAudioStreamer (AudioWorklet-based)');
-            console.log('Audio will now stream through continuous buffer - no pops!');
-        };
+        // Initialize seamless streamer (for testing) - only if available
+        if (typeof SeamlessAudioStreamer !== 'undefined') {
+            try {
+                window.seamlessStreamer = new SeamlessAudioStreamer({
+                    volume: volumeSlider.value / 100,
+                    onBufferLevel: (samples, seconds) => {
+                        console.log(`[SeamlessStreamer] Buffer: ${samples} samples (${seconds.toFixed(2)}s)`);
+                    },
+                    onPlaybackStart: () => {
+                        console.log('[SeamlessStreamer] Playback started');
+                    },
+                    onVisualizerData: (data) => {
+                        if (window.useSeamlessStreamer) {
+                            drawVisualizer(data);
+                        }
+                    }
+                });
 
-        window.switchToChunked = () => {
-            window.useSeamlessStreamer = false;
-            console.log('Switched back to chunked AudioStreamer');
-        };
+                // Helper function to switch streamers
+                window.switchToSeamless = async () => {
+                    window.useSeamlessStreamer = true;
+                    await window.seamlessStreamer.init();
+                    console.log('Switched to SeamlessAudioStreamer (AudioWorklet-based)');
+                    console.log('Audio will now stream through continuous buffer - no pops!');
+                };
 
-        console.log('[App] To test seamless streaming, run: switchToSeamless()');
+                window.switchToChunked = () => {
+                    window.useSeamlessStreamer = false;
+                    console.log('Switched back to chunked AudioStreamer');
+                };
+
+                console.log('[App] To test seamless streaming, run: switchToSeamless()');
+            } catch (e) {
+                console.warn('[App] SeamlessAudioStreamer failed to initialize:', e);
+            }
+        } else {
+            console.warn('[App] SeamlessAudioStreamer not available');
+        }
     }
 
     // Handle seed received from backend
