@@ -219,15 +219,7 @@ class AudioStreamer {
         try {
             console.log(`[AudioStreamer] Adding chunk ${chunkIndex}, data size: ${wavData.byteLength} bytes`);
 
-            // Validate WAV header
-            const view = new DataView(wavData);
-            const riff = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
-            if (riff !== 'RIFF') {
-                console.error(`[AudioStreamer] Invalid WAV header: expected RIFF, got ${riff}`);
-                return 0;
-            }
-
-            // Decode the WAV data
+            // Decode the audio data (supports WAV, OGG/Opus, etc.)
             const audioBuffer = await this.audioContext.decodeAudioData(wavData.slice(0));
 
             // Check for sample rate mismatch (potential resampling)
