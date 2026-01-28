@@ -8,7 +8,8 @@ mod tts_bridge;
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::State,
+    extract::{Query, State},
+    http::header,
     response::IntoResponse,
     routing::get,
     Router,
@@ -22,6 +23,25 @@ use tracing::{error, info, warn};
 
 use session::SessionManager;
 use tts_bridge::{TTSBridge, TTSEvent, TTSRequest};
+
+/// Query parameters for test WAV endpoint
+#[derive(serde::Deserialize)]
+struct TestWavParams {
+    /// Test type: silence, sine_zero_end, sine_nonzero_end, dc_offset
+    #[serde(default = "default_test_type")]
+    test_type: String,
+    /// Duration in milliseconds
+    #[serde(default = "default_duration")]
+    duration_ms: u32,
+}
+
+fn default_test_type() -> String {
+    "sine_nonzero_end".to_string()
+}
+
+fn default_duration() -> u32 {
+    160
+}
 
 /// Application state shared across all connections
 pub struct AppState {
@@ -82,6 +102,7 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .route("/ws/stream", get(ws_handler))
         .route("/health", get(health_handler))
+        .route("/test-chunk.wav", get(test_wav_handler))
         .nest_service("/", ServeDir::new(&frontend_path))
         .layer(cors)
         .with_state(state);
@@ -106,6 +127,75 @@ async fn health_handler() -> impl IntoResponse {
         "service": "dia2-streaming-server",
         "version": env!("CARGO_PKG_VERSION")
     }))
+}
+
+/// Test WAV file endpoint - returns a downloadable WAV file for testing
+///
+/// Usage: GET /test-chunk.wav?test_type=sine_nonzero_end&duration_ms=160
+///
+/// Test types:
+/// - silence: Pure silence (all zeros) - should NOT pop
+/// - sine_zero_end: 440Hz sine that ends at zero - should NOT pop
+/// - sine_nonzero_end: 440Hz sine that ends at non-zero - WILL pop if playback stops abruptly
+/// - dc_offset: Constant non-zero value
+async fn test_wav_handler(Query(params): Query<TestWavParams>) -> impl IntoResponse {
+    let sample_rate = 24000u32;
+    let num_samples = (sample_rate as f64 * params.duration_ms as f64 / 1000.0) as usize;
+
+    info!("Generating test WAV: type={}, duration={}ms, samples={}",
+          params.test_type, params.duration_ms, num_samples);
+
+    let samples: Vec<i16> = match params.test_type.as_str() {
+        "silence" => {
+            vec![0i16; num_samples]
+        }
+        "sine_zero_end" => {
+            // Sine wave that completes full cycles (ends at zero)
+            let freq = 440.0;
+            let cycles = (freq * params.duration_ms as f64 / 1000.0).round();
+            let adjusted_samples = (cycles * sample_rate as f64 / freq) as usize;
+
+            (0..adjusted_samples)
+                .map(|i| {
+                    let t = i as f64 / sample_rate as f64;
+                    let sample = (2.0 * std::f64::consts::PI * freq * t).sin();
+                    (sample * 16000.0) as i16
+                })
+                .collect()
+        }
+        "dc_offset" => {
+            vec![8000i16; num_samples]
+        }
+        "sine_nonzero_end" | _ => {
+            // Sine wave that does NOT complete full cycles (ends at non-zero)
+            let freq = 440.0;
+            (0..num_samples)
+                .map(|i| {
+                    let t = i as f64 / sample_rate as f64;
+                    let sample = (2.0 * std::f64::consts::PI * freq * t).sin();
+                    (sample * 16000.0) as i16
+                })
+                .collect()
+        }
+    };
+
+    // Log boundary values
+    let first_sample = samples.first().copied().unwrap_or(0);
+    let last_sample = samples.last().copied().unwrap_or(0);
+    info!("WAV generated: first_sample={} ({:.6}), last_sample={} ({:.6})",
+          first_sample, first_sample as f64 / 32767.0,
+          last_sample, last_sample as f64 / 32767.0);
+
+    let wav_data = generate_wav(&samples, sample_rate);
+
+    // Return as downloadable WAV file
+    (
+        [
+            (header::CONTENT_TYPE, "audio/wav"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"test-chunk.wav\""),
+        ],
+        wav_data,
+    )
 }
 
 /// WebSocket upgrade handler

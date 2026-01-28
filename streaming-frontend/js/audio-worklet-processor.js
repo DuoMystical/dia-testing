@@ -20,6 +20,13 @@ class StreamingAudioProcessor extends AudioWorkletProcessor {
         this.isPlaying = false;
         this.underrunCount = 0;
 
+        // Debugging
+        this.chunksReceived = 0;
+        this.totalSamplesReceived = 0;
+        this.totalSamplesPlayed = 0;
+        this.lastReportTime = 0;
+        this.processCallCount = 0;
+
         // Handle messages from main thread
         this.port.onmessage = (event) => {
             const { type, samples, command } = event.data;
@@ -48,6 +55,13 @@ class StreamingAudioProcessor extends AudioWorkletProcessor {
 
     _addSamples(newSamples) {
         const samplesToAdd = newSamples.length;
+        this.chunksReceived++;
+        this.totalSamplesReceived += samplesToAdd;
+
+        // Log chunk reception with boundary values
+        const firstSample = newSamples[0];
+        const lastSample = newSamples[samplesToAdd - 1];
+        console.log(`[AudioWorklet] Chunk ${this.chunksReceived}: ${samplesToAdd} samples, first=${firstSample?.toFixed(6)}, last=${lastSample?.toFixed(6)}, buffer before=${this.samplesAvailable}`);
 
         // Check for buffer overflow
         if (this.samplesAvailable + samplesToAdd > this.bufferSize) {
@@ -64,6 +78,8 @@ class StreamingAudioProcessor extends AudioWorkletProcessor {
             this.writePos = (this.writePos + 1) % this.bufferSize;
         }
         this.samplesAvailable += samplesToAdd;
+
+        console.log(`[AudioWorklet] Buffer after: ${this.samplesAvailable} samples (${(this.samplesAvailable / sampleRate).toFixed(2)}s)`);
 
         // Notify main thread of buffer level
         this.port.postMessage({
@@ -88,6 +104,12 @@ class StreamingAudioProcessor extends AudioWorkletProcessor {
         if (!channel) return true;
 
         const framesToProcess = channel.length; // Usually 128 samples
+        this.processCallCount++;
+
+        // Periodic status logging (every ~1 second = 375 calls at 128 samples/call at 48kHz)
+        if (this.processCallCount % 375 === 0) {
+            console.log(`[AudioWorklet] Status: playing=${this.isPlaying}, buffer=${this.samplesAvailable} (${(this.samplesAvailable / sampleRate).toFixed(2)}s), played=${this.totalSamplesPlayed}, underruns=${this.underrunCount}`);
+        }
 
         if (!this.isPlaying) {
             // Output silence when not playing
@@ -102,8 +124,10 @@ class StreamingAudioProcessor extends AudioWorkletProcessor {
                 this.readPos = (this.readPos + 1) % this.bufferSize;
             }
             this.samplesAvailable -= framesToProcess;
+            this.totalSamplesPlayed += framesToProcess;
         } else if (this.samplesAvailable > 0) {
             // Partial buffer - play what we have, then silence
+            console.warn(`[AudioWorklet] PARTIAL BUFFER: only ${this.samplesAvailable} samples available, need ${framesToProcess}`);
             let i = 0;
             while (this.samplesAvailable > 0 && i < framesToProcess) {
                 channel[i] = this.buffer[this.readPos];
@@ -111,9 +135,12 @@ class StreamingAudioProcessor extends AudioWorkletProcessor {
                 this.samplesAvailable--;
                 i++;
             }
+            this.totalSamplesPlayed += i;
+
             // Fill rest with silence (fade to zero to avoid pop)
             const lastSample = i > 0 ? channel[i - 1] : 0;
             const fadeLength = Math.min(framesToProcess - i, 64);
+            console.log(`[AudioWorklet] Fading from ${lastSample.toFixed(6)} over ${fadeLength} samples`);
             for (let j = 0; j < fadeLength && i < framesToProcess; j++, i++) {
                 channel[i] = lastSample * (1 - j / fadeLength);
             }
@@ -123,6 +150,9 @@ class StreamingAudioProcessor extends AudioWorkletProcessor {
             this.underrunCount++;
         } else {
             // Buffer underrun - output silence
+            if (this.underrunCount % 100 === 0) {
+                console.warn(`[AudioWorklet] UNDERRUN #${this.underrunCount}: buffer empty`);
+            }
             channel.fill(0);
             this.underrunCount++;
         }
