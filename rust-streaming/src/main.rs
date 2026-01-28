@@ -135,9 +135,10 @@ async fn health_handler() -> impl IntoResponse {
 ///
 /// Test types:
 /// - silence: Pure silence (all zeros) - should NOT pop
-/// - sine_zero_end: 440Hz sine that ends at zero - should NOT pop
-/// - sine_nonzero_end: 440Hz sine that ends at non-zero - WILL pop if playback stops abruptly
-/// - dc_offset: Constant non-zero value
+/// - sine_zero_end: 440Hz sine that ends EXACTLY at zero - should NOT pop
+/// - sine_fade_end: 440Hz sine with 5ms fade-out at end - should NOT pop
+/// - sine_nonzero_end: 440Hz sine that ends at non-zero - WILL pop
+/// - dc_offset: Constant non-zero value - WILL pop
 async fn test_wav_handler(Query(params): Query<TestWavParams>) -> impl IntoResponse {
     let sample_rate = 24000u32;
     let num_samples = (sample_rate as f64 * params.duration_ms as f64 / 1000.0) as usize;
@@ -150,15 +151,40 @@ async fn test_wav_handler(Query(params): Query<TestWavParams>) -> impl IntoRespo
             vec![0i16; num_samples]
         }
         "sine_zero_end" => {
-            // Sine wave that completes full cycles (ends at zero)
-            let freq = 440.0;
-            let cycles = (freq * params.duration_ms as f64 / 1000.0).round();
-            let adjusted_samples = (cycles * sample_rate as f64 / freq) as usize;
+            // Sine wave that ends EXACTLY at zero
+            // For sample indices 0 to N-1, we want phase(N-1) = 2*pi*k for some integer k
+            // phase(i) = 2*pi*k*i/(N-1)
+            // This means sample[N-1] = sin(2*pi*k) = 0
+            let base_freq = 440.0;
+            let desired_cycles = (base_freq * params.duration_ms as f64 / 1000.0).round() as usize;
 
-            (0..adjusted_samples)
+            info!("sine_zero_end: {} complete cycles over {} samples", desired_cycles, num_samples);
+
+            (0..num_samples)
+                .map(|i| {
+                    // Phase goes from 0 to 2*pi*desired_cycles as i goes from 0 to num_samples-1
+                    let phase = 2.0 * std::f64::consts::PI * desired_cycles as f64 * i as f64 / (num_samples - 1) as f64;
+                    let sample = phase.sin();
+                    (sample * 16000.0) as i16
+                })
+                .collect()
+        }
+        "sine_fade_end" => {
+            // Sine wave with a fade-out at the end (guaranteed no pop)
+            let freq = 440.0;
+            let fade_samples = (sample_rate as f64 * 0.005) as usize; // 5ms fade
+
+            (0..num_samples)
                 .map(|i| {
                     let t = i as f64 / sample_rate as f64;
-                    let sample = (2.0 * std::f64::consts::PI * freq * t).sin();
+                    let mut sample = (2.0 * std::f64::consts::PI * freq * t).sin();
+
+                    // Apply fade at the end
+                    let samples_from_end = num_samples - i;
+                    if samples_from_end < fade_samples {
+                        sample *= samples_from_end as f64 / fade_samples as f64;
+                    }
+
                     (sample * 16000.0) as i16
                 })
                 .collect()
