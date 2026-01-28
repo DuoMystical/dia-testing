@@ -304,6 +304,15 @@ async fn handle_text_message(
             });
             sender.send(Message::Text(pong.to_string())).await?;
         }
+        Some("test_audio") => {
+            // Test mode: send pre-generated WAV chunks to isolate browser vs generation issues
+            let test_type = msg.get("test_type").and_then(|t| t.as_str()).unwrap_or("sine_zero_end");
+            let num_chunks = msg.get("num_chunks").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
+
+            info!("Running audio test: type={}, chunks={}", test_type, num_chunks);
+
+            send_test_audio_chunks(sender, test_type, num_chunks).await?;
+        }
         _ => {
             let error = serde_json::json!({
                 "type": "error",
@@ -507,4 +516,164 @@ fn chrono_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Generate a WAV file from PCM samples
+fn generate_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+    let num_samples = samples.len();
+    let data_size = (num_samples * 2) as u32;
+    let file_size = 36 + data_size;
+
+    let mut wav = Vec::with_capacity(44 + num_samples * 2);
+
+    // RIFF header
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&file_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+
+    // fmt chunk
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes());  // audio format (PCM)
+    wav.extend_from_slice(&1u16.to_le_bytes());  // num channels
+    wav.extend_from_slice(&sample_rate.to_le_bytes()); // sample rate
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes());  // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+
+    // data chunk
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+
+    wav
+}
+
+/// Generate test audio chunks for debugging
+///
+/// Test types:
+/// - "silence": Pure silence (all zeros) - should NOT pop
+/// - "sine_zero_end": 440Hz sine wave that ends at zero crossing - should NOT pop
+/// - "sine_nonzero_end": 440Hz sine wave that ends at non-zero - SHOULD pop
+/// - "dc_offset": Constant DC offset (non-zero throughout) - SHOULD pop
+async fn send_test_audio_chunks(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    test_type: &str,
+    num_chunks: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sample_rate = 24000u32;
+    let chunk_duration_ms = 160.0;
+    let samples_per_chunk = (sample_rate as f64 * chunk_duration_ms / 1000.0) as usize;
+
+    info!("Generating {} test chunks of type '{}' ({} samples each at {}Hz)",
+          num_chunks, test_type, samples_per_chunk, sample_rate);
+
+    // Notify start
+    let start_msg = serde_json::json!({
+        "type": "status",
+        "message": format!("Starting audio test: {}", test_type),
+        "progress": 0.0
+    });
+    sender.send(Message::Text(start_msg.to_string())).await?;
+
+    let mut total_samples_generated = 0usize;
+
+    for chunk_idx in 0..num_chunks {
+        let samples: Vec<i16> = match test_type {
+            "silence" => {
+                // Pure silence - all zeros
+                vec![0i16; samples_per_chunk]
+            }
+            "sine_zero_end" => {
+                // Sine wave that completes full cycles (ends at zero)
+                let freq = 440.0;
+                let cycles_per_chunk = (freq * chunk_duration_ms / 1000.0).round();
+                let adjusted_samples = (cycles_per_chunk * sample_rate as f64 / freq) as usize;
+
+                (0..adjusted_samples)
+                    .map(|i| {
+                        let t = i as f64 / sample_rate as f64;
+                        let sample = (2.0 * std::f64::consts::PI * freq * t).sin();
+                        (sample * 16000.0) as i16
+                    })
+                    .collect()
+            }
+            "sine_nonzero_end" => {
+                // Sine wave that does NOT complete full cycles (ends at non-zero)
+                let freq = 440.0;
+                // Use exact samples_per_chunk which won't align with sine period
+                (0..samples_per_chunk)
+                    .map(|i| {
+                        let global_sample = total_samples_generated + i;
+                        let t = global_sample as f64 / sample_rate as f64;
+                        let sample = (2.0 * std::f64::consts::PI * freq * t).sin();
+                        (sample * 16000.0) as i16
+                    })
+                    .collect()
+            }
+            "dc_offset" => {
+                // Constant non-zero value (DC offset)
+                vec![8000i16; samples_per_chunk]
+            }
+            "ramp_up" => {
+                // Ramp from 0 to max - will pop at end
+                (0..samples_per_chunk)
+                    .map(|i| ((i as f64 / samples_per_chunk as f64) * 16000.0) as i16)
+                    .collect()
+            }
+            "ramp_down" => {
+                // Ramp from max to 0 - should NOT pop at end
+                (0..samples_per_chunk)
+                    .map(|i| ((1.0 - i as f64 / samples_per_chunk as f64) * 16000.0) as i16)
+                    .collect()
+            }
+            _ => {
+                // Default to silence
+                vec![0i16; samples_per_chunk]
+            }
+        };
+
+        total_samples_generated += samples.len();
+
+        // Log the last few samples for debugging
+        let last_5: Vec<i16> = samples.iter().rev().take(5).rev().cloned().collect();
+        let last_sample_float = *samples.last().unwrap_or(&0) as f64 / 32767.0;
+        info!("Chunk {}: {} samples, last 5 PCM: {:?}, last_float: {:.6}",
+              chunk_idx, samples.len(), last_5, last_sample_float);
+
+        let wav_data = generate_wav(&samples, sample_rate);
+
+        let audio_msg = serde_json::json!({
+            "type": "audio",
+            "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &wav_data),
+            "chunk_index": chunk_idx,
+            "timestamp_ms": chunk_idx as f64 * chunk_duration_ms,
+            "test_info": {
+                "test_type": test_type,
+                "samples": samples.len(),
+                "last_sample_pcm": samples.last().unwrap_or(&0),
+                "last_sample_float": last_sample_float
+            }
+        });
+
+        sender.send(Message::Text(audio_msg.to_string())).await?;
+
+        // Small delay between chunks to simulate streaming
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Send complete
+    let complete_msg = serde_json::json!({
+        "type": "complete",
+        "total_chunks": num_chunks,
+        "total_duration_ms": num_chunks as f64 * chunk_duration_ms,
+        "test_type": test_type
+    });
+    sender.send(Message::Text(complete_msg.to_string())).await?;
+
+    info!("Test audio complete: {} chunks sent", num_chunks);
+
+    Ok(())
 }
