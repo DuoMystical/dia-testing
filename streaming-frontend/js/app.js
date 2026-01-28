@@ -103,6 +103,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         wsClient.connect();
+
+        // Expose for debugging from console
+        window.wsClient = wsClient;
+        window.audioStreamer = audioStreamer;
     }
 
     // Handle seed received from backend
