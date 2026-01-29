@@ -90,8 +90,11 @@ echo "Starting Web Terminal on port 7681 (user: $TERMINAL_USER)"
 # Start ttyd in background
 ttyd -p 7681 -W -c "$TERMINAL_USER:$TERMINAL_PASS" bash &
 
-# Start frontend in background
-cd /app/frontend && node build/index.js &
+# Start frontend in background (override PORT to 3000, ignore platform's PORT)
+cd /app/frontend && PORT=3000 HOST=0.0.0.0 node build/index.js &
+
+# Small delay to ensure frontend binds first
+sleep 1
 
 # Start uvicorn in foreground
 cd /app && exec /app/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
@@ -105,8 +108,5 @@ EXPOSE 8000 3000 7681
 # Environment variables for terminal auth (override in Koyeb)
 ENV TERMINAL_USER=admin
 ENV TERMINAL_PASS=dia2dev
-
-# Frontend port (SvelteKit adapter-node uses PORT env var)
-ENV PORT=3000
 
 CMD ["/app/start.sh"]
