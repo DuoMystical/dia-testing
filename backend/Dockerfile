@@ -36,6 +36,17 @@ ENV PATH="/root/.local/bin:$PATH"
 # Set working directory
 WORKDIR /app
 
+# Copy and build frontend first (for better caching)
+COPY frontend/package.json frontend/package-lock.json /app/frontend/
+WORKDIR /app/frontend
+RUN npm ci
+
+COPY frontend/ /app/frontend/
+RUN npm run build
+
+# Back to app root for backend
+WORKDIR /app
+
 # Copy project files (paths relative to repo root since Koyeb uses repo root as build context)
 COPY backend/pyproject.toml backend/uv.lock ./
 COPY backend/main.py backend/utils.py ./
@@ -73,22 +84,29 @@ TERMINAL_USER=${TERMINAL_USER:-admin}
 TERMINAL_PASS=${TERMINAL_PASS:-dia2dev}
 
 echo "Starting Dia2 API on port 8000..."
+echo "Starting Frontend on port 3000..."
 echo "Starting Web Terminal on port 7681 (user: $TERMINAL_USER)"
 
 # Start ttyd in background
 ttyd -p 7681 -W -c "$TERMINAL_USER:$TERMINAL_PASS" bash &
 
+# Start frontend in background
+cd /app/frontend && node build/index.js &
+
 # Start uvicorn in foreground
-exec /app/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+cd /app && exec /app/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 STARTUP
 
 RUN chmod +x /app/start.sh
 
-# Expose ports: 8000 for API, 7681 for terminal
-EXPOSE 8000 7681
+# Expose ports: 8000 for API, 3000 for frontend, 7681 for terminal
+EXPOSE 8000 3000 7681
 
 # Environment variables for terminal auth (override in Koyeb)
 ENV TERMINAL_USER=admin
 ENV TERMINAL_PASS=dia2dev
+
+# Frontend port (SvelteKit adapter-node uses PORT env var)
+ENV PORT=3000
 
 CMD ["/app/start.sh"]
