@@ -289,16 +289,29 @@ def process_request(request: dict):
         if use_cache:
             cached_state = _cache_get(seed)
 
+        # Parse user text into entries (needed for both cache hit and miss)
+        text_normalized = normalize_script(text)
+        user_entries = parse_script([text_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+
         if cached_state is not None:
             # FAST PATH: Restore from cache
             print(f"[CACHE] HIT - Restoring state for seed {seed}", file=sys.stderr)
             emit_status("Using cached voice...", 0.1)
-            gen_state, rng_state, cuda_rng_state, warmup_steps = cached_state
+            gen_state, state, rng_state, cuda_rng_state, warmup_steps = cached_state
+
+            # Clone both states so cache remains pristine
             gen_state = gen_state.clone()
+            state = state.clone()
+
             # Restore RNG state to match post-warmup state
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state)
+
+            # Append user entries to the state (warmup entries already consumed)
+            state.entries.extend(user_entries)
+            state.end_step = None  # Reset so generation continues
+
             start_step = warmup_steps
         else:
             # SLOW PATH: Build initial state and run warmup
@@ -315,10 +328,10 @@ def process_request(request: dict):
                 )
             prefix_plan = build_prefix_plan(runtime, prefix_config)
 
-            # Build initial state
+            # Build initial generation state
             gen_state = build_initial_state(runtime, prefix=prefix_plan)
 
-            # Create warmup state with a phonetic pangram phrase
+            # Create state with warmup phrase entries
             # This exercises many phonemes while conditioning the voice.
             # S2 interjection creates a natural sentence boundary before user text.
             WARMUP_PHRASE = "[S1] The quick brown fox jumps over the lazy dog near the old bridge. [S2] Nice."
@@ -326,47 +339,39 @@ def process_request(request: dict):
 
             # Set initial_padding to 2 (original Dia default) for proper padding structure:
             # - 2 frames forced padding
-            # - 17 frames warmup phrase processing
-            # - = 19 total to cover max_delay (18)
+            # - then warmup phrase processing
+            # - total steps >= max_delay+1 to cover codec delay
             runtime.machine.initial_padding = 2
-            warmup_state = runtime.machine.new_state(warmup_entries)
+            state = runtime.machine.new_state(warmup_entries)
             runtime.machine.initial_padding = 0  # Reset to avoid side effects
 
             # Get max_delay for minimum warmup steps (codec alignment requirement)
             max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
 
             # Run warmup until entries are consumed, minimum max_delay+1 steps
-            # This ensures: 2 padding + 17 warmup = 19 steps >= max_delay+1
             gen_state, warmup_steps = run_seed_warmup(
                 runtime,
                 gen_state,
                 gen_config,
                 min_steps=max_delay + 1,  # Must be > max_delay for codec
-                warmup_state=warmup_state,
+                warmup_state=state,  # Use the SAME state that will continue for user text
             )
             start_step = warmup_steps
 
-            # Cache the warmed-up state with warmup_steps (only if not voice cloning)
+            # Cache BOTH gen_state AND state (with warmup entries consumed)
             if use_cache:
-                # Save RNG state along with generation state and warmup_steps
                 rng_state = torch.get_rng_state()
                 cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-                _cache_put(seed, (gen_state.clone(), rng_state, cuda_rng_state, warmup_steps))
+                _cache_put(seed, (gen_state.clone(), state.clone(), rng_state, cuda_rng_state, warmup_steps))
+
+            # Append user entries to the same state (warmup entries now consumed)
+            state.entries.extend(user_entries)
+            state.end_step = None  # Reset so generation continues
 
         warmup_time = time_module.time() - generation_start
         print(f"[TIMING] Warmup/restore took {warmup_time*1000:.0f}ms", file=sys.stderr)
 
         emit_status("Generating audio...", 0.2)
-
-        # Parse script and create state machine
-        text_normalized = normalize_script(text)
-        entries = parse_script([text_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate)
-
-        # Create state - don't modify runtime.machine.initial_padding globally
-        # Instead, create state and reset its padding since warmup already consumed it
-        state = runtime.machine.new_state(entries)
-        state.forced_padding = 0
-        state.padding_budget = 0
 
         # Run streaming generation
         logger = RuntimeLogger(enabled=False)

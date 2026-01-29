@@ -47,6 +47,19 @@ class State:
                     return entry.tokens
         return []
 
+    def clone(self) -> "State":
+        """Create a deep copy of this state."""
+        return State(
+            entries=deque(self.entries),
+            padding_budget=self.padding_budget,
+            forced_padding=self.forced_padding,
+            pending_tokens=deque(self.pending_tokens),
+            lookahead_tokens=deque(self.lookahead_tokens),
+            end_step=self.end_step,
+            consumption_times=list(self.consumption_times),
+            transcript=list(self.transcript),
+        )
+
 
 class StateMachine:
     def __init__(
