@@ -28,6 +28,161 @@ from .logger import RuntimeLogger
 _GRAPH_CUBLAS_READY = False
 
 
+class WebMOpusStreamer:
+    """Streaming WebM/Opus encoder for continuous audio streaming.
+
+    Creates a single continuous WebM stream with Opus audio that can be
+    played via MediaSource Extensions in the browser.
+    """
+
+    def __init__(self, sample_rate: int = 24000, channels: int = 1):
+        """Initialize the WebM streamer.
+
+        Args:
+            sample_rate: Audio sample rate (default 24000 for Dia)
+            channels: Number of audio channels (default 1 for mono)
+        """
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self._container = None
+        self._stream = None
+        self._output_buffer = None
+        self._pts = 0  # Presentation timestamp
+        self._initialized = False
+
+    def _ensure_initialized(self):
+        """Initialize the encoder on first use."""
+        if self._initialized:
+            return
+
+        import av
+        import io
+
+        # Create in-memory output buffer
+        self._output_buffer = io.BytesIO()
+
+        # Create WebM container
+        self._container = av.open(self._output_buffer, mode='w', format='webm')
+
+        # Add Opus audio stream
+        self._stream = self._container.add_stream('libopus', rate=self.sample_rate)
+        self._stream.channels = self.channels
+        self._stream.layout = 'mono' if self.channels == 1 else 'stereo'
+
+        self._initialized = True
+        self._pts = 0
+
+    def get_init_segment(self) -> bytes:
+        """Get the WebM initialization segment (header).
+
+        Must be called before encoding any audio. Returns the WebM header
+        that should be sent to the client first.
+        """
+        self._ensure_initialized()
+
+        # Write header by flushing container state
+        # The init segment is written when the first packet is muxed
+        # For now, return empty - we'll include header with first audio
+        return b""
+
+    def encode_audio(self, audio_np) -> bytes:
+        """Encode audio samples and return WebM segment data.
+
+        Args:
+            audio_np: Numpy array of float samples in [-1.0, 1.0]
+
+        Returns:
+            WebM segment bytes to append to the stream
+        """
+        import numpy as np
+        import av
+
+        self._ensure_initialized()
+
+        # Remember position before encoding
+        start_pos = self._output_buffer.tell()
+
+        # Clip and convert to format expected by encoder
+        audio_np = np.clip(audio_np, -1.0, 1.0).astype(np.float32)
+
+        # Create audio frame
+        frame = av.AudioFrame.from_ndarray(
+            audio_np.reshape(1, -1),  # Shape: (channels, samples)
+            format='flt',
+            layout='mono' if self.channels == 1 else 'stereo'
+        )
+        frame.sample_rate = self.sample_rate
+        frame.pts = self._pts
+        self._pts += len(audio_np)
+
+        # Encode and mux
+        for packet in self._stream.encode(frame):
+            self._container.mux(packet)
+
+        # Get bytes written since start_pos
+        self._output_buffer.seek(start_pos)
+        new_bytes = self._output_buffer.read()
+
+        return new_bytes
+
+    def finalize(self) -> bytes:
+        """Finalize the stream and return any remaining data."""
+        if not self._initialized:
+            return b""
+
+        start_pos = self._output_buffer.tell()
+
+        # Flush encoder
+        for packet in self._stream.encode(None):
+            self._container.mux(packet)
+
+        # Close container
+        self._container.close()
+
+        # Get remaining bytes
+        self._output_buffer.seek(start_pos)
+        final_bytes = self._output_buffer.read()
+
+        self._initialized = False
+        self._container = None
+        self._stream = None
+        self._output_buffer = None
+
+        return final_bytes
+
+    def reset(self):
+        """Reset the streamer for a new stream."""
+        if self._container is not None:
+            try:
+                self._container.close()
+            except:
+                pass
+        self._initialized = False
+        self._container = None
+        self._stream = None
+        self._output_buffer = None
+        self._pts = 0
+
+
+# Global streamer instance (reset per generation session)
+_webm_streamer: Optional[WebMOpusStreamer] = None
+
+
+def get_webm_streamer(sample_rate: int = 24000) -> WebMOpusStreamer:
+    """Get or create the global WebM streamer."""
+    global _webm_streamer
+    if _webm_streamer is None or _webm_streamer.sample_rate != sample_rate:
+        _webm_streamer = WebMOpusStreamer(sample_rate=sample_rate)
+    return _webm_streamer
+
+
+def reset_webm_streamer():
+    """Reset the WebM streamer for a new generation session."""
+    global _webm_streamer
+    if _webm_streamer is not None:
+        _webm_streamer.reset()
+
+
 def _ensure_graph_cublas_ready(device: torch.device) -> None:
     global _GRAPH_CUBLAS_READY
     if _GRAPH_CUBLAS_READY or device.type != "cuda":
@@ -676,18 +831,16 @@ def _analyze_audio_chunk(audio_np, chunk_index: int, sample_rate: int):
             _debug_all_samples.append(audio_np.copy())
 
 
-def _encode_opus_chunk(
+def _encode_webm_chunk(
     waveform: torch.Tensor,
     sample_rate: int,
 ) -> bytes:
-    """Encode a waveform tensor to Opus/OGG bytes.
+    """Encode a waveform tensor to WebM/Opus segment bytes.
 
-    Opus is designed for streaming and handles packet boundaries gracefully,
-    eliminating the clicks/pops that occur with WAV when samples don't end at zero.
+    Uses a persistent WebM streamer to maintain encoder state across chunks,
+    creating a single continuous stream that eliminates clicks/pops at chunk boundaries.
     """
-    import io
     import numpy as np
-    import soundfile as sf
     import sys
     global _chunk_counter
 
@@ -705,42 +858,44 @@ def _encode_opus_chunk(
     if audio_np.ndim > 1:
         audio_np = audio_np.flatten()
 
-    # Encode to Opus in OGG container
-    buffer = io.BytesIO()
-    sf.write(buffer, audio_np, sample_rate, format='OGG', subtype='OPUS')
-    opus_bytes = buffer.getvalue()
+    # Use persistent WebM streamer for seamless streaming
+    streamer = get_webm_streamer(sample_rate)
+    webm_bytes = streamer.encode_audio(audio_np)
 
     if _chunk_diagnostics_enabled:
-        print(f"  [OPUS] samples={len(audio_np)}, sample_rate={sample_rate}Hz, size={len(opus_bytes)} bytes", file=sys.stderr)
-        print(f"  [OPUS] first 5 samples: {audio_np[:5].tolist()}", file=sys.stderr)
-        print(f"  [OPUS] last 5 samples: {audio_np[-5:].tolist()}", file=sys.stderr)
+        print(f"  [WEBM] samples={len(audio_np)}, sample_rate={sample_rate}Hz, size={len(webm_bytes)} bytes", file=sys.stderr)
+        print(f"  [WEBM] first 5 samples: {audio_np[:5].tolist()}", file=sys.stderr)
+        print(f"  [WEBM] last 5 samples: {audio_np[-5:].tolist()}", file=sys.stderr)
 
-    return opus_bytes
+    return webm_bytes
 
 
 def run_seed_warmup(
     runtime: RuntimeContext,
     generation: GenerationState,
     config: GenerationConfig,
-    num_steps: int,
+    min_steps: int,
     warmup_state: Optional[State] = None,
-) -> GenerationState:
+    max_steps: int = 500,
+) -> Tuple[GenerationState, int]:
     """
     Run warmup steps to establish seed-dependent state.
 
-    This runs num_steps of generation with a fixed warmup phrase, building up
-    the KV cache and audio buffer. The warmup phrase ensures consistent behavior
-    across different user texts when using the same seed.
+    This runs generation with a warmup phrase until all entries are consumed,
+    building up the KV cache and audio buffer. The warmup phrase ensures
+    consistent behavior across different user texts when using the same seed.
 
     Args:
         runtime: Runtime context
         generation: Initial generation state
         config: Generation configuration
-        num_steps: Number of warmup steps (should be >= max_delay)
+        min_steps: Minimum warmup steps (should be >= max_delay for codec)
         warmup_state: State with warmup phrase entries (created by caller)
+        max_steps: Maximum warmup steps (safety limit)
 
     Returns:
-        The generation state after warmup, ready for caching
+        Tuple of (generation_state, warmup_steps) where warmup_steps is the
+        number of steps actually run.
     """
     import sys
 
@@ -770,10 +925,11 @@ def run_seed_warmup(
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
 
-    print(f"[WARMUP] Running {num_steps} warmup steps for seed caching", file=sys.stderr)
+    print(f"[WARMUP] Running warmup (min_steps={min_steps}, max_steps={max_steps})", file=sys.stderr)
 
+    warmup_steps = 0
     with torch.inference_mode():
-        for t in range(num_steps):
+        for t in range(max_steps):
             generation.reset_dep_cache()
             positions.fill_(t)
             _fill_audio_channels(step_tokens, audio_buf, delay_tensor, t, token_ids.audio_bos)
@@ -878,8 +1034,16 @@ def run_seed_warmup(
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
 
-    print(f"[WARMUP] Completed {num_steps} warmup steps", file=sys.stderr)
-    return generation
+            warmup_steps = t + 1
+
+            # Check if warmup is complete: entries consumed AND minimum steps reached
+            if warmup_state is not None and warmup_state.end_step is not None:
+                if warmup_steps >= min_steps:
+                    print(f"[WARMUP] Entries consumed at step {warmup_state.end_step}, stopping at {warmup_steps} steps", file=sys.stderr)
+                    break
+
+    print(f"[WARMUP] Completed {warmup_steps} warmup steps", file=sys.stderr)
+    return generation, warmup_steps
 
 
 def run_streaming_generation_loop(
@@ -1005,8 +1169,9 @@ def run_streaming_generation_loop(
 
     print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}, start_step={start_step}, last_aligned_emitted={last_aligned_emitted}", file=sys.stderr)
 
-    # Reset chunk diagnostics for this generation session
+    # Reset chunk diagnostics and WebM streamer for this generation session
     reset_chunk_diagnostics()
+    reset_webm_streamer()
 
     # Check for debug mode via environment variable
     import os
@@ -1254,7 +1419,7 @@ def run_streaming_generation_loop(
 
                             t0 = time.time()
                             if prev_waveform.numel() > 0:
-                                audio_bytes = _encode_opus_chunk(prev_waveform, runtime.mimi.sample_rate)
+                                audio_bytes = _encode_webm_chunk(prev_waveform, runtime.mimi.sample_rate)
                                 chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                                 yield AudioChunkEvent(
@@ -1303,7 +1468,7 @@ def run_streaming_generation_loop(
                                         runtime, aligned_chunk, decoder_state
                                     )
                                     if chunk_waveform.numel() > 0:
-                                        audio_bytes = _encode_opus_chunk(chunk_waveform, runtime.mimi.sample_rate)
+                                        audio_bytes = _encode_webm_chunk(chunk_waveform, runtime.mimi.sample_rate)
                                         chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
                                         yield AudioChunkEvent(
                                             audio_data=audio_bytes,
@@ -1339,7 +1504,7 @@ def run_streaming_generation_loop(
                     decode_stream.synchronize()
 
                 if prev_waveform.numel() > 0:
-                    audio_bytes = _encode_opus_chunk(prev_waveform, runtime.mimi.sample_rate)
+                    audio_bytes = _encode_webm_chunk(prev_waveform, runtime.mimi.sample_rate)
                     chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                     yield AudioChunkEvent(
@@ -1380,7 +1545,7 @@ def run_streaming_generation_loop(
                             )
 
                             if final_waveform.numel() > 0:
-                                audio_bytes = _encode_opus_chunk(final_waveform, runtime.mimi.sample_rate)
+                                audio_bytes = _encode_webm_chunk(final_waveform, runtime.mimi.sample_rate)
                                 chunk_duration_ms = (final_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                                 yield AudioChunkEvent(
@@ -1480,4 +1645,7 @@ __all__ = [
     "enable_debug_chunk_save",
     "disable_debug_chunk_save",
     "save_debug_concatenated",
+    "WebMOpusStreamer",
+    "get_webm_streamer",
+    "reset_webm_streamer",
 ]
