@@ -323,7 +323,12 @@ def process_request(request: dict):
             # S2 interjection creates a natural sentence boundary before user text.
             WARMUP_PHRASE = "[S1] The quick brown fox jumps over the lazy dog near the old bridge. [S2] Nice."
             warmup_entries = parse_script([WARMUP_PHRASE], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+
+            # Set initial_padding on machine so warmup state gets proper padding
+            # Original Dia uses 19 frames: ~2 forced padding + 17 warmup
+            runtime.machine.initial_padding = gen_config.initial_padding
             warmup_state = runtime.machine.new_state(warmup_entries)
+            runtime.machine.initial_padding = 0  # Reset to avoid side effects
 
             # Get max_delay for minimum warmup steps (codec alignment requirement)
             max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0

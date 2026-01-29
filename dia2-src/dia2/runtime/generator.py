@@ -64,9 +64,8 @@ class WebMOpusStreamer:
         # Create WebM container
         self._container = av.open(self._output_buffer, mode='w', format='webm')
 
-        # Add Opus audio stream
+        # Add Opus audio stream - layout determines channels (channels attr is read-only)
         self._stream = self._container.add_stream('libopus', rate=self.sample_rate)
-        self._stream.channels = self.channels
         self._stream.layout = 'mono' if self.channels == 1 else 'stereo'
 
         self._initialized = True
