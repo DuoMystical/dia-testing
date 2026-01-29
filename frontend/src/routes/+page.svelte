@@ -36,8 +36,8 @@
 	let elapsedTime = $state(0);
 	let timerInterval: ReturnType<typeof setInterval> | null = null;
 
-	// Backend URL - Dia2 backend with dual model support
-	const BACKEND_URL = 'https://occasional-angel-puddle-6a36e6b8.koyeb.app';
+	// Backend URL - empty for same-origin requests (served by FastAPI)
+	const BACKEND_URL = '';
 
 	function startTimer() {
 		elapsedTime = 0;
@@ -170,7 +170,8 @@
 
 	async function generateStreaming() {
 		// Use WebSocket for streaming generation with progress updates
-		const wsUrl = BACKEND_URL.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws/generate';
+		const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+		const wsUrl = BACKEND_URL ? BACKEND_URL.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws/generate' : `${wsProtocol}//${window.location.host}/ws/generate`;
 
 		try {
 			currentWebSocket = new WebSocket(wsUrl);

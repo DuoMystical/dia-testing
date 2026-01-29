@@ -83,27 +83,20 @@ set -e
 TERMINAL_USER=${TERMINAL_USER:-admin}
 TERMINAL_PASS=${TERMINAL_PASS:-dia2dev}
 
-echo "Starting Dia2 API on port 8000..."
-echo "Starting Frontend on port 3000..."
+echo "Starting Dia2 API + Frontend on port 8000..."
 echo "Starting Web Terminal on port 7681 (user: $TERMINAL_USER)"
 
 # Start ttyd in background
 ttyd -p 7681 -W -c "$TERMINAL_USER:$TERMINAL_PASS" bash &
 
-# Start frontend in background (override PORT to 3000, ignore platform's PORT)
-cd /app/frontend && PORT=3000 HOST=0.0.0.0 node build/index.js &
-
-# Small delay to ensure frontend binds first
-sleep 1
-
-# Start uvicorn in foreground
+# Start uvicorn (serves both API and frontend static files)
 cd /app && exec /app/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 STARTUP
 
 RUN chmod +x /app/start.sh
 
-# Expose ports: 8000 for API, 3000 for frontend, 7681 for terminal
-EXPOSE 8000 3000 7681
+# Expose ports: 8000 for API + frontend, 7681 for terminal
+EXPOSE 8000 7681
 
 # Environment variables for terminal auth (override in Koyeb)
 ENV TERMINAL_USER=admin

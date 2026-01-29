@@ -5,9 +5,10 @@ import base64
 import json
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import time
 from typing import Optional, List, Literal
@@ -496,3 +497,32 @@ async def websocket_generate(websocket: WebSocket):
             await websocket.close()
         except:
             pass
+
+
+# Serve frontend static files
+FRONTEND_DIR = Path("/app/frontend/build")
+
+if FRONTEND_DIR.exists():
+    # Mount static assets (JS, CSS, etc.) - SvelteKit puts these in _app
+    app_dir = FRONTEND_DIR / "_app"
+    if app_dir.exists():
+        app.mount("/_app", StaticFiles(directory=str(app_dir)), name="app_static")
+
+    # Catch-all route to serve the SvelteKit app
+    @app.get("/{full_path:path}")
+    async def serve_frontend(request: Request, full_path: str):
+        # Don't serve frontend for API routes
+        if full_path.startswith("api/") or full_path.startswith("ws/"):
+            raise HTTPException(status_code=404)
+
+        # Try to serve static file first
+        static_file = FRONTEND_DIR / full_path
+        if static_file.exists() and static_file.is_file():
+            return FileResponse(static_file)
+
+        # Otherwise serve the index.html for SPA routing
+        index_file = FRONTEND_DIR / "index.html"
+        if index_file.exists():
+            return FileResponse(index_file)
+
+        raise HTTPException(status_code=404, detail="Frontend not found")
