@@ -324,16 +324,19 @@ def process_request(request: dict):
             WARMUP_PHRASE = "[S1] The quick brown fox jumps over the lazy dog near the old bridge. [S2] Nice."
             warmup_entries = parse_script([WARMUP_PHRASE], runtime.tokenizer, runtime.constants, runtime.frame_rate)
 
-            # Set initial_padding on machine so warmup state gets proper padding
-            # Original Dia uses 19 frames: ~2 forced padding + 17 warmup
-            runtime.machine.initial_padding = gen_config.initial_padding
+            # Set initial_padding to 2 (original Dia default) for proper padding structure:
+            # - 2 frames forced padding
+            # - 17 frames warmup phrase processing
+            # - = 19 total to cover max_delay (18)
+            runtime.machine.initial_padding = 2
             warmup_state = runtime.machine.new_state(warmup_entries)
             runtime.machine.initial_padding = 0  # Reset to avoid side effects
 
             # Get max_delay for minimum warmup steps (codec alignment requirement)
             max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
 
-            # Run warmup until entries are consumed (dynamic length)
+            # Run warmup until entries are consumed, minimum max_delay+1 steps
+            # This ensures: 2 padding + 17 warmup = 19 steps >= max_delay+1
             gen_state, warmup_steps = run_seed_warmup(
                 runtime,
                 gen_state,
