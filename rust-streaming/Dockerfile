@@ -32,6 +32,8 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     libsndfile1 \
+    libopus0 \
+    ffmpeg \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -54,7 +56,8 @@ RUN uv pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
     huggingface-hub>=0.24.7 \
     sphn>=0.2.0 \
     numpy>=2.1.0 \
-    soundfile>=0.12.1
+    soundfile>=0.12.1 \
+    av>=14.0.0
 
 # Copy modified Dia2 source and install (paths relative to repo root)
 COPY dia2-src /app/dia2-src

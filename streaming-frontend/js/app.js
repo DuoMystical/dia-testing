@@ -1,5 +1,7 @@
 /**
  * Dia2 Streaming TTS - Main Application
+ *
+ * Uses WebM/Opus streaming via MediaSource Extensions for gapless audio playback.
  */
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -64,7 +66,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // State
     let isGenerating = false;
     let wsClient = null;
-    let audioStreamer = null;
+    let audioStreamer = null; // WebM streamer (primary) or legacy fallback
 
     // Timer state
     let generationStartTime = null;
@@ -104,73 +106,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         wsClient.connect();
 
-        // Expose for debugging from console
+        // Expose for debugging
         window.wsClient = wsClient;
         window.audioStreamer = audioStreamer;
-
-        // Flag to switch between streamers
-        window.useSeamlessStreamer = false;
-
-        // Initialize seamless streamer (for testing) - only if available
-        if (typeof SeamlessAudioStreamer !== 'undefined') {
-            try {
-                window.seamlessStreamer = new SeamlessAudioStreamer({
-                    volume: volumeSlider.value / 100,
-                    onBufferLevel: (samples, seconds) => {
-                        console.log(`[SeamlessStreamer] Buffer: ${samples} samples (${seconds.toFixed(2)}s)`);
-                    },
-                    onPlaybackStart: () => {
-                        console.log('[SeamlessStreamer] Playback started');
-                    },
-                    onVisualizerData: (data) => {
-                        if (window.useSeamlessStreamer) {
-                            drawVisualizer(data);
-                        }
-                    }
-                });
-
-                // Helper function to switch streamers
-                window.switchToSeamless = async () => {
-                    window.useSeamlessStreamer = true;
-                    await window.seamlessStreamer.init();
-                    console.log('Switched to SeamlessAudioStreamer (AudioWorklet-based)');
-                    console.log('Audio will now stream through continuous buffer - no pops!');
-                };
-
-                window.switchToChunked = () => {
-                    window.useSeamlessStreamer = false;
-                    console.log('Switched back to chunked AudioStreamer');
-                };
-
-                // Test function to play sine wave through worklet
-                window.testWorklet = async (durationSeconds = 1.0, frequency = 440) => {
-                    if (!window.seamlessStreamer) {
-                        console.error('Seamless streamer not available');
-                        return;
-                    }
-                    console.log('Testing worklet with sine wave...');
-                    await window.seamlessStreamer.testWithSineWave(durationSeconds, frequency);
-                };
-
-                // Get worklet status
-                window.getWorkletStatus = () => {
-                    if (window.seamlessStreamer && window.seamlessStreamer.workletNode) {
-                        window.seamlessStreamer.workletNode.port.postMessage({ type: 'getStatus' });
-                        console.log('Status requested - check console for response');
-                    } else {
-                        console.error('Worklet not available');
-                    }
-                };
-
-                console.log('[App] To test seamless streaming, run: switchToSeamless()');
-                console.log('[App] To test worklet with sine wave, run: testWorklet(1.0, 440)');
-                console.log('[App] To get worklet status, run: getWorkletStatus()');
-            } catch (e) {
-                console.warn('[App] SeamlessAudioStreamer failed to initialize:', e);
-            }
-        } else {
-            console.warn('[App] SeamlessAudioStreamer not available');
-        }
     }
 
     // Handle seed received from backend
@@ -191,23 +129,56 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Initialize Audio Streamer
     function initAudioStreamer() {
-        audioStreamer = new AudioStreamer({
-            volume: volumeSlider.value / 100,
-            autoPlay: true,
-            onChunkPlay: (index) => {
-                updateChunkHighlight(index);
-            },
-            onPlaybackEnd: () => {
-                playIcon.textContent = '\u25B6'; // Play icon
-            },
-            onTimeUpdate: (current, total) => {
-                currentTimeEl.textContent = formatTime(current);
-                totalTimeEl.textContent = formatTime(total);
-            },
-            onVisualizerData: (data) => {
-                drawVisualizer(data);
-            }
-        });
+        // Use WebM/MSE streaming (gapless playback)
+        if (typeof WebMAudioStreamer !== 'undefined') {
+            audioStreamer = new WebMAudioStreamer({
+                volume: volumeSlider.value / 100,
+                onPlaybackStart: () => {
+                    playIcon.textContent = '\u23F8'; // Pause icon
+                },
+                onPlaybackEnd: () => {
+                    playIcon.textContent = '\u25B6'; // Play icon
+                },
+                onVisualizerData: (data) => {
+                    drawVisualizer(data);
+                },
+                onBufferUpdate: (bytes, chunks) => {
+                    // Update time display
+                    if (audioStreamer) {
+                        const current = audioStreamer.audioElement?.currentTime || 0;
+                        const total = audioStreamer.getTotalDuration();
+                        currentTimeEl.textContent = formatTime(current);
+                        totalTimeEl.textContent = formatTime(total);
+                    }
+                },
+                onError: (error) => {
+                    console.error('[WebMStreamer] Error:', error);
+                }
+            });
+            console.log('[App] WebM streaming enabled (MSE-based gapless playback)');
+        } else {
+            // Fallback to legacy chunk-based streamer
+            audioStreamer = new AudioStreamer({
+                volume: volumeSlider.value / 100,
+                autoPlay: true,
+                onChunkPlay: (index) => {
+                    updateChunkHighlight(index);
+                },
+                onPlaybackEnd: () => {
+                    playIcon.textContent = '\u25B6'; // Play icon
+                },
+                onTimeUpdate: (current, total) => {
+                    currentTimeEl.textContent = formatTime(current);
+                    totalTimeEl.textContent = formatTime(total);
+                },
+                onVisualizerData: (data) => {
+                    drawVisualizer(data);
+                }
+            });
+            console.warn('[App] WebMAudioStreamer not available, using legacy chunked playback');
+        }
+
+        window.audioStreamer = audioStreamer;
     }
 
     // Timer functions
@@ -230,7 +201,6 @@ document.addEventListener('DOMContentLoaded', () => {
             clearInterval(timerInterval);
             timerInterval = null;
         }
-        // Show final time
         if (generationStartTime) {
             const elapsed = (performance.now() - generationStartTime) / 1000;
             generationTimer.textContent = `${elapsed.toFixed(1)}s`;
@@ -260,13 +230,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         lastChunkReceiveTime = receiveTime;
 
-        // Use seamless streamer if enabled, otherwise use chunked streamer
-        let duration;
-        if (window.useSeamlessStreamer && window.seamlessStreamer) {
-            duration = await window.seamlessStreamer.addChunk(chunk.data, chunk.chunkIndex);
-        } else {
-            duration = await audioStreamer.addChunk(chunk.data, chunk.chunkIndex);
-        }
+        // Add chunk to streamer
+        const duration = await audioStreamer.addChunk(chunk.data, chunk.chunkIndex);
 
         // Calculate chunk audio duration in ms
         const chunkAudioMs = duration * 1000;
@@ -290,12 +255,9 @@ document.addEventListener('DOMContentLoaded', () => {
             chunkLatency.hidden = false;
         }
 
-        // Update UI - use correct streamer for counts
-        const activeStreamer = (window.useSeamlessStreamer && window.seamlessStreamer)
-            ? window.seamlessStreamer
-            : audioStreamer;
-        chunksCount.textContent = `${activeStreamer.getChunkCount()} chunks`;
-        audioDuration.textContent = `${activeStreamer.getTotalDuration().toFixed(1)}s audio`;
+        // Update UI
+        chunksCount.textContent = `${audioStreamer.getChunkCount()} chunks`;
+        audioDuration.textContent = `${audioStreamer.getTotalDuration().toFixed(1)}s audio`;
 
         // Add chunk to list
         addChunkToList(chunk.chunkIndex, duration);
@@ -331,7 +293,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const genTime = generationStartTime ? ((performance.now() - generationStartTime) / 1000).toFixed(1) : '?';
         progressText.textContent = `Complete! ${result.totalChunks} chunks, ${(result.totalDurationMs / 1000).toFixed(1)}s audio in ${genTime}s`;
         progressBar.style.width = '100%';
-        // Keep progress section visible so user can see results and play audio
+
+        // Signal end of stream (WebM streamer needs this)
+        if (audioStreamer.endOfStream) {
+            audioStreamer.endOfStream();
+        }
+
+        // Keep progress section visible
         setGenerating(false, true);
     }
 
@@ -348,7 +316,6 @@ document.addEventListener('DOMContentLoaded', () => {
         isGenerating = generating;
         generateBtn.disabled = generating || !wsClient?.isConnected;
         cancelBtn.disabled = !generating;
-        // Only hide progress section if explicitly requested (not after completion)
         if (!keepProgressVisible) {
             progressSection.hidden = !generating;
         }
@@ -359,26 +326,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const item = document.createElement('div');
         item.className = 'chunk-item new';
         item.textContent = index + 1;
-        item.title = `Chunk ${index + 1}: ${duration.toFixed(2)}s (click to play)`;
+        item.title = `Chunk ${index + 1}: ${duration.toFixed(2)}s`;
         item.dataset.index = index;
-
-        // Click to play single chunk (for debugging audio boundaries)
-        item.addEventListener('click', async () => {
-            const chunkIndex = parseInt(item.dataset.index, 10);
-            console.log(`Playing single chunk ${chunkIndex} (seamless mode: ${window.useSeamlessStreamer})`);
-
-            // Use the appropriate streamer based on current mode
-            let played;
-            if (window.useSeamlessStreamer && window.seamlessStreamer) {
-                played = await window.seamlessStreamer.playSingleChunk(chunkIndex);
-            } else {
-                played = await audioStreamer.playSingleChunk(chunkIndex);
-            }
-
-            if (played) {
-                playIcon.textContent = '\u23F8'; // Pause icon
-            }
-        });
 
         chunkList.appendChild(item);
         chunkTotal.textContent = `(${audioStreamer.getChunkCount()})`;
@@ -414,8 +363,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const value = data[i] / 255;
             const barHeight = value * height;
 
-            // Gradient color based on value
-            const hue = 240 + value * 120; // Blue to purple
+            const hue = 240 + value * 120;
             visualizerCtx.fillStyle = `hsl(${hue}, 70%, ${50 + value * 30}%)`;
 
             visualizerCtx.fillRect(
@@ -435,7 +383,6 @@ document.addEventListener('DOMContentLoaded', () => {
         visualizerCtx.fillStyle = '#0f172a';
         visualizerCtx.fillRect(0, 0, width, height);
 
-        // Draw a flat line
         visualizerCtx.strokeStyle = '#334155';
         visualizerCtx.lineWidth = 2;
         visualizerCtx.beginPath();
@@ -461,9 +408,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Reset audio streamer
         audioStreamer.reset();
-        if (window.seamlessStreamer) {
-            window.seamlessStreamer.reset();
-        }
         chunkList.innerHTML = '';
 
         // Reset timing state
@@ -487,29 +431,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const options = {
             model: modelSelect.value,
-            // Sampling config
             audioTemperature: parseFloat(audioTempInput.value) || 0.8,
             audioTopK: parseInt(audioTopKInput.value) || 50,
             textTemperature: parseFloat(textTempInput.value) || 0.6,
             textTopK: parseInt(textTopKInput.value) || 50,
-            // CFG config
             cfgScale: parseFloat(cfgScaleInput.value) || 6.0,
             cfgFilterK: parseInt(cfgFilterKInput.value) || 50,
-            // Streaming config
             chunkSizeFrames: parseInt(chunkSizeInput.value) || 1,
             minChunkFrames: parseInt(minChunkSizeInput.value) || 1,
-            // Seed (empty string = random)
             seed: seedInput.value.trim(),
-            // Voice cloning (base64 audio data)
             speaker1Audio: speaker1AudioData,
             speaker2Audio: speaker2AudioData
         };
 
         if (streamInputCheckbox.checked) {
-            // Bidirectional streaming - send text in chunks (with options in final chunk)
             wsClient.sendTextChunks(text, 50, options);
         } else {
-            // Direct generation
             wsClient.generate(text, options);
         }
     }
@@ -526,10 +463,10 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             if (audioStreamer.isPlaying) {
                 audioStreamer.pause();
-                playIcon.textContent = '\u25B6'; // Play icon
+                playIcon.textContent = '\u25B6';
             } else {
                 await audioStreamer.play();
-                playIcon.textContent = '\u23F8'; // Pause icon
+                playIcon.textContent = '\u23F8';
             }
         } catch (error) {
             console.error('Playback error:', error);
@@ -556,7 +493,6 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // Validate file type
         if (!file.type.includes('wav') && !file.name.endsWith('.wav')) {
             speaker1Status.textContent = 'Error: Only WAV files are supported';
             speaker1Status.className = 'upload-status error';
@@ -564,10 +500,8 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // Read and convert to base64
         const reader = new FileReader();
         reader.onload = function(e) {
-            // Get base64 part (remove data:audio/wav;base64, prefix)
             const base64 = e.target.result.split(',')[1];
             speaker1AudioData = base64;
             speaker1Status.textContent = `Loaded: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
@@ -590,7 +524,6 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // Validate file type
         if (!file.type.includes('wav') && !file.name.endsWith('.wav')) {
             speaker2Status.textContent = 'Error: Only WAV files are supported';
             speaker2Status.className = 'upload-status error';
@@ -598,10 +531,8 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // Read and convert to base64
         const reader = new FileReader();
         reader.onload = function(e) {
-            // Get base64 part (remove data:audio/wav;base64, prefix)
             const base64 = e.target.result.split(',')[1];
             speaker2AudioData = base64;
             speaker2Status.textContent = `Loaded: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
