@@ -280,8 +280,6 @@ def process_request(request: dict):
             emit_status_every=config_overrides.get("emit_status_every", 20),
         )
 
-        print(f"[CONFIG] chunk_size_frames={chunk_size}, min_chunk_frames={min_chunk}", file=sys.stderr)
-
         generation_start = time_module.time()
 
         # Check seed cache (only for non-voice-cloning requests)
@@ -364,8 +362,6 @@ def process_request(request: dict):
         audio_chunk_count = 0
         first_audio_time = None
 
-        print(f"Starting generation with text: {text[:50]}...", file=sys.stderr)
-
         for event in run_streaming_generation_loop(
             runtime,
             state=state,
@@ -387,9 +383,6 @@ def process_request(request: dict):
                     first_audio_time = elapsed
                     print(f"[TIMING] First audio chunk at {first_audio_time*1000:.0f}ms", file=sys.stderr)
 
-                audio_bytes = len(event.audio_data) - 44
-                chunk_duration_ms = (audio_bytes / 48000) * 1000
-                print(f"  AudioChunk #{audio_chunk_count}: {len(event.audio_data)} bytes ({chunk_duration_ms:.0f}ms audio), elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
                 emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
 
             elif isinstance(event, StatusEvent):

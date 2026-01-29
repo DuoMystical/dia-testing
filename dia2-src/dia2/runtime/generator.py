@@ -509,7 +509,7 @@ def decode_audio_streaming(
 
 # Module-level tracking for cross-chunk boundary analysis
 _last_chunk_end_samples = None
-_chunk_diagnostics_enabled = True
+_chunk_diagnostics_enabled = False  # Set True for detailed per-chunk audio analysis
 _chunk_counter = 0
 
 # Debug mode for saving raw audio chunks
