@@ -1236,8 +1236,7 @@ def run_streaming_generation_loop(
                     should_emit_chunk = True
 
                 if should_emit_chunk:
-                    # IMMEDIATE DECODE: No lookahead, no pending - decode and emit right away
-                    # This minimizes latency to first audio chunk
+                    # Decode and emit audio chunk immediately
                     current_frame = t + 1
                     is_first_chunk = not first_chunk_emitted
 
@@ -1259,7 +1258,6 @@ def run_streaming_generation_loop(
                         if aligned_chunk.shape[-1] > 0:
                             try:
                                 t_decode_start = time.time()
-                                # Decode immediately without lookahead
                                 chunk_waveform, decoder_state = decode_audio_streaming(
                                     runtime, aligned_chunk, decoder_state
                                 )
