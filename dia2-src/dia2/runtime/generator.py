@@ -480,45 +480,30 @@ def decode_audio_streaming(
     runtime: RuntimeContext,
     tokens: torch.Tensor,
     decoder_state=None,
-    lookahead_tokens: torch.Tensor = None,
 ):
-    """Decode audio tokens to waveform with optional lookahead for seamless streaming.
+    """Decode audio tokens to waveform with streaming state.
 
-    Uses the MimiCodec's overlap decode to ensure smooth audio transitions
+    Uses the MimiCodec's streaming decode to maintain continuity
     between chunks without boundary artifacts.
 
     Args:
         runtime: Runtime context containing the mimi codec
         tokens: Audio tokens to decode (batch, codebooks, frames)
-        decoder_state: Previous StreamingDecoderState, or None for first chunk
-        lookahead_tokens: Optional lookahead tokens for forward context.
-                         If provided, these are appended to tokens but only
-                         tokens' audio is output (lookahead provides forward context).
+        decoder_state: Previous decoder state, or None for first chunk
 
     Returns:
         Tuple of (waveform, new_decoder_state)
-        - waveform: 1D tensor of audio samples (for tokens only, not lookahead)
+        - waveform: 1D tensor of audio samples
         - new_decoder_state: State to pass to next call
     """
     if tokens.shape[-1] == 0:
         return torch.zeros(0, device=runtime.device), decoder_state
 
     with torch.inference_mode():
-        if lookahead_tokens is not None and lookahead_tokens.shape[-1] > 0:
-            # Overlap decode: combine tokens with lookahead for forward context
-            combined = torch.cat([tokens, lookahead_tokens], dim=-1)
-            output_frames = tokens.shape[-1]
-            pcm, new_state = runtime.mimi.decode_with_lookahead(
-                combined.to(runtime.device),
-                output_frames=output_frames,
-                decoder_state=decoder_state,
-            )
-        else:
-            # Regular decode without lookahead
-            pcm, new_state = runtime.mimi.decode_with_state(
-                tokens.to(runtime.device),
-                decoder_state=decoder_state,
-            )
+        pcm, new_state = runtime.mimi.decode_with_state(
+            tokens.to(runtime.device),
+            decoder_state=decoder_state,
+        )
         return pcm[0, 0], new_state
 
 
@@ -976,6 +961,15 @@ def run_streaming_generation_loop(
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
 
+    # Check if we're on CUDA for sync operations
+    is_cuda = runtime.device.type == "cuda"
+
+    # Create separate CUDA stream for audio decoding (overlaps with generation)
+    decode_stream = torch.cuda.Stream() if is_cuda else None
+
+    # Pending async decode state: (waveform_tensor, chunk_index, timestamp_ms)
+    pending_decode = None
+
     # Streaming state
     chunk_size = streaming_config.chunk_size_frames
     min_chunk = streaming_config.min_chunk_frames
@@ -983,19 +977,11 @@ def run_streaming_generation_loop(
     total_audio_ms = 0.0
     generation_start_time = time.time()
 
-    # Check if we're on CUDA for sync operations
-    is_cuda = runtime.device.type == "cuda"
-
     # Decoder state for maintaining continuity between audio chunks
-    # This preserves the Mimi decoder's internal state (key-value cache) across chunks,
-    # eliminating boundary artifacts that occur when decoding chunks independently
     decoder_state = None
 
     # Track aligned frames we've already emitted (after undelay)
-    # undelay output length = input_length - max_delay
-    # Skip warmup frames - they were used to prime the pipeline and should be clipped
-    # warmup produces (start_step - max_delay) aligned frames that we don't emit
-    last_aligned_emitted = max(0, start_step - max_delay)
+    last_aligned_emitted = 0
 
     # Calculate approximate frame rate for timing
     frame_rate = getattr(runtime, 'frame_rate', 75.0)
@@ -1233,11 +1219,14 @@ def run_streaming_generation_loop(
                     eos_cutoff = state.end_step + flush_tail
                     print(f"[TIMING] EOS detected at step {t}, eos_cutoff set to {eos_cutoff}", file=sys.stderr)
 
-                # NOTE: We no longer skip based on first_word_frame for streaming.
-                # With seed caching, the warmup frames are already accounted for in last_aligned_emitted
-                # (initialized to start_step - max_delay). Skipping based on first_word_frame caused
-                # the 450ms delay bug because it would wait for the first new_word token.
-                first_word_frame_applied = True
+                # Skip initial frames before first_word_frame (warmup/padding frames)
+                # This matches the crop behavior in non-streaming generate()
+                if not first_word_frame_applied and first_word_frame is not None:
+                    skip_to = max(first_word_frame, 0)
+                    if skip_to > last_aligned_emitted:
+                        print(f"[TIMING] Skipping initial frames: last_aligned_emitted {last_aligned_emitted} -> {skip_to}", file=sys.stderr)
+                        last_aligned_emitted = skip_to
+                    first_word_frame_applied = True
 
                 # Check if we have enough NEW aligned frames for a chunk
                 # aligned length = (t + 1) - max_delay, we've emitted last_aligned_emitted
@@ -1251,20 +1240,48 @@ def run_streaming_generation_loop(
                     should_emit_chunk = True
 
                 if should_emit_chunk:
-                    # IMMEDIATE DECODE: No lookahead, no pending - decode and emit right away
-                    # This minimizes latency to first audio chunk
-                    current_frame = t + 1
-                    is_first_chunk = not first_chunk_emitted
+                    # ASYNC DECODE PIPELINE:
+                    # 1. First, yield any pending chunk from PREVIOUS async decode
+                    # 2. Start new decode on decode_stream (async)
+                    # 3. Store waveform for next iteration
 
-                    # Undelay the entire buffer up to current position
-                    t_undelay_start = time.time()
+                    # Step 1: Yield pending chunk from previous async decode
+                    if pending_decode is not None:
+                        prev_waveform, prev_idx, prev_ts = pending_decode
+                        try:
+                            if decode_stream is not None:
+                                decode_stream.synchronize()
+
+                            t0 = time.time()
+                            if prev_waveform.numel() > 0:
+                                audio_bytes = _encode_opus_chunk(prev_waveform, runtime.mimi.sample_rate)
+                                chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
+
+                                yield AudioChunkEvent(
+                                    audio_data=audio_bytes,
+                                    chunk_index=prev_idx,
+                                    timestamp_ms=prev_ts,
+                                )
+                                total_audio_ms += chunk_duration_ms
+
+                            t1 = time.time()
+                            timing_stats['audio_decode'] += (t1 - t0)
+                        except Exception as e:
+                            if logger:
+                                logger.event(f"Chunk encode error: {e}")
+                            yield ErrorEvent(error=f"Chunk encode error: {e}")
+                            return
+                        pending_decode = None
+
+                    # Step 2: Prepare new chunk for async decode
+                    current_frame = t + 1
+
                     full_tokens = audio_buf[0, :, :current_frame + 1]
                     aligned_full = undelay_frames(
                         full_tokens,
                         runtime.audio_delays,
                         token_ids.audio_pad
                     ).unsqueeze(0)
-                    t_undelay_end = time.time()
 
                     current_aligned_end = aligned_full.shape[-1]
 
@@ -1273,54 +1290,30 @@ def run_streaming_generation_loop(
 
                         if aligned_chunk.shape[-1] > 0:
                             try:
-                                t_decode_start = time.time()
-                                # Decode immediately without lookahead
-                                chunk_waveform, decoder_state = decode_audio_streaming(
-                                    runtime, aligned_chunk, decoder_state
-                                )
-                                t_decode_end = time.time()
-
-                                if chunk_waveform.numel() > 0:
-                                    t_encode_start = time.time()
-                                    audio_bytes = _encode_opus_chunk(chunk_waveform, runtime.mimi.sample_rate)
-                                    t_encode_end = time.time()
-                                    chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
-
-                                    yield AudioChunkEvent(
-                                        audio_data=audio_bytes,
-                                        chunk_index=chunk_index,
-                                        timestamp_ms=total_audio_ms,
-                                    )
-
-                                    # Print detailed timing for first chunk
-                                    if is_first_chunk:
-                                        first_chunk_emitted = True
-                                        total_time = time.time() - generation_start_time
-                                        steps_run = offset + 1
-                                        print(f"[TIMING] === FIRST CHUNK BREAKDOWN ===", file=sys.stderr)
-                                        print(f"[TIMING]   Step: {t} (offset={offset}, steps_run={steps_run})", file=sys.stderr)
-                                        print(f"[TIMING]   Aligned frames emitted: {last_aligned_emitted} -> {current_aligned_end}", file=sys.stderr)
-                                        print(f"[TIMING]   --- Generation steps ({steps_run} steps) ---", file=sys.stderr)
-                                        print(f"[TIMING]   Transformer: {timing_stats['transformer_step']*1000:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING]   Text sampling: {timing_stats['text_sampling']*1000:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING]   State machine: {timing_stats['machine_process']*1000:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING]   Audio sampling: {timing_stats['audio_sampling']*1000:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING]   Depformer: {timing_stats['depformer_stages']*1000:.1f}ms", file=sys.stderr)
-                                        if timing_stats['cuda_graph_capture'] > 0:
-                                            print(f"[TIMING]   CUDA graph capture: {timing_stats['cuda_graph_capture']*1000:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING]   --- Audio encoding ---", file=sys.stderr)
-                                        print(f"[TIMING]   Undelay: {(t_undelay_end - t_undelay_start)*1000:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING]   Mimi decode: {(t_decode_end - t_decode_start)*1000:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING]   Opus encode: {(t_encode_end - t_encode_start)*1000:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING]   --- Summary ---", file=sys.stderr)
-                                        print(f"[TIMING]   Chunk audio duration: {chunk_duration_ms:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING]   TOTAL time to first chunk: {total_time*1000:.1f}ms", file=sys.stderr)
-                                        print(f"[TIMING] ==============================", file=sys.stderr)
-
-                                    total_audio_ms += chunk_duration_ms
+                                t0 = time.time()
+                                if decode_stream is not None:
+                                    with torch.cuda.stream(decode_stream):
+                                        chunk_waveform, decoder_state = decode_audio_streaming(
+                                            runtime, aligned_chunk, decoder_state
+                                        )
+                                    pending_decode = (chunk_waveform, chunk_index, total_audio_ms)
                                     chunk_index += 1
+                                else:
+                                    chunk_waveform, decoder_state = decode_audio_streaming(
+                                        runtime, aligned_chunk, decoder_state
+                                    )
+                                    if chunk_waveform.numel() > 0:
+                                        audio_bytes = _encode_opus_chunk(chunk_waveform, runtime.mimi.sample_rate)
+                                        chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
+                                        yield AudioChunkEvent(
+                                            audio_data=audio_bytes,
+                                            chunk_index=chunk_index,
+                                            timestamp_ms=total_audio_ms,
+                                        )
+                                        total_audio_ms += chunk_duration_ms
+                                        chunk_index += 1
 
-                                timing_stats['audio_decode'] += (t_decode_end - t_decode_start)
+                                t1 = time.time()
 
                             except Exception as e:
                                 if logger:
@@ -1337,6 +1330,31 @@ def run_streaming_generation_loop(
                         message=f"Generating audio ({offset + 1}/{max_context} steps)",
                         progress=progress
                     )
+
+        # First, yield any pending async decode from the loop
+        if pending_decode is not None:
+            prev_waveform, prev_idx, prev_ts = pending_decode
+            try:
+                if decode_stream is not None:
+                    decode_stream.synchronize()
+
+                if prev_waveform.numel() > 0:
+                    audio_bytes = _encode_opus_chunk(prev_waveform, runtime.mimi.sample_rate)
+                    chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
+
+                    yield AudioChunkEvent(
+                        audio_data=audio_bytes,
+                        chunk_index=prev_idx,
+                        timestamp_ms=prev_ts,
+                    )
+                    total_audio_ms += chunk_duration_ms
+
+            except Exception as e:
+                if logger:
+                    logger.event(f"Pending chunk encode error: {e}")
+                yield ErrorEvent(error=f"Pending chunk encode error: {e}")
+                return
+            pending_decode = None
 
         # Handle any remaining frames at end of generation
         if last_step >= 0:
