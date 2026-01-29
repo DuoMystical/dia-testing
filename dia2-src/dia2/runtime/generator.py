@@ -480,45 +480,30 @@ def decode_audio_streaming(
     runtime: RuntimeContext,
     tokens: torch.Tensor,
     decoder_state=None,
-    lookahead_tokens: torch.Tensor = None,
 ):
-    """Decode audio tokens to waveform with optional lookahead for seamless streaming.
+    """Decode audio tokens to waveform with streaming state.
 
-    Uses the MimiCodec's overlap decode to ensure smooth audio transitions
+    Uses the MimiCodec's streaming decode to maintain continuity
     between chunks without boundary artifacts.
 
     Args:
         runtime: Runtime context containing the mimi codec
         tokens: Audio tokens to decode (batch, codebooks, frames)
-        decoder_state: Previous StreamingDecoderState, or None for first chunk
-        lookahead_tokens: Optional lookahead tokens for forward context.
-                         If provided, these are appended to tokens but only
-                         tokens' audio is output (lookahead provides forward context).
+        decoder_state: Previous decoder state, or None for first chunk
 
     Returns:
         Tuple of (waveform, new_decoder_state)
-        - waveform: 1D tensor of audio samples (for tokens only, not lookahead)
+        - waveform: 1D tensor of audio samples
         - new_decoder_state: State to pass to next call
     """
     if tokens.shape[-1] == 0:
         return torch.zeros(0, device=runtime.device), decoder_state
 
     with torch.inference_mode():
-        if lookahead_tokens is not None and lookahead_tokens.shape[-1] > 0:
-            # Overlap decode: combine tokens with lookahead for forward context
-            combined = torch.cat([tokens, lookahead_tokens], dim=-1)
-            output_frames = tokens.shape[-1]
-            pcm, new_state = runtime.mimi.decode_with_lookahead(
-                combined.to(runtime.device),
-                output_frames=output_frames,
-                decoder_state=decoder_state,
-            )
-        else:
-            # Regular decode without lookahead
-            pcm, new_state = runtime.mimi.decode_with_state(
-                tokens.to(runtime.device),
-                decoder_state=decoder_state,
-            )
+        pcm, new_state = runtime.mimi.decode_with_state(
+            tokens.to(runtime.device),
+            decoder_state=decoder_state,
+        )
         return pcm[0, 0], new_state
 
 
