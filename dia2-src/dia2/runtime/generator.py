@@ -1513,7 +1513,8 @@ def run_streaming_generation_loop(
 
                         # Calculate how many of these frames should be output vs discarded
                         # Transition frames are between last_aligned_decoded and last_aligned_emitted
-                        frames_to_skip = max(0, last_aligned_emitted - last_aligned_decoded)
+                        # Cap at num_frames_decoded to avoid skipping more than we have
+                        frames_to_skip = max(0, min(last_aligned_emitted - last_aligned_decoded, num_frames_decoded))
                         frames_to_output = num_frames_decoded - frames_to_skip
 
                         # Debug: log decode range for first few chunks
@@ -1629,8 +1630,10 @@ def run_streaming_generation_loop(
 
         # Handle any remaining frames at end of generation
         # Use same two-variable logic: decode from last_aligned_decoded, output from last_aligned_emitted
+        print(f"[DEBUG END] last_step={last_step}, last_aligned_decoded={last_aligned_decoded}, last_aligned_emitted={last_aligned_emitted}", file=sys.stderr)
         if last_step >= 0:
             remaining_end = min(last_step + 2, audio_buf.shape[-1])
+            print(f"[DEBUG END] remaining_end={remaining_end}", file=sys.stderr)
 
             if remaining_end > 0:
                 full_tokens = audio_buf[0, :, :remaining_end]
@@ -1641,6 +1644,7 @@ def run_streaming_generation_loop(
                 ).unsqueeze(0)
 
                 current_aligned_end = aligned_full.shape[-1]
+                print(f"[DEBUG END] current_aligned_end={current_aligned_end}, full_tokens.shape={full_tokens.shape}", file=sys.stderr)
 
                 # Decode any frames we haven't decoded yet
                 if current_aligned_end > last_aligned_decoded:
@@ -1648,7 +1652,10 @@ def run_streaming_generation_loop(
                     num_frames_decoded = frames_to_decode.shape[-1]
 
                     # Calculate frames to skip (transition frames)
-                    frames_to_skip = max(0, last_aligned_emitted - last_aligned_decoded)
+                    # Cap at num_frames_decoded to avoid skipping more than we have
+                    frames_to_skip = max(0, min(last_aligned_emitted - last_aligned_decoded, num_frames_decoded))
+                    frames_to_output = num_frames_decoded - frames_to_skip
+                    print(f"[DEBUG END] num_frames_decoded={num_frames_decoded}, frames_to_skip={frames_to_skip}, frames_to_output={frames_to_output}", file=sys.stderr)
 
                     if frames_to_decode.shape[-1] > 0:
                         try:
@@ -1660,10 +1667,12 @@ def run_streaming_generation_loop(
                             samples_per_frame = runtime.mimi.samples_per_frame
                             samples_to_skip = frames_to_skip * samples_per_frame
                             output_waveform = full_waveform[samples_to_skip:]
+                            print(f"[DEBUG END] full_waveform.numel()={full_waveform.numel()}, samples_to_skip={samples_to_skip}, output_waveform.numel()={output_waveform.numel()}", file=sys.stderr)
 
                             if output_waveform.numel() > 0:
                                 audio_bytes = _encode_webm_chunk(output_waveform, runtime.mimi.sample_rate)
                                 chunk_duration_ms = (output_waveform.numel() / runtime.mimi.sample_rate) * 1000
+                                print(f"[DEBUG END] Emitting final chunk: {chunk_duration_ms:.1f}ms", file=sys.stderr)
 
                                 yield AudioChunkEvent(
                                     audio_data=audio_bytes,
@@ -1673,12 +1682,16 @@ def run_streaming_generation_loop(
                                 )
                                 total_audio_ms += chunk_duration_ms
                                 chunk_index += 1
+                            else:
+                                print(f"[DEBUG END] No output audio (all transition frames)", file=sys.stderr)
 
                         except Exception as e:
                             if logger:
                                 logger.event(f"Final chunk decode error: {e}")
                             yield ErrorEvent(error=f"Final chunk decode error: {e}")
                             return
+                else:
+                    print(f"[DEBUG END] No new frames to decode (current_aligned_end={current_aligned_end} <= last_aligned_decoded={last_aligned_decoded})", file=sys.stderr)
 
         # Save concatenated debug audio if enabled
         save_debug_concatenated()
