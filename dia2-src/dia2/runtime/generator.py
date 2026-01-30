@@ -1206,25 +1206,15 @@ def run_streaming_generation_loop(
     #
     # We track TWO separate positions:
     # 1. last_aligned_decoded - where the decoder has processed up to
-    #    (starts at warmup aligned frames, needed to keep decoder state in sync)
-    # 2. last_aligned_emitted - what audio we've outputted
-    #    (starts AFTER transition frames to avoid warmup audio bleed)
+    # 2. last_aligned_emitted - where we start outputting from
     #
-    # With max_delay=18 and warmup_steps=40:
-    # - Raw frames 0-40 are warmup tokens
-    # - Aligned frame N uses raw frames N through N+18 (due to codebook delays)
-    # - Aligned frames 0-22 use only warmup tokens
-    # - Aligned frames 23-40 are TRANSITION: mix of warmup (raw 23-40) and user (raw 41+)
-    # - Aligned frames 41+ use only user tokens (pure user audio)
+    # With extended warmup (warmup_steps = max_delay * 3), the decoder has already
+    # processed all warmup AND transition frames during cache creation.
+    # On cache HIT, decoder is ready and we can emit on the first generation step.
     #
-    # The decoder was built from warmup, so it has processed aligned frames 0 to
-    # (start_step + 1 - max_delay - 1) = start_step - max_delay aligned frames.
-    # We need to continue decoding from there to keep state in sync.
-    #
-    # But we only OUTPUT audio starting from aligned frame (start_step + 1) to avoid
-    # ANY warmup tokens bleeding into the output.
+    # Both values are ALIGNED frame positions (not raw frame positions).
     last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # Where decoder left off
-    last_aligned_emitted = start_step + 1  # Where we start outputting (skip warmup+transition)
+    last_aligned_emitted = last_aligned_decoded - 1  # Emit starting from next frame
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
@@ -1257,8 +1247,7 @@ def run_streaming_generation_loop(
     print(f"[DEBUG STREAM] audio_buf.shape={generation.audio_buf.shape}, total_raw_frames={generation.audio_buf.shape[-1]}", file=sys.stderr)
     print(f"[DEBUG STREAM] start_step={start_step}, max_delay={max_delay}", file=sys.stderr)
     print(f"[DEBUG STREAM] last_aligned_decoded={last_aligned_decoded} (decoder state position)", file=sys.stderr)
-    print(f"[DEBUG STREAM] last_aligned_emitted={last_aligned_emitted} (output starts here, skipping warmup+transition)", file=sys.stderr)
-    print(f"[DEBUG STREAM] Will decode {last_aligned_emitted - last_aligned_decoded} transition frames before first output", file=sys.stderr)
+    print(f"[DEBUG STREAM] last_aligned_emitted={last_aligned_emitted} (emit from frame {last_aligned_emitted + 1})", file=sys.stderr)
     print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}, start_step={start_step}", file=sys.stderr)
 
     # Reset chunk diagnostics and WebM streamer for this generation session
