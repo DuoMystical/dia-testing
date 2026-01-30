@@ -260,7 +260,7 @@ document.addEventListener('DOMContentLoaded', () => {
         audioDuration.textContent = `${audioStreamer.getTotalDuration().toFixed(1)}s audio`;
 
         // Add chunk to list
-        addChunkToList(chunk.chunkIndex, duration);
+        addChunkToList(chunk.chunkIndex, chunkAudioMs);
 
         playPauseBtn.disabled = false;
     }
