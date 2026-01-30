@@ -49,6 +49,7 @@ class WebMOpusStreamer:
         self._output_buffer = None
         self._pts = 0  # Presentation timestamp
         self._initialized = False
+        self._bytes_returned = 0  # Track how many bytes we've already returned
 
     def _ensure_initialized(self):
         """Initialize the encoder on first use."""
@@ -70,6 +71,7 @@ class WebMOpusStreamer:
 
         self._initialized = True
         self._pts = 0
+        self._bytes_returned = 0
 
     def get_init_segment(self) -> bytes:
         """Get the WebM initialization segment (header).
@@ -95,11 +97,9 @@ class WebMOpusStreamer:
         """
         import numpy as np
         import av
+        import sys
 
         self._ensure_initialized()
-
-        # Remember position before encoding
-        start_pos = self._output_buffer.tell()
 
         # Clip and convert to format expected by encoder
         audio_np = np.clip(audio_np, -1.0, 1.0).astype(np.float32)
@@ -112,15 +112,28 @@ class WebMOpusStreamer:
         )
         frame.sample_rate = self.sample_rate
         frame.pts = self._pts
+
+        # Debug: log input
+        print(f"[WEBM DEBUG] encode_audio: input_samples={len(audio_np)}, pts={self._pts}, bytes_returned_before={self._bytes_returned}", file=sys.stderr)
+
         self._pts += len(audio_np)
 
         # Encode and mux
+        packets_encoded = 0
         for packet in self._stream.encode(frame):
+            packets_encoded += 1
             self._container.mux(packet)
 
-        # Get bytes written since start_pos
-        self._output_buffer.seek(start_pos)
-        new_bytes = self._output_buffer.read()
+        print(f"[WEBM DEBUG] encode_audio: packets_encoded={packets_encoded}", file=sys.stderr)
+
+        # Read all bytes from buffer and return only the new ones
+        self._output_buffer.seek(0)
+        all_bytes = self._output_buffer.read()
+        new_bytes = all_bytes[self._bytes_returned:]
+
+        print(f"[WEBM DEBUG] encode_audio: buffer_total={len(all_bytes)}, new_bytes={len(new_bytes)}", file=sys.stderr)
+
+        self._bytes_returned = len(all_bytes)
 
         return new_bytes
 
@@ -161,6 +174,7 @@ class WebMOpusStreamer:
         self._stream = None
         self._output_buffer = None
         self._pts = 0
+        self._bytes_returned = 0
 
 
 # Global streamer instance (reset per generation session)

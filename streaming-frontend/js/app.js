@@ -322,11 +322,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Add chunk indicator to list
-    function addChunkToList(index, duration) {
+    function addChunkToList(index, durationMs) {
         const item = document.createElement('div');
         item.className = 'chunk-item new';
         item.textContent = index + 1;
-        item.title = `Chunk ${index + 1}: ${duration.toFixed(2)}s`;
+        item.title = `Chunk ${index + 1}: ${durationMs.toFixed(0)}ms`;
         item.dataset.index = index;
 
         chunkList.appendChild(item);
