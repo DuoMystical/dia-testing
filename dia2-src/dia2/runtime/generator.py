@@ -62,8 +62,15 @@ class WebMOpusStreamer:
         # Create in-memory output buffer
         self._output_buffer = io.BytesIO()
 
-        # Create WebM container
-        self._container = av.open(self._output_buffer, mode='w', format='webm')
+        # Create WebM container with immediate flush settings
+        # cluster_time_limit forces a new cluster after this many microseconds,
+        # preventing the muxer from buffering multiple chunks worth of audio
+        self._container = av.open(
+            self._output_buffer,
+            mode='w',
+            format='webm',
+            options={'cluster_time_limit': '1'}  # 1 microsecond = flush immediately
+        )
 
         # Add Opus audio stream - layout determines channels (channels attr is read-only)
         self._stream = self._container.add_stream('libopus', rate=self.sample_rate)
