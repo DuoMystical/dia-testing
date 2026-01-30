@@ -144,6 +144,40 @@ class WebMOpusStreamer:
 
         return new_bytes
 
+    def prime_encoder(self, audio_np) -> None:
+        """Prime the encoder with audio samples, discarding the output.
+
+        This warms up the Opus encoder's predictive coding state so that
+        the first real audio chunk doesn't have a click/pop artifact.
+        """
+        import numpy as np
+        import av
+        import sys
+
+        self._ensure_initialized()
+
+        audio_np = np.clip(audio_np, -1.0, 1.0).astype(np.float32)
+
+        frame = av.AudioFrame.from_ndarray(
+            audio_np.reshape(1, -1),
+            format='flt',
+            layout='mono' if self.channels == 1 else 'stereo'
+        )
+        frame.sample_rate = self.sample_rate
+        frame.pts = self._pts
+        self._pts += len(audio_np)
+
+        # Encode and mux
+        for packet in self._stream.encode(frame):
+            self._container.mux(packet)
+
+        # Discard output by advancing _bytes_returned to current buffer position
+        self._output_buffer.seek(0)
+        all_bytes = self._output_buffer.read()
+        self._bytes_returned = len(all_bytes)
+
+        print(f"[WEBM DEBUG] prime_encoder: primed with {len(audio_np)} samples, discarded {len(all_bytes)} bytes", file=sys.stderr)
+
     def finalize(self) -> bytes:
         """Finalize the stream and return any remaining data."""
         import sys
@@ -1571,6 +1605,14 @@ def run_streaming_generation_loop(
                                 samples_per_frame = runtime.mimi.samples_per_frame
                                 samples_to_skip = frames_to_skip * samples_per_frame
                                 output_waveform = full_waveform[samples_to_skip:]
+
+                                # Prime the encoder with transition audio to prevent click at start
+                                if samples_to_skip > 0 and chunk_index == 0:
+                                    prime_samples = min(2000, samples_to_skip)
+                                    prime_start = samples_to_skip - prime_samples
+                                    prime_audio = full_waveform[prime_start:samples_to_skip]
+                                    streamer = get_webm_streamer(runtime.mimi.sample_rate)
+                                    streamer.prime_encoder(prime_audio.detach().cpu().numpy())
 
                                 # Debug: log waveform sizes
                                 if chunk_index < 5:
