@@ -537,12 +537,13 @@ async fn start_streaming_generation(
                                             "progress": progress
                                         }), false)
                                     }
-                                    TTSEvent::AudioChunk { data, chunk_index, timestamp_ms } => {
+                                    TTSEvent::AudioChunk { data, chunk_index, timestamp_ms, duration_ms } => {
                                         (serde_json::json!({
                                             "type": "audio",
                                             "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data),
                                             "chunk_index": chunk_index,
-                                            "timestamp_ms": timestamp_ms
+                                            "timestamp_ms": timestamp_ms,
+                                            "duration_ms": duration_ms
                                         }), false)
                                     }
                                     TTSEvent::Complete { total_chunks, total_duration_ms } => {

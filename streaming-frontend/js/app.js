@@ -231,10 +231,10 @@ document.addEventListener('DOMContentLoaded', () => {
         lastChunkReceiveTime = receiveTime;
 
         // Add chunk to streamer
-        const duration = await audioStreamer.addChunk(chunk.data, chunk.chunkIndex);
+        await audioStreamer.addChunk(chunk.data, chunk.chunkIndex);
 
-        // Calculate chunk audio duration in ms
-        const chunkAudioMs = duration * 1000;
+        // Use actual duration from server (in ms)
+        const chunkAudioMs = chunk.duration_ms || 0;
 
         // Track timing
         const timingData = {
@@ -435,7 +435,7 @@ document.addEventListener('DOMContentLoaded', () => {
             audioTopK: parseInt(audioTopKInput.value) || 50,
             textTemperature: parseFloat(textTempInput.value) || 0.6,
             textTopK: parseInt(textTopKInput.value) || 50,
-            cfgScale: parseFloat(cfgScaleInput.value) || 6.0,
+            cfgScale: parseFloat(cfgScaleInput.value) || 2.0,
             cfgFilterK: parseInt(cfgFilterKInput.value) || 50,
             chunkSizeFrames: parseInt(chunkSizeInput.value) || 1,
             minChunkFrames: parseInt(minChunkSizeInput.value) || 1,

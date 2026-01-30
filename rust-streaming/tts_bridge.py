@@ -71,12 +71,13 @@ def emit_status(message: str, progress: float):
     })
 
 
-def emit_audio(data: bytes, chunk_index: int, timestamp_ms: float):
+def emit_audio(data: bytes, chunk_index: int, timestamp_ms: float, duration_ms: float):
     emit_event({
         "type": "audio_chunk",
         "data": base64.b64encode(data).decode('utf-8'),
         "chunk_index": chunk_index,
         "timestamp_ms": timestamp_ms,
+        "duration_ms": duration_ms,
     })
 
 
@@ -264,7 +265,7 @@ def process_request(request: dict):
                 temperature=config_overrides.get("audio_temperature", 0.8),
                 top_k=config_overrides.get("audio_top_k", 50),
             ),
-            cfg_scale=config_overrides.get("cfg_scale", 6.0),
+            cfg_scale=config_overrides.get("cfg_scale", 2.0),
             cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
             initial_padding=19,  # Must be >= max_delay (18) for caching
             use_cuda_graph=True,
@@ -334,7 +335,7 @@ def process_request(request: dict):
             # Create state with warmup phrase entries
             # This exercises many phonemes while conditioning the voice.
             # S2 interjection creates a natural sentence boundary before user text.
-            WARMUP_PHRASE = "[S1] The quick brown fox jumps over the lazy dog near the old bridge. [S2] Nice."
+            WARMUP_PHRASE = "[S1] Hello! This is a streaming TTS demo."
             warmup_entries = parse_script([WARMUP_PHRASE], runtime.tokenizer, runtime.constants, runtime.frame_rate)
 
             # Set initial_padding to 2 (original Dia default) for proper padding structure:
@@ -400,7 +401,7 @@ def process_request(request: dict):
                     first_audio_time = elapsed
                     print(f"[TIMING] First audio chunk at {first_audio_time*1000:.0f}ms", file=sys.stderr)
 
-                emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
+                emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms, event.duration_ms)
 
             elif isinstance(event, StatusEvent):
                 emit_status(event.message, event.progress)

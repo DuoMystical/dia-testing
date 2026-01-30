@@ -1144,7 +1144,8 @@ def run_streaming_generation_loop(
     decoder_state = None
 
     # Track aligned frames we've already emitted (after undelay)
-    last_aligned_emitted = 0
+    # Skip warmup audio - start emitting from after warmup aligned frames
+    last_aligned_emitted = max(0, start_step - max_delay)
 
     # Calculate approximate frame rate for timing
     frame_rate = getattr(runtime, 'frame_rate', 75.0)
@@ -1188,6 +1189,9 @@ def run_streaming_generation_loop(
                 if first_step_time is None:
                     first_step_time = step_start
                     print(f"[TIMING] First step started at {(step_start - generation_start_time)*1000:.0f}ms", file=sys.stderr)
+
+                # Log first 5 steps for debugging first chunk latency
+                log_this_step = offset < 5
 
                 if use_torch_compile:
                     torch.compiler.cudagraph_mark_step_begin()
@@ -1248,12 +1252,15 @@ def run_streaming_generation_loop(
                     torch.cuda.synchronize()
 
                 t1 = time.time()
+                transformer_elapsed = t1 - t0
                 if is_graph_capture:
-                    timing_stats['cuda_graph_capture'] += (t1 - t0)
-                    print(f"[TIMING] CUDA graph capture took {(t1-t0)*1000:.0f}ms", file=sys.stderr)
+                    timing_stats['cuda_graph_capture'] += transformer_elapsed
+                    print(f"[TIMING] CUDA graph capture took {transformer_elapsed*1000:.0f}ms", file=sys.stderr)
                     cuda_graph_captured = True
                 else:
-                    timing_stats['transformer_step'] += (t1 - t0)
+                    timing_stats['transformer_step'] += transformer_elapsed
+                    if log_this_step:
+                        print(f"[TIMING] Step {offset}: transformer={transformer_elapsed*1000:.1f}ms", file=sys.stderr)
 
                 # Text token sampling (now accurately timed - transformer already synced)
                 t0 = time.time()
@@ -1374,7 +1381,12 @@ def run_streaming_generation_loop(
                     torch.cuda.synchronize()
 
                 t1 = time.time()
-                timing_stats['depformer_stages'] += (t1 - t0)
+                depformer_elapsed = t1 - t0
+                timing_stats['depformer_stages'] += depformer_elapsed
+
+                if log_this_step:
+                    step_total = (t1 - step_start) * 1000
+                    print(f"[TIMING] Step {offset}: depformer={depformer_elapsed*1000:.1f}ms, step_total={step_total:.1f}ms @ {(t1 - generation_start_time)*1000:.0f}ms", file=sys.stderr)
 
                 last_step = t
                 timing_stats['step_count'] += 1
@@ -1409,6 +1421,9 @@ def run_streaming_generation_loop(
                     # 2. Start new decode on decode_stream (async)
                     # 3. Store waveform for next iteration
 
+                    if log_this_step:
+                        print(f"[TIMING] Step {offset}: should_emit_chunk=True, new_aligned={new_aligned_frames}, pending={pending_decode is not None} @ {(time.time() - generation_start_time)*1000:.0f}ms", file=sys.stderr)
+
                     # Step 1: Yield pending chunk from previous async decode
                     if pending_decode is not None:
                         prev_waveform, prev_idx, prev_ts = pending_decode
@@ -1421,10 +1436,15 @@ def run_streaming_generation_loop(
                                 audio_bytes = _encode_webm_chunk(prev_waveform, runtime.mimi.sample_rate)
                                 chunk_duration_ms = (prev_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
+                                if not first_chunk_emitted:
+                                    print(f"[TIMING] First audio chunk at {(time.time() - generation_start_time)*1000:.0f}ms (chunk_idx={prev_idx}, bytes={len(audio_bytes)})", file=sys.stderr)
+                                    first_chunk_emitted = True
+
                                 yield AudioChunkEvent(
                                     audio_data=audio_bytes,
                                     chunk_index=prev_idx,
                                     timestamp_ms=prev_ts,
+                                    duration_ms=chunk_duration_ms,
                                 )
                                 total_audio_ms += chunk_duration_ms
 
@@ -1455,6 +1475,7 @@ def run_streaming_generation_loop(
                         if aligned_chunk.shape[-1] > 0:
                             try:
                                 t0 = time.time()
+                                is_first_decode = (chunk_index == 0)
                                 if decode_stream is not None:
                                     with torch.cuda.stream(decode_stream):
                                         chunk_waveform, decoder_state = decode_audio_streaming(
@@ -1469,15 +1490,23 @@ def run_streaming_generation_loop(
                                     if chunk_waveform.numel() > 0:
                                         audio_bytes = _encode_webm_chunk(chunk_waveform, runtime.mimi.sample_rate)
                                         chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
+
+                                        if not first_chunk_emitted:
+                                            print(f"[TIMING] First audio chunk at {(time.time() - generation_start_time)*1000:.0f}ms (chunk_idx={chunk_index}, bytes={len(audio_bytes)})", file=sys.stderr)
+                                            first_chunk_emitted = True
+
                                         yield AudioChunkEvent(
                                             audio_data=audio_bytes,
                                             chunk_index=chunk_index,
                                             timestamp_ms=total_audio_ms,
+                                            duration_ms=chunk_duration_ms,
                                         )
                                         total_audio_ms += chunk_duration_ms
                                         chunk_index += 1
 
                                 t1 = time.time()
+                                if is_first_decode:
+                                    print(f"[TIMING] First decode took {(t1-t0)*1000:.1f}ms (async={decode_stream is not None}) @ {(t1 - generation_start_time)*1000:.0f}ms", file=sys.stderr)
 
                             except Exception as e:
                                 if logger:
@@ -1510,6 +1539,7 @@ def run_streaming_generation_loop(
                         audio_data=audio_bytes,
                         chunk_index=prev_idx,
                         timestamp_ms=prev_ts,
+                        duration_ms=chunk_duration_ms,
                     )
                     total_audio_ms += chunk_duration_ms
 
@@ -1551,6 +1581,7 @@ def run_streaming_generation_loop(
                                     audio_data=audio_bytes,
                                     chunk_index=chunk_index,
                                     timestamp_ms=total_audio_ms,
+                                    duration_ms=chunk_duration_ms,
                                 )
                                 total_audio_ms += chunk_duration_ms
                                 chunk_index += 1
