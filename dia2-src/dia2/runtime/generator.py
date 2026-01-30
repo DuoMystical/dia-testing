@@ -1205,13 +1205,18 @@ def run_streaming_generation_loop(
     # Use provided state (from warmup cache) or start fresh
     #
     # We track TWO separate positions:
-    # 1. last_aligned_decoded - where the decoder has processed up to
-    # 2. last_aligned_emitted - what audio we've outputted (aligned frame position)
+    # 1. last_aligned_decoded - where the decoder has processed up to (aligned frame index)
+    # 2. last_aligned_emitted - what audio we've outputted (aligned frame index)
     #
     # The decoder was primed during warmup with aligned frames 0 to (start_step - max_delay).
-    # We skip outputting warmup audio by setting last_aligned_emitted appropriately.
+    # To avoid outputting warmup audio, we skip until we have pure user audio.
+    #
+    # Aligned frame N uses raw tokens from positions N to N+max_delay. At step t, we write
+    # to position t+1, so warmup (steps 0 to start_step-1) writes positions 1 to start_step.
+    # First user token is at position start_step+1. For PURE user audio, we need N > start_step.
+    # Set last_aligned_emitted = start_step so we output starting from aligned frame start_step+1.
     last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # Where decoder left off
-    last_aligned_emitted = last_aligned_decoded - 1  # Emit immediately on first step
+    last_aligned_emitted = start_step  # Skip warmup, output pure user audio from frame start_step+1
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
