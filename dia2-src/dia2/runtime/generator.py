@@ -144,28 +144,66 @@ class WebMOpusStreamer:
 
         return new_bytes
 
+    def prime_encoder(self, audio_np) -> None:
+        """Prime the encoder with audio samples, discarding the output.
+
+        This warms up the Opus encoder's predictive coding state so that
+        the first real audio chunk doesn't have a click/pop artifact.
+        """
+        import numpy as np
+        import av
+        import sys
+
+        self._ensure_initialized()
+
+        audio_np = np.clip(audio_np, -1.0, 1.0).astype(np.float32)
+
+        frame = av.AudioFrame.from_ndarray(
+            audio_np.reshape(1, -1),
+            format='flt',
+            layout='mono' if self.channels == 1 else 'stereo'
+        )
+        frame.sample_rate = self.sample_rate
+        frame.pts = self._pts
+        self._pts += len(audio_np)
+
+        # Encode and mux
+        for packet in self._stream.encode(frame):
+            self._container.mux(packet)
+
+        # Discard output by advancing _bytes_returned to current buffer position
+        self._output_buffer.seek(0)
+        all_bytes = self._output_buffer.read()
+        self._bytes_returned = len(all_bytes)
+
+        print(f"[WEBM DEBUG] prime_encoder: primed with {len(audio_np)} samples, discarded {len(all_bytes)} bytes", file=sys.stderr)
+
     def finalize(self) -> bytes:
         """Finalize the stream and return any remaining data."""
+        import sys
+
         if not self._initialized:
             return b""
-
-        start_pos = self._output_buffer.tell()
 
         # Flush encoder
         for packet in self._stream.encode(None):
             self._container.mux(packet)
 
-        # Close container
+        # Close container to finalize the WebM file
         self._container.close()
 
-        # Get remaining bytes
-        self._output_buffer.seek(start_pos)
-        final_bytes = self._output_buffer.read()
+        # Get only the NEW bytes (after what we've already returned)
+        self._output_buffer.seek(0)
+        all_bytes = self._output_buffer.read()
+        final_bytes = all_bytes[self._bytes_returned:]
+
+        print(f"[WEBM DEBUG] finalize: buffer_total={len(all_bytes)}, new_bytes={len(final_bytes)}", file=sys.stderr)
 
         self._initialized = False
         self._container = None
         self._stream = None
         self._output_buffer = None
+        self._bytes_returned = 0
 
         return final_bytes
 
@@ -1168,25 +1206,15 @@ def run_streaming_generation_loop(
     #
     # We track TWO separate positions:
     # 1. last_aligned_decoded - where the decoder has processed up to
-    #    (starts at warmup aligned frames, needed to keep decoder state in sync)
-    # 2. last_aligned_emitted - what audio we've outputted
-    #    (starts AFTER transition frames to avoid warmup audio bleed)
+    # 2. last_aligned_emitted - where we start outputting from
     #
-    # With max_delay=18 and warmup_steps=40:
-    # - Raw frames 0-40 are warmup tokens
-    # - Aligned frame N uses raw frames N through N+18 (due to codebook delays)
-    # - Aligned frames 0-22 use only warmup tokens
-    # - Aligned frames 23-40 are TRANSITION: mix of warmup (raw 23-40) and user (raw 41+)
-    # - Aligned frames 41+ use only user tokens (pure user audio)
+    # With extended warmup (warmup_steps = max_delay * 3), the decoder has already
+    # processed all warmup AND transition frames during cache creation.
+    # On cache HIT, decoder is ready and we can emit on the first generation step.
     #
-    # The decoder was built from warmup, so it has processed aligned frames 0 to
-    # (start_step + 1 - max_delay - 1) = start_step - max_delay aligned frames.
-    # We need to continue decoding from there to keep state in sync.
-    #
-    # But we only OUTPUT audio starting from aligned frame (start_step + 1) to avoid
-    # ANY warmup tokens bleeding into the output.
+    # Both values are ALIGNED frame positions (not raw frame positions).
     last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # Where decoder left off
-    last_aligned_emitted = start_step + 1  # Where we start outputting (skip warmup+transition)
+    last_aligned_emitted = last_aligned_decoded - 1  # Emit starting from next frame
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
@@ -1219,8 +1247,7 @@ def run_streaming_generation_loop(
     print(f"[DEBUG STREAM] audio_buf.shape={generation.audio_buf.shape}, total_raw_frames={generation.audio_buf.shape[-1]}", file=sys.stderr)
     print(f"[DEBUG STREAM] start_step={start_step}, max_delay={max_delay}", file=sys.stderr)
     print(f"[DEBUG STREAM] last_aligned_decoded={last_aligned_decoded} (decoder state position)", file=sys.stderr)
-    print(f"[DEBUG STREAM] last_aligned_emitted={last_aligned_emitted} (output starts here, skipping warmup+transition)", file=sys.stderr)
-    print(f"[DEBUG STREAM] Will decode {last_aligned_emitted - last_aligned_decoded} transition frames before first output", file=sys.stderr)
+    print(f"[DEBUG STREAM] last_aligned_emitted={last_aligned_emitted} (emit from frame {last_aligned_emitted + 1})", file=sys.stderr)
     print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}, start_step={start_step}", file=sys.stderr)
 
     # Reset chunk diagnostics and WebM streamer for this generation session
@@ -1568,6 +1595,14 @@ def run_streaming_generation_loop(
                                 samples_to_skip = frames_to_skip * samples_per_frame
                                 output_waveform = full_waveform[samples_to_skip:]
 
+                                # Prime the encoder with transition audio to prevent click at start
+                                if samples_to_skip > 0 and chunk_index == 0:
+                                    prime_samples = min(2000, samples_to_skip)
+                                    prime_start = samples_to_skip - prime_samples
+                                    prime_audio = full_waveform[prime_start:samples_to_skip]
+                                    streamer = get_webm_streamer(runtime.mimi.sample_rate)
+                                    streamer.prime_encoder(prime_audio.detach().cpu().numpy())
+
                                 # Debug: log waveform sizes
                                 if chunk_index < 5:
                                     full_samples = full_waveform.numel()
@@ -1716,6 +1751,19 @@ def run_streaming_generation_loop(
 
         # Save concatenated debug audio if enabled
         save_debug_concatenated()
+
+        # Finalize the WebM stream to flush any remaining audio in the Opus encoder
+        streamer = get_webm_streamer(runtime.mimi.sample_rate)
+        final_bytes = streamer.finalize()
+        if final_bytes and len(final_bytes) > 0:
+            print(f"[DEBUG END] Finalized WebM stream, got {len(final_bytes)} bytes", file=sys.stderr)
+            yield AudioChunkEvent(
+                audio_data=final_bytes,
+                chunk_index=chunk_index,
+                timestamp_ms=total_audio_ms,
+                duration_ms=0,  # Duration unknown for finalization data
+            )
+            chunk_index += 1
 
         # Emit completion event
         yield CompleteEvent(
