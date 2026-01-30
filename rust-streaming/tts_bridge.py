@@ -443,16 +443,12 @@ def process_request(request: dict):
             # Get max_delay for minimum warmup steps (codec alignment requirement)
             max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
 
-            # Run warmup long enough to cover transition frames
-            # We need warmup_steps + max_delay raw frames so decoder can process
-            # all frames up to the point where pure user audio starts.
-            # This way, on cache HIT, first generation step emits immediately.
-            min_warmup = max_delay * 3  # ~54 steps covers warmup + transition
+            # Run warmup until phrase is consumed, minimum max_delay+1 steps
             gen_state, warmup_steps = run_seed_warmup(
                 runtime,
                 gen_state,
                 gen_config,
-                min_steps=min_warmup,
+                min_steps=max_delay + 1,  # Must be > max_delay for codec
                 warmup_state=state,  # Use the SAME state that will continue for user text
             )
             start_step = warmup_steps
