@@ -18,6 +18,7 @@ class AudioChunkEvent:
     audio_data: bytes  # WAV chunk
     chunk_index: int
     timestamp_ms: float
+    duration_ms: float = 0.0  # Actual audio duration in this chunk
 
 
 @dataclass(frozen=True)

@@ -30,6 +30,7 @@ pub enum TTSEvent {
         data: Vec<u8>,
         chunk_index: u32,
         timestamp_ms: f64,
+        duration_ms: f64,
     },
     Complete {
         total_chunks: u32,
@@ -58,6 +59,7 @@ struct PythonEvent {
     data: Option<String>, // base64 encoded
     chunk_index: Option<u32>,
     timestamp_ms: Option<f64>,
+    duration_ms: Option<f64>,
     // Complete fields
     total_chunks: Option<u32>,
     total_duration_ms: Option<f64>,
@@ -308,6 +310,7 @@ fn parse_python_event(event: PythonEvent) -> TTSEvent {
                 data,
                 chunk_index: event.chunk_index.unwrap_or(0),
                 timestamp_ms: event.timestamp_ms.unwrap_or(0.0),
+                duration_ms: event.duration_ms.unwrap_or(0.0),
             }
         }
         "complete" => TTSEvent::Complete {
