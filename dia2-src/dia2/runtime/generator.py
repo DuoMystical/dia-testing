@@ -146,26 +146,30 @@ class WebMOpusStreamer:
 
     def finalize(self) -> bytes:
         """Finalize the stream and return any remaining data."""
+        import sys
+
         if not self._initialized:
             return b""
-
-        start_pos = self._output_buffer.tell()
 
         # Flush encoder
         for packet in self._stream.encode(None):
             self._container.mux(packet)
 
-        # Close container
+        # Close container to finalize the WebM file
         self._container.close()
 
-        # Get remaining bytes
-        self._output_buffer.seek(start_pos)
-        final_bytes = self._output_buffer.read()
+        # Get only the NEW bytes (after what we've already returned)
+        self._output_buffer.seek(0)
+        all_bytes = self._output_buffer.read()
+        final_bytes = all_bytes[self._bytes_returned:]
+
+        print(f"[WEBM DEBUG] finalize: buffer_total={len(all_bytes)}, new_bytes={len(final_bytes)}", file=sys.stderr)
 
         self._initialized = False
         self._container = None
         self._stream = None
         self._output_buffer = None
+        self._bytes_returned = 0
 
         return final_bytes
 
@@ -1716,6 +1720,19 @@ def run_streaming_generation_loop(
 
         # Save concatenated debug audio if enabled
         save_debug_concatenated()
+
+        # Finalize the WebM stream to flush any remaining audio in the Opus encoder
+        streamer = get_webm_streamer(runtime.mimi.sample_rate)
+        final_bytes = streamer.finalize()
+        if final_bytes and len(final_bytes) > 0:
+            print(f"[DEBUG END] Finalized WebM stream, got {len(final_bytes)} bytes", file=sys.stderr)
+            yield AudioChunkEvent(
+                audio_data=final_bytes,
+                chunk_index=chunk_index,
+                timestamp_ms=total_audio_ms,
+                duration_ms=0,  # Duration unknown for finalization data
+            )
+            chunk_index += 1
 
         # Emit completion event
         yield CompleteEvent(
