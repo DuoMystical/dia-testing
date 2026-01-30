@@ -243,7 +243,8 @@ class WebSocketClient {
                     this.onAudioChunk({
                         data: audioBytes,
                         chunkIndex: data.chunk_index,
-                        timestampMs: data.timestamp_ms
+                        timestampMs: data.timestamp_ms,
+                        duration_ms: data.duration_ms
                     });
                     break;
 

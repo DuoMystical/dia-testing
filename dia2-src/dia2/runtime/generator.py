@@ -49,6 +49,7 @@ class WebMOpusStreamer:
         self._output_buffer = None
         self._pts = 0  # Presentation timestamp
         self._initialized = False
+        self._bytes_returned = 0  # Track how many bytes we've already returned
 
     def _ensure_initialized(self):
         """Initialize the encoder on first use."""
@@ -70,6 +71,7 @@ class WebMOpusStreamer:
 
         self._initialized = True
         self._pts = 0
+        self._bytes_returned = 0
 
     def get_init_segment(self) -> bytes:
         """Get the WebM initialization segment (header).
@@ -98,9 +100,6 @@ class WebMOpusStreamer:
 
         self._ensure_initialized()
 
-        # Remember position before encoding
-        start_pos = self._output_buffer.tell()
-
         # Clip and convert to format expected by encoder
         audio_np = np.clip(audio_np, -1.0, 1.0).astype(np.float32)
 
@@ -118,9 +117,12 @@ class WebMOpusStreamer:
         for packet in self._stream.encode(frame):
             self._container.mux(packet)
 
-        # Get bytes written since start_pos
-        self._output_buffer.seek(start_pos)
-        new_bytes = self._output_buffer.read()
+        # Read all bytes from buffer and return only the new ones
+        # This avoids issues with buffer position tracking
+        self._output_buffer.seek(0)
+        all_bytes = self._output_buffer.read()
+        new_bytes = all_bytes[self._bytes_returned:]
+        self._bytes_returned = len(all_bytes)
 
         return new_bytes
 
@@ -161,6 +163,7 @@ class WebMOpusStreamer:
         self._stream = None
         self._output_buffer = None
         self._pts = 0
+        self._bytes_returned = 0
 
 
 # Global streamer instance (reset per generation session)
