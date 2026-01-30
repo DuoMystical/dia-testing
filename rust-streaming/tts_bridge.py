@@ -389,6 +389,15 @@ def process_request(request: dict):
             state = state.clone()
             decoder_state = _clone_decoder_state(cached_decoder_state)
 
+            # Debug: log restored state info
+            max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
+            print(f"[DEBUG HIT] warmup_steps={warmup_steps}, max_delay={max_delay}", file=sys.stderr)
+            print(f"[DEBUG HIT] gen_state.audio_buf.shape={gen_state.audio_buf.shape}", file=sys.stderr)
+            if decoder_state is not None:
+                print(f"[DEBUG HIT] decoder_state.kv_cache type={type(decoder_state.kv_cache).__name__}", file=sys.stderr)
+                if decoder_state.kv_cache is not None and hasattr(decoder_state.kv_cache, 'get_seq_length'):
+                    print(f"[DEBUG HIT] decoder_state.kv_cache.get_seq_length()={decoder_state.kv_cache.get_seq_length()}", file=sys.stderr)
+
             # Restore RNG state to match post-warmup state
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
@@ -447,12 +456,20 @@ def process_request(request: dict):
             # Build decoder state by decoding warmup audio (discard the audio, keep the state)
             # This primes the Mimi decoder's convolutional padding cache
             warmup_codes = gen_state.audio_buf[0, :, :warmup_steps + 1]  # (codebooks, steps)
+            print(f"[DEBUG WARMUP] warmup_steps={warmup_steps}, raw_frames={warmup_codes.shape[-1]}, max_delay={max_delay}", file=sys.stderr)
             aligned_warmup = undelay_frames(
                 warmup_codes,
                 runtime.audio_delays,
                 runtime.constants.audio_pad,
             ).unsqueeze(0)  # (1, codebooks, aligned_frames)
-            _, decoder_state = decode_audio_streaming(runtime, aligned_warmup, None)
+            print(f"[DEBUG WARMUP] aligned_warmup.shape={aligned_warmup.shape}, aligned_frames={aligned_warmup.shape[-1]}", file=sys.stderr)
+            warmup_audio, decoder_state = decode_audio_streaming(runtime, aligned_warmup, None)
+            warmup_audio_samples = warmup_audio.numel() if warmup_audio is not None else 0
+            warmup_audio_ms = (warmup_audio_samples / 24000) * 1000 if warmup_audio_samples > 0 else 0
+            print(f"[DEBUG WARMUP] Decoded warmup: {warmup_audio_samples} samples = {warmup_audio_ms:.1f}ms audio", file=sys.stderr)
+            print(f"[DEBUG WARMUP] decoder_state.kv_cache type={type(decoder_state.kv_cache).__name__}", file=sys.stderr)
+            if decoder_state.kv_cache is not None and hasattr(decoder_state.kv_cache, 'get_seq_length'):
+                print(f"[DEBUG WARMUP] decoder_state.kv_cache.get_seq_length()={decoder_state.kv_cache.get_seq_length()}", file=sys.stderr)
             print(f"[CACHE] Built decoder state from {aligned_warmup.shape[-1]} aligned warmup frames", file=sys.stderr)
 
             # Cache BOTH gen_state AND state (with warmup entries consumed)

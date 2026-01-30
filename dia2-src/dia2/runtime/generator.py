@@ -1149,6 +1149,14 @@ def run_streaming_generation_loop(
     # Skip warmup audio - start emitting from after warmup aligned frames
     last_aligned_emitted = max(0, start_step - max_delay)
 
+    # DEBUG: Log decoder_state info at start
+    print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
+    if decoder_state is not None:
+        print(f"[DEBUG STREAM] decoder_state.kv_cache: {type(decoder_state.kv_cache).__name__ if decoder_state.kv_cache else None}", file=sys.stderr)
+        if decoder_state.kv_cache is not None and hasattr(decoder_state.kv_cache, 'get_seq_length'):
+            print(f"[DEBUG STREAM] decoder_state.kv_cache.get_seq_length()={decoder_state.kv_cache.get_seq_length()}", file=sys.stderr)
+        print(f"[DEBUG STREAM] decoder_state.padding_cache: {decoder_state.padding_cache is not None}", file=sys.stderr)
+
     # Calculate approximate frame rate for timing
     frame_rate = getattr(runtime, 'frame_rate', 75.0)
     ms_per_frame = 1000.0 / frame_rate
@@ -1169,6 +1177,8 @@ def run_streaming_generation_loop(
     first_chunk_emitted = False
     first_chunk_timing = {}  # Detailed timing for first chunk
 
+    print(f"[DEBUG STREAM] start_step={start_step}, max_delay={max_delay}, last_aligned_emitted={last_aligned_emitted}", file=sys.stderr)
+    print(f"[DEBUG STREAM] Formula: last_aligned_emitted = max(0, {start_step} - {max_delay}) = {last_aligned_emitted}", file=sys.stderr)
     print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}, start_step={start_step}, last_aligned_emitted={last_aligned_emitted}", file=sys.stderr)
 
     # Reset chunk diagnostics and WebM streamer for this generation session
@@ -1476,8 +1486,11 @@ def run_streaming_generation_loop(
 
                         if aligned_chunk.shape[-1] > 0:
                             # Debug: log decode range for first few chunks
-                            if chunk_index < 3:
-                                print(f"[DEBUG] Decode chunk {chunk_index}: aligned[{last_aligned_emitted}:{current_aligned_end}] = {aligned_chunk.shape[-1]} frames, decoder_state={decoder_state is not None}", file=sys.stderr)
+                            if chunk_index < 5:
+                                print(f"[DEBUG DECODE] chunk {chunk_index}: t={t}, current_frame={current_frame}, full_tokens[:,:,:{current_frame+1}].shape[-1]={current_frame+1}", file=sys.stderr)
+                                print(f"[DEBUG DECODE] chunk {chunk_index}: aligned_full.shape={aligned_full.shape}, current_aligned_end={current_aligned_end}", file=sys.stderr)
+                                print(f"[DEBUG DECODE] chunk {chunk_index}: decoding aligned[{last_aligned_emitted}:{current_aligned_end}] = {aligned_chunk.shape[-1]} frames", file=sys.stderr)
+                                print(f"[DEBUG DECODE] chunk {chunk_index}: decoder_state.kv_cache={type(decoder_state.kv_cache).__name__ if decoder_state and decoder_state.kv_cache else None}", file=sys.stderr)
                             try:
                                 t0 = time.time()
                                 is_first_decode = (chunk_index == 0)
@@ -1486,12 +1499,22 @@ def run_streaming_generation_loop(
                                         chunk_waveform, decoder_state = decode_audio_streaming(
                                             runtime, aligned_chunk, decoder_state
                                         )
+                                    # Debug: log waveform size for first chunks
+                                    if chunk_index < 5:
+                                        waveform_samples = chunk_waveform.numel()
+                                        waveform_ms = (waveform_samples / runtime.mimi.sample_rate) * 1000
+                                        print(f"[DEBUG DECODE] chunk {chunk_index}: waveform output = {waveform_samples} samples = {waveform_ms:.1f}ms", file=sys.stderr)
                                     pending_decode = (chunk_waveform, chunk_index, total_audio_ms)
                                     chunk_index += 1
                                 else:
                                     chunk_waveform, decoder_state = decode_audio_streaming(
                                         runtime, aligned_chunk, decoder_state
                                     )
+                                    # Debug: log waveform size for first chunks
+                                    if chunk_index < 5:
+                                        waveform_samples = chunk_waveform.numel()
+                                        waveform_ms = (waveform_samples / runtime.mimi.sample_rate) * 1000
+                                        print(f"[DEBUG DECODE] chunk {chunk_index}: waveform output = {waveform_samples} samples = {waveform_ms:.1f}ms", file=sys.stderr)
                                     if chunk_waveform.numel() > 0:
                                         audio_bytes = _encode_webm_chunk(chunk_waveform, runtime.mimi.sample_rate)
                                         chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
