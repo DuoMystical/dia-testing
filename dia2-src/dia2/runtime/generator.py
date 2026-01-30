@@ -97,6 +97,7 @@ class WebMOpusStreamer:
         """
         import numpy as np
         import av
+        import sys
 
         self._ensure_initialized()
 
@@ -111,17 +112,27 @@ class WebMOpusStreamer:
         )
         frame.sample_rate = self.sample_rate
         frame.pts = self._pts
+
+        # Debug: log input
+        print(f"[WEBM DEBUG] encode_audio: input_samples={len(audio_np)}, pts={self._pts}, bytes_returned_before={self._bytes_returned}", file=sys.stderr)
+
         self._pts += len(audio_np)
 
         # Encode and mux
+        packets_encoded = 0
         for packet in self._stream.encode(frame):
+            packets_encoded += 1
             self._container.mux(packet)
 
+        print(f"[WEBM DEBUG] encode_audio: packets_encoded={packets_encoded}", file=sys.stderr)
+
         # Read all bytes from buffer and return only the new ones
-        # This avoids issues with buffer position tracking
         self._output_buffer.seek(0)
         all_bytes = self._output_buffer.read()
         new_bytes = all_bytes[self._bytes_returned:]
+
+        print(f"[WEBM DEBUG] encode_audio: buffer_total={len(all_bytes)}, new_bytes={len(new_bytes)}", file=sys.stderr)
+
         self._bytes_returned = len(all_bytes)
 
         return new_bytes
