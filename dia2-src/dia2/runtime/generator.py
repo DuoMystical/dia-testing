@@ -1213,10 +1213,14 @@ def run_streaming_generation_loop(
     #
     # Aligned frame N uses raw tokens from positions N to N+max_delay. At step t, we write
     # to position t+1, so warmup (steps 0 to start_step-1) writes positions 1 to start_step.
-    # First user token is at position start_step+1. For PURE user audio, we need N > start_step.
-    # Set last_aligned_emitted = start_step so we output starting from aligned frame start_step+1.
+    # First user token is at position start_step+1 (written at step start_step).
+    #
+    # Frame last_aligned_decoded uses tokens [last_aligned_decoded, last_aligned_decoded+max_delay].
+    # With start_step=36, max_delay=18: last_aligned_decoded=19, uses tokens 19-36 = ALL warmup.
+    # Frame 20 uses tokens 20-37, which INCLUDES the first user token (37).
+    # Set last_aligned_emitted = last_aligned_decoded + 1 to skip the pure-warmup frame.
     last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # Where decoder left off
-    last_aligned_emitted = start_step  # Skip warmup, output pure user audio from frame start_step+1
+    last_aligned_emitted = last_aligned_decoded + 1  # Skip pure-warmup frame, output from first user-influenced frame
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
