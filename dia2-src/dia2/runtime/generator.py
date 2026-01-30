@@ -1177,8 +1177,12 @@ def run_streaming_generation_loop(
     first_chunk_emitted = False
     first_chunk_timing = {}  # Detailed timing for first chunk
 
+    print(f"[DEBUG STREAM] audio_buf.shape={generation.audio_buf.shape}, total_raw_frames={generation.audio_buf.shape[-1]}", file=sys.stderr)
     print(f"[DEBUG STREAM] start_step={start_step}, max_delay={max_delay}, last_aligned_emitted={last_aligned_emitted}", file=sys.stderr)
     print(f"[DEBUG STREAM] Formula: last_aligned_emitted = max(0, {start_step} - {max_delay}) = {last_aligned_emitted}", file=sys.stderr)
+    # Calculate what aligned frames SHOULD be available at start
+    initial_aligned = max(0, (start_step + 1) - max_delay)
+    print(f"[DEBUG STREAM] Expected aligned frames at start: (start_step+1) - max_delay = ({start_step}+1) - {max_delay} = {initial_aligned}", file=sys.stderr)
     print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}, start_step={start_step}, last_aligned_emitted={last_aligned_emitted}", file=sys.stderr)
 
     # Reset chunk diagnostics and WebM streamer for this generation session
