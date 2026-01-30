@@ -1144,10 +1144,28 @@ def run_streaming_generation_loop(
 
     # Decoder state for maintaining continuity between audio chunks
     # Use provided state (from warmup cache) or start fresh
-
-    # Track aligned frames we've already emitted (after undelay)
-    # Skip warmup audio - start emitting from after warmup aligned frames
-    last_aligned_emitted = max(0, start_step - max_delay)
+    #
+    # We track TWO separate positions:
+    # 1. last_aligned_decoded - where the decoder has processed up to
+    #    (starts at warmup aligned frames, needed to keep decoder state in sync)
+    # 2. last_aligned_emitted - what audio we've outputted
+    #    (starts AFTER transition frames to avoid warmup audio bleed)
+    #
+    # With max_delay=18 and warmup_steps=40:
+    # - Raw frames 0-40 are warmup tokens
+    # - Aligned frame N uses raw frames N through N+18 (due to codebook delays)
+    # - Aligned frames 0-22 use only warmup tokens
+    # - Aligned frames 23-40 are TRANSITION: mix of warmup (raw 23-40) and user (raw 41+)
+    # - Aligned frames 41+ use only user tokens (pure user audio)
+    #
+    # The decoder was built from warmup, so it has processed aligned frames 0 to
+    # (start_step + 1 - max_delay - 1) = start_step - max_delay aligned frames.
+    # We need to continue decoding from there to keep state in sync.
+    #
+    # But we only OUTPUT audio starting from aligned frame (start_step + 1) to avoid
+    # ANY warmup tokens bleeding into the output.
+    last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # Where decoder left off
+    last_aligned_emitted = start_step + 1  # Where we start outputting (skip warmup+transition)
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
@@ -1178,12 +1196,11 @@ def run_streaming_generation_loop(
     first_chunk_timing = {}  # Detailed timing for first chunk
 
     print(f"[DEBUG STREAM] audio_buf.shape={generation.audio_buf.shape}, total_raw_frames={generation.audio_buf.shape[-1]}", file=sys.stderr)
-    print(f"[DEBUG STREAM] start_step={start_step}, max_delay={max_delay}, last_aligned_emitted={last_aligned_emitted}", file=sys.stderr)
-    print(f"[DEBUG STREAM] Formula: last_aligned_emitted = max(0, {start_step} - {max_delay}) = {last_aligned_emitted}", file=sys.stderr)
-    # Calculate what aligned frames SHOULD be available at start
-    initial_aligned = max(0, (start_step + 1) - max_delay)
-    print(f"[DEBUG STREAM] Expected aligned frames at start: (start_step+1) - max_delay = ({start_step}+1) - {max_delay} = {initial_aligned}", file=sys.stderr)
-    print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}, start_step={start_step}, last_aligned_emitted={last_aligned_emitted}", file=sys.stderr)
+    print(f"[DEBUG STREAM] start_step={start_step}, max_delay={max_delay}", file=sys.stderr)
+    print(f"[DEBUG STREAM] last_aligned_decoded={last_aligned_decoded} (decoder state position)", file=sys.stderr)
+    print(f"[DEBUG STREAM] last_aligned_emitted={last_aligned_emitted} (output starts here, skipping warmup+transition)", file=sys.stderr)
+    print(f"[DEBUG STREAM] Will decode {last_aligned_emitted - last_aligned_decoded} transition frames before first output", file=sys.stderr)
+    print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}, start_step={start_step}", file=sys.stderr)
 
     # Reset chunk diagnostics and WebM streamer for this generation session
     reset_chunk_diagnostics()
@@ -1421,24 +1438,25 @@ def run_streaming_generation_loop(
                     first_word_frame_applied = True
 
                 # Check if we have enough NEW aligned frames for a chunk
-                # aligned length = (t + 1) - max_delay, we've emitted last_aligned_emitted
+                # We check against last_aligned_emitted (output position), not last_aligned_decoded
                 current_aligned_len = max(0, (t + 1) - max_delay)
-                new_aligned_frames = current_aligned_len - last_aligned_emitted
-                should_emit_chunk = new_aligned_frames >= chunk_size
+                new_frames_to_output = current_aligned_len - last_aligned_emitted
+                should_emit_chunk = new_frames_to_output >= chunk_size
 
                 # Also emit on EOS if we have enough frames
                 at_end = (eos_cutoff is not None and t + 1 >= eos_cutoff) or (t + 2 >= audio_buf.shape[-1])
-                if at_end and new_aligned_frames >= min_chunk:
+                if at_end and new_frames_to_output >= min_chunk:
                     should_emit_chunk = True
 
                 if should_emit_chunk:
                     # ASYNC DECODE PIPELINE:
                     # 1. First, yield any pending chunk from PREVIOUS async decode
-                    # 2. Start new decode on decode_stream (async)
-                    # 3. Store waveform for next iteration
+                    # 2. Decode from last_aligned_decoded (decoder position) to current
+                    # 3. Slice waveform to only output from last_aligned_emitted (skip transition frames)
+                    # 4. Store waveform for next iteration
 
                     if log_this_step:
-                        print(f"[TIMING] Step {offset}: should_emit_chunk=True, new_aligned={new_aligned_frames}, pending={pending_decode is not None} @ {(time.time() - generation_start_time)*1000:.0f}ms", file=sys.stderr)
+                        print(f"[TIMING] Step {offset}: should_emit_chunk=True, new_output={new_frames_to_output}, pending={pending_decode is not None} @ {(time.time() - generation_start_time)*1000:.0f}ms", file=sys.stderr)
 
                     # Step 1: Yield pending chunk from previous async decode
                     if pending_decode is not None:
@@ -1474,6 +1492,8 @@ def run_streaming_generation_loop(
                         pending_decode = None
 
                     # Step 2: Prepare new chunk for async decode
+                    # We decode from last_aligned_decoded (where decoder left off) to current
+                    # But only OUTPUT audio starting from last_aligned_emitted (skip transition frames)
                     current_frame = t + 1
 
                     full_tokens = audio_buf[0, :, :current_frame + 1]
@@ -1485,43 +1505,67 @@ def run_streaming_generation_loop(
 
                     current_aligned_end = aligned_full.shape[-1]
 
-                    if current_aligned_end > last_aligned_emitted:
-                        aligned_chunk = aligned_full[:, :, last_aligned_emitted:current_aligned_end]
+                    # Only proceed if we have new frames to decode
+                    if current_aligned_end > last_aligned_decoded:
+                        # Decode all frames from decoder position to current (includes transition frames)
+                        frames_to_decode = aligned_full[:, :, last_aligned_decoded:current_aligned_end]
+                        num_frames_decoded = frames_to_decode.shape[-1]
 
-                        if aligned_chunk.shape[-1] > 0:
-                            # Debug: log decode range for first few chunks
-                            if chunk_index < 5:
-                                print(f"[DEBUG DECODE] chunk {chunk_index}: t={t}, current_frame={current_frame}, full_tokens[:,:,:{current_frame+1}].shape[-1]={current_frame+1}", file=sys.stderr)
-                                print(f"[DEBUG DECODE] chunk {chunk_index}: aligned_full.shape={aligned_full.shape}, current_aligned_end={current_aligned_end}", file=sys.stderr)
-                                print(f"[DEBUG DECODE] chunk {chunk_index}: decoding aligned[{last_aligned_emitted}:{current_aligned_end}] = {aligned_chunk.shape[-1]} frames", file=sys.stderr)
-                                print(f"[DEBUG DECODE] chunk {chunk_index}: decoder_state.kv_cache={type(decoder_state.kv_cache).__name__ if decoder_state and decoder_state.kv_cache else None}", file=sys.stderr)
+                        # Calculate how many of these frames should be output vs discarded
+                        # Transition frames are between last_aligned_decoded and last_aligned_emitted
+                        frames_to_skip = max(0, last_aligned_emitted - last_aligned_decoded)
+                        frames_to_output = num_frames_decoded - frames_to_skip
+
+                        # Debug: log decode range for first few chunks
+                        if chunk_index < 5:
+                            print(f"[DEBUG DECODE] chunk {chunk_index}: t={t}, current_frame={current_frame}", file=sys.stderr)
+                            print(f"[DEBUG DECODE] chunk {chunk_index}: aligned_full.shape={aligned_full.shape}, current_aligned_end={current_aligned_end}", file=sys.stderr)
+                            print(f"[DEBUG DECODE] chunk {chunk_index}: decoding aligned[{last_aligned_decoded}:{current_aligned_end}] = {num_frames_decoded} frames", file=sys.stderr)
+                            print(f"[DEBUG DECODE] chunk {chunk_index}: frames_to_skip={frames_to_skip} (transition), frames_to_output={frames_to_output}", file=sys.stderr)
+                            print(f"[DEBUG DECODE] chunk {chunk_index}: decoder_state.kv_cache={type(decoder_state.kv_cache).__name__ if decoder_state and decoder_state.kv_cache else None}", file=sys.stderr)
+
+                        if frames_to_decode.shape[-1] > 0:
                             try:
                                 t0 = time.time()
                                 is_first_decode = (chunk_index == 0)
+
+                                # Decode the full range (including transition frames)
                                 if decode_stream is not None:
                                     with torch.cuda.stream(decode_stream):
-                                        chunk_waveform, decoder_state = decode_audio_streaming(
-                                            runtime, aligned_chunk, decoder_state
+                                        full_waveform, decoder_state = decode_audio_streaming(
+                                            runtime, frames_to_decode, decoder_state
                                         )
-                                    # Debug: log waveform size for first chunks
-                                    if chunk_index < 5:
-                                        waveform_samples = chunk_waveform.numel()
-                                        waveform_ms = (waveform_samples / runtime.mimi.sample_rate) * 1000
-                                        print(f"[DEBUG DECODE] chunk {chunk_index}: waveform output = {waveform_samples} samples = {waveform_ms:.1f}ms", file=sys.stderr)
-                                    pending_decode = (chunk_waveform, chunk_index, total_audio_ms)
-                                    chunk_index += 1
                                 else:
-                                    chunk_waveform, decoder_state = decode_audio_streaming(
-                                        runtime, aligned_chunk, decoder_state
+                                    full_waveform, decoder_state = decode_audio_streaming(
+                                        runtime, frames_to_decode, decoder_state
                                     )
-                                    # Debug: log waveform size for first chunks
-                                    if chunk_index < 5:
-                                        waveform_samples = chunk_waveform.numel()
-                                        waveform_ms = (waveform_samples / runtime.mimi.sample_rate) * 1000
-                                        print(f"[DEBUG DECODE] chunk {chunk_index}: waveform output = {waveform_samples} samples = {waveform_ms:.1f}ms", file=sys.stderr)
-                                    if chunk_waveform.numel() > 0:
-                                        audio_bytes = _encode_webm_chunk(chunk_waveform, runtime.mimi.sample_rate)
-                                        chunk_duration_ms = (chunk_waveform.numel() / runtime.mimi.sample_rate) * 1000
+
+                                # Slice the waveform to skip transition frames
+                                # Each frame = samples_per_frame samples
+                                samples_per_frame = runtime.mimi.samples_per_frame
+                                samples_to_skip = frames_to_skip * samples_per_frame
+                                output_waveform = full_waveform[samples_to_skip:]
+
+                                # Debug: log waveform sizes
+                                if chunk_index < 5:
+                                    full_samples = full_waveform.numel()
+                                    output_samples = output_waveform.numel()
+                                    full_ms = (full_samples / runtime.mimi.sample_rate) * 1000
+                                    output_ms = (output_samples / runtime.mimi.sample_rate) * 1000
+                                    print(f"[DEBUG DECODE] chunk {chunk_index}: full waveform = {full_samples} samples = {full_ms:.1f}ms", file=sys.stderr)
+                                    print(f"[DEBUG DECODE] chunk {chunk_index}: skipping {samples_to_skip} samples, output = {output_samples} samples = {output_ms:.1f}ms", file=sys.stderr)
+
+                                # Update decoder position
+                                last_aligned_decoded = current_aligned_end
+
+                                # Only emit if we have output audio
+                                if output_waveform.numel() > 0:
+                                    if decode_stream is not None:
+                                        pending_decode = (output_waveform, chunk_index, total_audio_ms)
+                                        chunk_index += 1
+                                    else:
+                                        audio_bytes = _encode_webm_chunk(output_waveform, runtime.mimi.sample_rate)
+                                        chunk_duration_ms = (output_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                                         if not first_chunk_emitted:
                                             print(f"[TIMING] First audio chunk at {(time.time() - generation_start_time)*1000:.0f}ms (chunk_idx={chunk_index}, bytes={len(audio_bytes)})", file=sys.stderr)
@@ -1536,6 +1580,9 @@ def run_streaming_generation_loop(
                                         total_audio_ms += chunk_duration_ms
                                         chunk_index += 1
 
+                                    # Update output position
+                                    last_aligned_emitted = current_aligned_end
+
                                 t1 = time.time()
                                 if is_first_decode:
                                     print(f"[TIMING] First decode took {(t1-t0)*1000:.1f}ms (async={decode_stream is not None}) @ {(t1 - generation_start_time)*1000:.0f}ms", file=sys.stderr)
@@ -1545,8 +1592,6 @@ def run_streaming_generation_loop(
                                     logger.event(f"Chunk decode error: {e}")
                                 yield ErrorEvent(error=f"Chunk decode error: {e}")
                                 return
-
-                        last_aligned_emitted = current_aligned_end
 
                 # Emit status periodically
                 if (offset + 1) % (streaming_config.emit_status_every * chunk_size) == 0:
@@ -1583,6 +1628,7 @@ def run_streaming_generation_loop(
             pending_decode = None
 
         # Handle any remaining frames at end of generation
+        # Use same two-variable logic: decode from last_aligned_decoded, output from last_aligned_emitted
         if last_step >= 0:
             remaining_end = min(last_step + 2, audio_buf.shape[-1])
 
@@ -1596,18 +1642,28 @@ def run_streaming_generation_loop(
 
                 current_aligned_end = aligned_full.shape[-1]
 
-                if current_aligned_end > last_aligned_emitted:
-                    aligned_remaining = aligned_full[:, :, last_aligned_emitted:current_aligned_end]
+                # Decode any frames we haven't decoded yet
+                if current_aligned_end > last_aligned_decoded:
+                    frames_to_decode = aligned_full[:, :, last_aligned_decoded:current_aligned_end]
+                    num_frames_decoded = frames_to_decode.shape[-1]
 
-                    if aligned_remaining.shape[-1] > 0:
+                    # Calculate frames to skip (transition frames)
+                    frames_to_skip = max(0, last_aligned_emitted - last_aligned_decoded)
+
+                    if frames_to_decode.shape[-1] > 0:
                         try:
-                            final_waveform, decoder_state = decode_audio_streaming(
-                                runtime, aligned_remaining, decoder_state
+                            full_waveform, decoder_state = decode_audio_streaming(
+                                runtime, frames_to_decode, decoder_state
                             )
 
-                            if final_waveform.numel() > 0:
-                                audio_bytes = _encode_webm_chunk(final_waveform, runtime.mimi.sample_rate)
-                                chunk_duration_ms = (final_waveform.numel() / runtime.mimi.sample_rate) * 1000
+                            # Slice to skip transition frames
+                            samples_per_frame = runtime.mimi.samples_per_frame
+                            samples_to_skip = frames_to_skip * samples_per_frame
+                            output_waveform = full_waveform[samples_to_skip:]
+
+                            if output_waveform.numel() > 0:
+                                audio_bytes = _encode_webm_chunk(output_waveform, runtime.mimi.sample_rate)
+                                chunk_duration_ms = (output_waveform.numel() / runtime.mimi.sample_rate) * 1000
 
                                 yield AudioChunkEvent(
                                     audio_data=audio_bytes,
