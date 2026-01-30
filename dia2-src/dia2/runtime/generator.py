@@ -1206,15 +1206,12 @@ def run_streaming_generation_loop(
     #
     # We track TWO separate positions:
     # 1. last_aligned_decoded - where the decoder has processed up to
-    # 2. last_aligned_emitted - where we start outputting from
+    # 2. last_aligned_emitted - what audio we've outputted (aligned frame position)
     #
-    # With extended warmup (warmup_steps = max_delay * 3), the decoder has already
-    # processed all warmup AND transition frames during cache creation.
-    # On cache HIT, decoder is ready and we can emit on the first generation step.
-    #
-    # Both values are ALIGNED frame positions (not raw frame positions).
+    # The decoder was primed during warmup with aligned frames 0 to (start_step - max_delay).
+    # We skip outputting warmup audio by setting last_aligned_emitted appropriately.
     last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # Where decoder left off
-    last_aligned_emitted = last_aligned_decoded - 1  # Emit starting from next frame
+    last_aligned_emitted = last_aligned_decoded - 1  # Emit immediately on first step
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
