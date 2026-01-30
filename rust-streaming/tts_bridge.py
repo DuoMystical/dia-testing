@@ -113,21 +113,17 @@ def _clone_decoder_state(decoder_state):
     if decoder_state is None:
         return None
 
+    import copy
     from dia2.audio.codec import StreamingDecoderState
 
-    # Clone kv_cache (tuple of tensors)
+    # Clone kv_cache - it's a HuggingFace DynamicCache object, use deepcopy
     new_kv_cache = None
     if decoder_state.kv_cache is not None:
-        # kv_cache is typically a tuple of tuples of tensors
-        new_kv_cache = tuple(
-            tuple(t.clone() if t is not None else None for t in layer_cache)
-            for layer_cache in decoder_state.kv_cache
-        )
+        new_kv_cache = copy.deepcopy(decoder_state.kv_cache)
 
     # Clone padding_cache (MimiDecoderPaddingCache with layer_caches)
     new_padding_cache = None
     if decoder_state.padding_cache is not None:
-        import copy
         # Shallow copy the object, then clone the tensor data
         new_padding_cache = copy.copy(decoder_state.padding_cache)
         new_padding_cache.layer_caches = []

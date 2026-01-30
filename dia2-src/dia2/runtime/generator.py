@@ -1475,6 +1475,9 @@ def run_streaming_generation_loop(
                         aligned_chunk = aligned_full[:, :, last_aligned_emitted:current_aligned_end]
 
                         if aligned_chunk.shape[-1] > 0:
+                            # Debug: log decode range for first few chunks
+                            if chunk_index < 3:
+                                print(f"[DEBUG] Decode chunk {chunk_index}: aligned[{last_aligned_emitted}:{current_aligned_end}] = {aligned_chunk.shape[-1]} frames, decoder_state={decoder_state is not None}", file=sys.stderr)
                             try:
                                 t0 = time.time()
                                 is_first_decode = (chunk_index == 0)
