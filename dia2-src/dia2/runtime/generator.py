@@ -1054,6 +1054,7 @@ def run_streaming_generation_loop(
     streaming_config: StreamingConfig,
     start_step: int = 0,
     logger: RuntimeLogger | None = None,
+    decoder_state=None,
 ) -> StreamGenerator:
     """
     Streaming generation loop that yields audio chunks during generation.
@@ -1069,6 +1070,7 @@ def run_streaming_generation_loop(
         streaming_config: Streaming configuration
         start_step: Starting step (after prefix warmup)
         logger: Optional logger
+        decoder_state: Optional pre-initialized decoder state (for warmup cache)
 
     Yields:
         StreamEvent objects (AudioChunkEvent, StatusEvent, CompleteEvent, ErrorEvent)
@@ -1141,7 +1143,7 @@ def run_streaming_generation_loop(
     generation_start_time = time.time()
 
     # Decoder state for maintaining continuity between audio chunks
-    decoder_state = None
+    # Use provided state (from warmup cache) or start fresh
 
     # Track aligned frames we've already emitted (after undelay)
     # Skip warmup audio - start emitting from after warmup aligned frames

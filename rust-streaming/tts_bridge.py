@@ -54,6 +54,92 @@ def _cache_put(seed: int, state):
     print(f"[CACHE] Cached seed {seed}, cache size: {len(_seed_cache)}", file=sys.stderr)
 
 
+def _get_tensor_size_mb(tensor):
+    """Get size of a tensor in MB."""
+    if tensor is None:
+        return 0.0
+    return tensor.element_size() * tensor.numel() / (1024 * 1024)
+
+
+def _log_cache_entry_size(seed, gen_state, state, decoder_state):
+    """Log the VRAM size breakdown of a cache entry."""
+    sizes = {}
+
+    # GenerationState sizes
+    gen_size = 0.0
+    if hasattr(gen_state, 'audio_buf'):
+        gen_size += _get_tensor_size_mb(gen_state.audio_buf)
+        sizes['audio_buf'] = _get_tensor_size_mb(gen_state.audio_buf)
+    if hasattr(gen_state, 'step_tokens'):
+        gen_size += _get_tensor_size_mb(gen_state.step_tokens)
+        sizes['step_tokens'] = _get_tensor_size_mb(gen_state.step_tokens)
+    if hasattr(gen_state, 'decode') and hasattr(gen_state.decode, 'kv_cache'):
+        kv_size = 0.0
+        if gen_state.decode.kv_cache is not None:
+            for layer in gen_state.decode.kv_cache:
+                if layer is not None:
+                    for t in layer:
+                        if t is not None:
+                            kv_size += _get_tensor_size_mb(t)
+        gen_size += kv_size
+        sizes['gen_kv_cache'] = kv_size
+
+    # Decoder state sizes
+    decoder_size = 0.0
+    if decoder_state is not None:
+        if decoder_state.kv_cache is not None:
+            for layer in decoder_state.kv_cache:
+                if layer is not None:
+                    for t in layer:
+                        if t is not None:
+                            decoder_size += _get_tensor_size_mb(t)
+            sizes['decoder_kv_cache'] = decoder_size
+
+        padding_size = 0.0
+        if decoder_state.padding_cache is not None:
+            for cache in decoder_state.padding_cache.layer_caches:
+                if cache.cached_input is not None:
+                    padding_size += _get_tensor_size_mb(cache.cached_input)
+            sizes['padding_cache'] = padding_size
+            decoder_size += padding_size
+
+    total = gen_size + decoder_size
+    breakdown = ", ".join(f"{k}={v:.2f}MB" for k, v in sizes.items())
+    print(f"[CACHE] Seed {seed} size: {total:.2f}MB ({breakdown})", file=sys.stderr)
+
+
+def _clone_decoder_state(decoder_state):
+    """Deep clone a StreamingDecoderState to avoid mutating cached state."""
+    if decoder_state is None:
+        return None
+
+    from dia2.audio.codec import StreamingDecoderState
+
+    # Clone kv_cache (tuple of tensors)
+    new_kv_cache = None
+    if decoder_state.kv_cache is not None:
+        # kv_cache is typically a tuple of tuples of tensors
+        new_kv_cache = tuple(
+            tuple(t.clone() if t is not None else None for t in layer_cache)
+            for layer_cache in decoder_state.kv_cache
+        )
+
+    # Clone padding_cache (MimiDecoderPaddingCache with layer_caches)
+    new_padding_cache = None
+    if decoder_state.padding_cache is not None:
+        import copy
+        # Shallow copy the object, then clone the tensor data
+        new_padding_cache = copy.copy(decoder_state.padding_cache)
+        new_padding_cache.layer_caches = []
+        for cache in decoder_state.padding_cache.layer_caches:
+            new_cache = copy.copy(cache)
+            if cache.cached_input is not None:
+                new_cache.cached_input = cache.cached_input.clone()
+            new_padding_cache.layer_caches.append(new_cache)
+
+    return StreamingDecoderState(kv_cache=new_kv_cache, padding_cache=new_padding_cache)
+
+
 def emit_event(event: dict):
     """Emit a JSON event to stdout."""
     try:
@@ -191,7 +277,9 @@ def process_request(request: dict):
         build_initial_state,
         run_seed_warmup,
         run_streaming_generation_loop,
+        decode_audio_streaming,
     )
+    from dia2.audio.grid import undelay_frames
     from dia2.runtime.voice_clone import build_prefix_plan
     from dia2.generation import PrefixConfig, merge_generation_config
     from dia2.runtime.script_parser import parse_script
@@ -298,11 +386,12 @@ def process_request(request: dict):
             # FAST PATH: Restore from cache
             print(f"[CACHE] HIT - Restoring state for seed {seed}", file=sys.stderr)
             emit_status("Using cached voice...", 0.1)
-            gen_state, state, rng_state, cuda_rng_state, warmup_steps = cached_state
+            gen_state, state, rng_state, cuda_rng_state, warmup_steps, cached_decoder_state = cached_state
 
-            # Clone both states so cache remains pristine
+            # Clone all states so cache remains pristine
             gen_state = gen_state.clone()
             state = state.clone()
+            decoder_state = _clone_decoder_state(cached_decoder_state)
 
             # Restore RNG state to match post-warmup state
             torch.set_rng_state(rng_state)
@@ -359,11 +448,23 @@ def process_request(request: dict):
             )
             start_step = warmup_steps
 
+            # Build decoder state by decoding warmup audio (discard the audio, keep the state)
+            # This primes the Mimi decoder's convolutional padding cache
+            warmup_codes = gen_state.audio_buf[0, :, :warmup_steps + 1]  # (codebooks, steps)
+            aligned_warmup = undelay_frames(
+                warmup_codes,
+                runtime.audio_delays,
+                runtime.constants.audio_pad,
+            ).unsqueeze(0)  # (1, codebooks, aligned_frames)
+            _, decoder_state = decode_audio_streaming(runtime, aligned_warmup, None)
+            print(f"[CACHE] Built decoder state from {aligned_warmup.shape[-1]} aligned warmup frames", file=sys.stderr)
+
             # Cache BOTH gen_state AND state (with warmup entries consumed)
             if use_cache:
                 rng_state = torch.get_rng_state()
                 cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-                _cache_put(seed, (gen_state.clone(), state.clone(), rng_state, cuda_rng_state, warmup_steps))
+                _cache_put(seed, (gen_state.clone(), state.clone(), rng_state, cuda_rng_state, warmup_steps, decoder_state))
+                _log_cache_entry_size(seed, gen_state, state, decoder_state)
 
             # Append user entries to the same state (warmup entries now consumed)
             state.entries.extend(user_entries)
@@ -388,6 +489,7 @@ def process_request(request: dict):
             streaming_config=streaming_config,
             start_step=start_step,
             logger=logger,
+            decoder_state=decoder_state,
         ):
             event_count += 1
             event_type = type(event).__name__
