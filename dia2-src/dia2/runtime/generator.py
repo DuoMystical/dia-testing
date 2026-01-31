@@ -1376,10 +1376,15 @@ def run_streaming_generation_loop(
                 timing_stats['text_sampling'] += (t1 - t0)
 
                 t0 = time.time()
-                main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
+                main_token, aux_token, consumed_word = runtime.machine.process(t, state, text_token)
                 second_token = aux_token if aux_token != -1 else token_ids.pad
                 t1 = time.time()
                 timing_stats['machine_process'] += (t1 - t0)
+
+                # Debug: log first 10 steps of user generation to see state machine behavior
+                if offset < 10:
+                    print(f"[DEBUG GEN] step={t} (offset={offset}): text_token={text_token}, main={main_token}, aux={aux_token}, consumed={consumed_word}", file=sys.stderr)
+                    print(f"[DEBUG GEN]   state: entries={len(state.entries)}, pending={len(state.pending_tokens)}, forced_pad={state.forced_padding}, pad_budget={state.padding_budget}", file=sys.stderr)
 
                 if first_word_frame is None and main_token == token_ids.new_word:
                     first_word_frame = t - config.initial_padding
