@@ -255,9 +255,36 @@ class WebMAudioStreamer {
             URL.revokeObjectURL(this.audioElement.src);
         }
 
+        // Clean up Web Audio nodes - must close context since sourceNode can't be reused
+        if (this.sourceNode) {
+            try {
+                this.sourceNode.disconnect();
+            } catch (e) {}
+            this.sourceNode = null;
+        }
+        if (this.gainNode) {
+            try {
+                this.gainNode.disconnect();
+            } catch (e) {}
+            this.gainNode = null;
+        }
+        if (this.analyser) {
+            try {
+                this.analyser.disconnect();
+            } catch (e) {}
+            this.analyser = null;
+        }
+        if (this.audioContext) {
+            try {
+                this.audioContext.close();
+            } catch (e) {}
+            this.audioContext = null;
+        }
+
         // Reset state
         this.mediaSource = null;
         this.sourceBuffer = null;
+        this.audioElement = null;
         this.pendingBuffers = [];
         this.isUpdating = false;
         this.isPlaying = false;
