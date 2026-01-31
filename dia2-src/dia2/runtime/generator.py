@@ -1231,17 +1231,8 @@ def run_streaming_generation_loop(
         decoder_state = None  # Force fresh decode from start
         print(f"[DEBUG STREAM] debug_include_warmup=True: outputting ALL frames from 0, ignoring cached decoder_state", file=sys.stderr)
     else:
-        # Warmup writes audio to raw positions 1 through warmup_steps (= start_step).
-        # User audio starts at position start_step + 1.
-        #
-        # undelay_frames: aligned frame F uses raw positions F to F+max_delay.
-        # For frame F to contain ONLY user audio, ALL positions must be > start_step.
-        # The minimum position is F (delay=0 codebook), so F > start_step → F >= start_step + 1.
-        #
-        # To maintain decoder continuity, we decode from where warmup's decoder left off,
-        # but we only OUTPUT starting from the first pure-user frame.
-        last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # Continue from warmup decoder state
-        last_aligned_emitted = start_step + 1  # First frame with ONLY user audio (no warmup)
+        last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # First frame to decode in streaming
+        last_aligned_emitted = last_aligned_decoded + 1  # Skip transition frame, output from frame with more user influence
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
