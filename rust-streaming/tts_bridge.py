@@ -414,14 +414,18 @@ def process_request(request: dict):
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state)
 
-            # Reset padding_budget to 0 to ensure immediate consumption of first user word
-            # Without this, leftover padding from warmup causes gap frames where
-            # the model continues generating warmup audio before the first user word
+            # Reset ALL state machine variables to ensure clean transition to user text
+            # - padding_budget=0: forces new_word on first step (consumes first user entry)
+            # - forced_padding=0: prevents forced pad tokens from last warmup entry
+            # - pending_tokens cleared: prevents leftover warmup tokens from being output
+            # - end_step=None: allows generation to continue
             state.padding_budget = 0
+            state.forced_padding = 0
+            state.pending_tokens.clear()
+            state.end_step = None
 
             # Append user entries to the state (warmup entries already consumed)
             state.entries.extend(user_entries)
-            state.end_step = None  # Reset so generation continues
 
             # Debug: log state after adding user entries
             print(f"[DEBUG STATE] After cache HIT + user entries:", file=sys.stderr)
@@ -517,14 +521,18 @@ def process_request(request: dict):
                 _cache_put(seed, (gen_state.clone(), state.clone(), rng_state, cuda_rng_state, warmup_steps, decoder_state))
                 _log_cache_entry_size(seed, gen_state, state, decoder_state)
 
-            # Reset padding_budget to 0 to ensure immediate consumption of first user word
-            # Without this, leftover padding from warmup causes gap frames where
-            # the model continues generating warmup audio before the first user word
+            # Reset ALL state machine variables to ensure clean transition to user text
+            # - padding_budget=0: forces new_word on first step (consumes first user entry)
+            # - forced_padding=0: prevents forced pad tokens from last warmup entry
+            # - pending_tokens cleared: prevents leftover warmup tokens from being output
+            # - end_step=None: allows generation to continue
             state.padding_budget = 0
+            state.forced_padding = 0
+            state.pending_tokens.clear()
+            state.end_step = None
 
             # Append user entries to the same state (warmup entries now consumed)
             state.entries.extend(user_entries)
-            state.end_step = None  # Reset so generation continues
 
             # Debug: log state after adding user entries
             print(f"[DEBUG STATE] After cache MISS + user entries:", file=sys.stderr)
