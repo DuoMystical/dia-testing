@@ -520,6 +520,14 @@ def process_request(request: dict):
 
             # Cache BOTH gen_state AND state (with warmup entries consumed)
             if use_cache:
+                print(f"[DEBUG CACHE] Caching state for seed {seed}:", file=sys.stderr)
+                print(f"[DEBUG CACHE]   warmup_steps: {warmup_steps}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.end_step: {state.end_step}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.padding_budget: {state.padding_budget}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.forced_padding: {state.forced_padding}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.entries: {len(state.entries)}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.transcript: {state.transcript}", file=sys.stderr)
                 rng_state = torch.get_rng_state()
                 cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
                 _cache_put(seed, (gen_state.clone(), state.clone(), rng_state, cuda_rng_state, warmup_steps, decoder_state))

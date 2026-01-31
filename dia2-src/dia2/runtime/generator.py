@@ -1037,8 +1037,17 @@ def run_seed_warmup(
 
             # Process through state machine with warmup phrase (or use pad if no state)
             if warmup_state is not None:
-                main_token, aux_token, _ = runtime.machine.process(t, warmup_state, text_token)
+                main_token, aux_token, consumed = runtime.machine.process(t, warmup_state, text_token)
                 second_token = aux_token if aux_token != -1 else token_ids.pad
+
+                # Log warmup state machine behavior for debugging
+                # Log every step to understand the padding pattern
+                if t < 10 or consumed or warmup_state.end_step is not None:
+                    print(f"[WARMUP STEP] t={t}: main={main_token}, consumed={consumed}, end_step={warmup_state.end_step}", file=sys.stderr)
+                    print(f"[WARMUP STEP]   entries={len(warmup_state.entries)}, pending={len(warmup_state.pending_tokens)}, forced_pad={warmup_state.forced_padding}, pad_budget={warmup_state.padding_budget}", file=sys.stderr)
+                    if consumed and warmup_state.transcript:
+                        last_word = warmup_state.transcript[-1]
+                        print(f"[WARMUP STEP]   consumed: '{last_word[0]}' at step {last_word[1]}", file=sys.stderr)
             else:
                 # Fallback: use pad tokens (old behavior)
                 main_token = token_ids.pad
@@ -1105,6 +1114,15 @@ def run_seed_warmup(
                     break
 
     print(f"[WARMUP] Completed {warmup_steps} warmup steps", file=sys.stderr)
+    # Log final warmup state that will be used for user text
+    if warmup_state is not None:
+        print(f"[WARMUP FINAL] State at end of warmup:", file=sys.stderr)
+        print(f"[WARMUP FINAL]   end_step: {warmup_state.end_step}", file=sys.stderr)
+        print(f"[WARMUP FINAL]   entries: {len(warmup_state.entries)}", file=sys.stderr)
+        print(f"[WARMUP FINAL]   padding_budget: {warmup_state.padding_budget}", file=sys.stderr)
+        print(f"[WARMUP FINAL]   forced_padding: {warmup_state.forced_padding}", file=sys.stderr)
+        print(f"[WARMUP FINAL]   pending_tokens: {list(warmup_state.pending_tokens)}", file=sys.stderr)
+        print(f"[WARMUP FINAL]   transcript: {warmup_state.transcript}", file=sys.stderr)
     return generation, warmup_steps
 
 
@@ -1266,6 +1284,13 @@ def run_streaming_generation_loop(
     print(f"[DEBUG STREAM] start_step={start_step}, max_delay={max_delay}", file=sys.stderr)
     print(f"[DEBUG STREAM] last_aligned_decoded={last_aligned_decoded} (decoder state position)", file=sys.stderr)
     print(f"[DEBUG STREAM] last_aligned_emitted={last_aligned_emitted} (emit from frame {last_aligned_emitted + 1})", file=sys.stderr)
+    print(f"[DEBUG STREAM] Token IDs: new_word={token_ids.new_word}, pad={token_ids.pad}, spk1={token_ids.spk1}, spk2={token_ids.spk2}", file=sys.stderr)
+    print(f"[DEBUG STREAM] Initial state: entries={len(state.entries)}, padding_budget={state.padding_budget}, forced_padding={state.forced_padding}, pending_tokens={list(state.pending_tokens)}", file=sys.stderr)
+    print(f"[DEBUG STREAM] Initial state: end_step={state.end_step}", file=sys.stderr)
+    # Show first few entries
+    print(f"[DEBUG STREAM] First 3 entries to process:", file=sys.stderr)
+    for i, entry in enumerate(list(state.entries)[:3]):
+        print(f"[DEBUG STREAM]   [{i}] text='{entry.text}', tokens={entry.tokens}, padding={entry.padding}", file=sys.stderr)
     print(f"[TIMING] Starting generation loop: max_context={max_context}, chunk_size={chunk_size}, max_delay={max_delay}, start_step={start_step}", file=sys.stderr)
 
     # Reset chunk diagnostics and WebM streamer for this generation session
@@ -1383,12 +1408,16 @@ def run_streaming_generation_loop(
 
                 # Debug: log first 10 steps of user generation to see state machine behavior
                 if offset < 10:
-                    print(f"[DEBUG GEN] step={t} (offset={offset}): text_token={text_token}, main={main_token}, aux={aux_token}, consumed={consumed_word}", file=sys.stderr)
-                    print(f"[DEBUG GEN]   state: entries={len(state.entries)}, pending={len(state.pending_tokens)}, forced_pad={state.forced_padding}, pad_budget={state.padding_budget}", file=sys.stderr)
+                    # Decode token meanings
+                    text_token_name = "new_word" if text_token == token_ids.new_word else ("pad" if text_token == token_ids.pad else f"other({text_token})")
+                    main_token_name = "new_word" if main_token == token_ids.new_word else ("pad" if main_token == token_ids.pad else f"other({main_token})")
+                    print(f"[DEBUG GEN] step={t} (offset={offset}): text_token={text_token_name}, main={main_token_name}, consumed={consumed_word}", file=sys.stderr)
+                    print(f"[DEBUG GEN]   BEFORE: entries={len(state.entries)}, pending={list(state.pending_tokens)[:5]}{'...' if len(state.pending_tokens) > 5 else ''}, forced_pad={state.forced_padding}, pad_budget={state.padding_budget}", file=sys.stderr)
                     # Show transcript (words consumed so far) when entry is consumed
                     if consumed_word and state.transcript:
                         last_word = state.transcript[-1]
-                        print(f"[DEBUG GEN]   consumed entry: text='{last_word[0]}' at step {last_word[1]}", file=sys.stderr)
+                        print(f"[DEBUG GEN]   >>> CONSUMED: text='{last_word[0]}' at step {last_word[1]}", file=sys.stderr)
+                        print(f"[DEBUG GEN]   >>> NEW STATE: pending={list(state.pending_tokens)[:5]}, forced_pad={state.forced_padding}, pad_budget={state.padding_budget}", file=sys.stderr)
 
                 if first_word_frame is None and main_token == token_ids.new_word:
                     first_word_frame = t - config.initial_padding
