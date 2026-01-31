@@ -384,6 +384,11 @@ def process_request(request: dict):
         text_normalized = normalize_script(text)
         user_entries = parse_script([text_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate, initial_speaker_idx=0)
 
+        # Debug: log user entries
+        print(f"[DEBUG ENTRIES] User entries ({len(user_entries)} total):", file=sys.stderr)
+        for i, entry in enumerate(user_entries[:5]):  # First 5 entries
+            print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
+
         if cached_state is not None:
             # FAST PATH: Restore from cache
             print(f"[CACHE] HIT - Restoring state for seed {seed}", file=sys.stderr)
@@ -437,6 +442,11 @@ def process_request(request: dict):
             # S2 interjection creates a natural sentence boundary before user text.
             WARMUP_PHRASE = "[S1] Hello! This is a streaming TTS demo."
             warmup_entries = parse_script([WARMUP_PHRASE], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+
+            # Debug: log warmup entries
+            print(f"[DEBUG ENTRIES] Warmup entries ({len(warmup_entries)} total):", file=sys.stderr)
+            for i, entry in enumerate(warmup_entries):
+                print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
 
             # Set initial_padding to 2 (original Dia default) for proper padding structure:
             # - 2 frames forced padding
