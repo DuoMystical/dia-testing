@@ -983,13 +983,10 @@ def run_seed_warmup(
     transformer_capture = None
     dep_captures = None
 
-    # Compute max_delay for proper flush timing (same as streaming loop)
-    max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
-
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
 
-    print(f"[WARMUP] Running warmup (min_steps={min_steps}, max_steps={max_steps}, max_delay={max_delay})", file=sys.stderr)
+    print(f"[WARMUP] Running warmup (min_steps={min_steps}, max_steps={max_steps})", file=sys.stderr)
 
     warmup_steps = 0
     with torch.inference_mode():
@@ -1100,14 +1097,11 @@ def run_seed_warmup(
 
             warmup_steps = t + 1
 
-            # Check if warmup is complete: entries consumed AND audio flushed through codec delay
-            # After end_step (text consumed), we need max_delay more steps to flush audio
+            # Check if warmup is complete: entries consumed AND minimum steps reached
+            # Streaming loop handles flush_tail for output alignment separately
             if warmup_state is not None and warmup_state.end_step is not None:
-                # Target: end_step + max_delay to complete audio for consumed text
-                # This matches streaming loop's eos_cutoff = end_step + flush_tail
-                target_steps = warmup_state.end_step + max_delay
-                if warmup_steps >= target_steps and warmup_steps >= min_steps:
-                    print(f"[WARMUP] Entries consumed at step {warmup_state.end_step}, flushed to {warmup_steps} steps (target={target_steps})", file=sys.stderr)
+                if warmup_steps >= min_steps:
+                    print(f"[WARMUP] Entries consumed at step {warmup_state.end_step}, stopping at {warmup_steps} steps", file=sys.stderr)
                     break
 
     print(f"[WARMUP] Completed {warmup_steps} warmup steps", file=sys.stderr)
