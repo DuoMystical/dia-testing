@@ -46,6 +46,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const chunkSizeInput = document.getElementById('chunk-size');
     const minChunkSizeInput = document.getElementById('min-chunk-size');
 
+    // Debug options
+    const debugIncludeWarmupCheckbox = document.getElementById('debug-include-warmup');
+
     // Seed
     const seedInput = document.getElementById('seed-input');
     const seedDisplay = document.getElementById('seed-display');
@@ -441,7 +444,8 @@ document.addEventListener('DOMContentLoaded', () => {
             minChunkFrames: parseInt(minChunkSizeInput.value) || 1,
             seed: seedInput.value.trim(),
             speaker1Audio: speaker1AudioData,
-            speaker2Audio: speaker2AudioData
+            speaker2Audio: speaker2AudioData,
+            debugIncludeWarmup: debugIncludeWarmupCheckbox.checked
         };
 
         if (streamInputCheckbox.checked) {

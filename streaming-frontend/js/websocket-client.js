@@ -112,7 +112,9 @@ class WebSocketClient {
             chunk_size_frames: options.chunkSizeFrames || 1,
             min_chunk_frames: options.minChunkFrames || 1,
             // Seed (empty string = random)
-            seed: options.seed || ''
+            seed: options.seed || '',
+            // Debug options
+            debug_include_warmup: options.debugIncludeWarmup || false
         };
 
         // Add voice cloning audio if provided
@@ -161,7 +163,9 @@ class WebSocketClient {
             chunk_size_frames: options.chunkSizeFrames || 1,
             min_chunk_frames: options.minChunkFrames || 1,
             // Seed (empty string = random)
-            seed: options.seed || ''
+            seed: options.seed || '',
+            // Debug options
+            debug_include_warmup: options.debugIncludeWarmup || false
         };
 
         // Add voice cloning audio if provided

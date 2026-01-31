@@ -359,11 +359,15 @@ def process_request(request: dict):
         # Streaming config
         chunk_size = config_overrides.get("chunk_size_frames", 1)
         min_chunk = config_overrides.get("min_chunk_frames", 1)
+        debug_include_warmup = config_overrides.get("debug_include_warmup", False)
         streaming_config = StreamingConfig(
             chunk_size_frames=chunk_size,
             min_chunk_frames=min_chunk,
             emit_status_every=config_overrides.get("emit_status_every", 20),
+            debug_include_warmup=debug_include_warmup,
         )
+        if debug_include_warmup:
+            print(f"[DEBUG] debug_include_warmup=True: will output all audio including warmup", file=sys.stderr)
 
         generation_start = time_module.time()
 
