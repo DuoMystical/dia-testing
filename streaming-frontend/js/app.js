@@ -49,6 +49,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Debug options
     const debugIncludeWarmupCheckbox = document.getElementById('debug-include-warmup');
     const debugCompareEntriesCheckbox = document.getElementById('debug-compare-entries');
+    const debugCompareAudioTokensCheckbox = document.getElementById('debug-compare-audio-tokens');
 
     // Seed
     const seedInput = document.getElementById('seed-input');
@@ -447,7 +448,8 @@ document.addEventListener('DOMContentLoaded', () => {
             speaker1Audio: speaker1AudioData,
             speaker2Audio: speaker2AudioData,
             debugIncludeWarmup: debugIncludeWarmupCheckbox.checked,
-            debugCompareEntries: debugCompareEntriesCheckbox.checked
+            debugCompareEntries: debugCompareEntriesCheckbox.checked,
+            debugCompareAudioTokens: debugCompareAudioTokensCheckbox.checked
         };
 
         if (streamInputCheckbox.checked) {

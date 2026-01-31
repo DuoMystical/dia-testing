@@ -211,6 +211,13 @@
                                 </label>
                                 <span class="setting-hint">Debug: compares baseline vs warmup+user token sequences in server logs</span>
                             </div>
+                            <div class="setting">
+                                <label>
+                                    <input type="checkbox" id="debug-compare-audio-tokens">
+                                    Compare audio tokens (slow, logs only)
+                                </label>
+                                <span class="setting-hint">Debug: runs baseline generation first, then warmup+extend, compares audio tokens</span>
+                            </div>
                         </div>
                     </div>
                 </details>
