@@ -66,8 +66,10 @@ RUN cd /app/dia2-src && uv pip install -e .
 # Copy Rust binary from builder
 COPY --from=rust-builder /app/target/release/dia2-streaming-server /app/
 
-# Copy TTS bridge and frontend (paths relative to repo root)
+# Copy TTS bridge and test scripts (paths relative to repo root)
 COPY rust-streaming/tts_bridge.py /app/tts_bridge.py
+COPY rust-streaming/compare_entries_simple.py /app/compare_entries_simple.py
+COPY rust-streaming/compare_token_chains.py /app/compare_token_chains.py
 COPY streaming-frontend /app/frontend
 
 # Environment variables
