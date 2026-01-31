@@ -384,6 +384,11 @@ def process_request(request: dict):
         text_normalized = normalize_script(text)
         user_entries = parse_script([text_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate, initial_speaker_idx=0)
 
+        # Debug: log user entries
+        print(f"[DEBUG ENTRIES] User entries ({len(user_entries)} total):", file=sys.stderr)
+        for i, entry in enumerate(user_entries[:5]):  # First 5 entries
+            print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
+
         if cached_state is not None:
             # FAST PATH: Restore from cache
             print(f"[CACHE] HIT - Restoring state for seed {seed}", file=sys.stderr)
@@ -413,6 +418,14 @@ def process_request(request: dict):
             state.entries.extend(user_entries)
             state.end_step = None  # Reset so generation continues
 
+            # Debug: log state after adding user entries
+            print(f"[DEBUG STATE] After cache HIT + user entries:", file=sys.stderr)
+            print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
+            print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
+            print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
+            print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+            print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
+
             start_step = warmup_steps
         else:
             # SLOW PATH: Build initial state and run warmup
@@ -437,6 +450,11 @@ def process_request(request: dict):
             # S2 interjection creates a natural sentence boundary before user text.
             WARMUP_PHRASE = "[S1] Hello! This is a streaming TTS demo."
             warmup_entries = parse_script([WARMUP_PHRASE], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+
+            # Debug: log warmup entries
+            print(f"[DEBUG ENTRIES] Warmup entries ({len(warmup_entries)} total):", file=sys.stderr)
+            for i, entry in enumerate(warmup_entries):
+                print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
 
             # Set initial_padding to 2 (original Dia default) for proper padding structure:
             # - 2 frames forced padding
@@ -488,6 +506,14 @@ def process_request(request: dict):
             # Append user entries to the same state (warmup entries now consumed)
             state.entries.extend(user_entries)
             state.end_step = None  # Reset so generation continues
+
+            # Debug: log state after adding user entries
+            print(f"[DEBUG STATE] After cache MISS + user entries:", file=sys.stderr)
+            print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
+            print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
+            print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
+            print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+            print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
 
         warmup_time = time_module.time() - generation_start
         print(f"[TIMING] Warmup/restore took {warmup_time*1000:.0f}ms", file=sys.stderr)
