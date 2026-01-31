@@ -273,6 +273,7 @@ def process_request(request: dict):
         build_initial_state,
         run_seed_warmup,
         run_streaming_generation_loop,
+        run_generation_loop,
         decode_audio_streaming,
     )
     from dia2.audio.grid import undelay_frames
@@ -451,6 +452,94 @@ def process_request(request: dict):
                     if bt != ct:
                         print(f"[COMPARE]   First diff at index {i}: baseline={bt}, combined={ct}", file=sys.stderr)
                         break
+            print(f"{'='*60}\n", file=sys.stderr)
+
+        # Debug: compare AUDIO tokens between baseline and warmup+extend
+        # This runs baseline generation first, saves audio tokens, then lets warmup+extend run
+        debug_compare_audio_tokens = config_overrides.get("debug_compare_audio_tokens", False)
+        baseline_audio_buf = None
+        baseline_end_step = None
+
+        if debug_compare_audio_tokens:
+            print(f"\n{'='*60}", file=sys.stderr)
+            print(f"[AUDIO COMPARE] Running baseline generation for comparison", file=sys.stderr)
+            print(f"{'='*60}", file=sys.stderr)
+
+            # Save RNG state so we can restore it for warmup+extend
+            saved_rng_state = torch.get_rng_state()
+            saved_cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+
+            # Reset RNG to same seed for baseline
+            random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+
+            # Build initial state for baseline
+            baseline_gen_state = build_initial_state(runtime, prefix=None)
+
+            # Parse FULL text (warmup + user) for baseline
+            WARMUP_PHRASE = "[S1] Hello! This is a streaming TTS demo."
+            FULL_TEXT = f"{WARMUP_PHRASE} {text}"
+            full_normalized = normalize_script(FULL_TEXT)
+            baseline_entries = parse_script([full_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+
+            # Create baseline state with full text
+            runtime.machine.initial_padding = 19  # Standard padding
+            baseline_state = runtime.machine.new_state(baseline_entries)
+            runtime.machine.initial_padding = 0
+
+            # Create baseline gen config (no torch.compile to avoid RNG issues on first run)
+            baseline_gen_config = GenerationConfig(
+                text=SamplingConfig(
+                    temperature=config_overrides.get("text_temperature", 0.6),
+                    top_k=config_overrides.get("text_top_k", 50),
+                ),
+                audio=SamplingConfig(
+                    temperature=config_overrides.get("audio_temperature", 0.8),
+                    top_k=config_overrides.get("audio_top_k", 50),
+                ),
+                cfg_scale=config_overrides.get("cfg_scale", 2.0),
+                cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
+                initial_padding=19,
+                use_cuda_graph=True,
+                use_torch_compile=True,  # Same as normal run
+            )
+
+            # Run baseline generation (non-streaming)
+            print(f"[AUDIO COMPARE] Running baseline with {len(baseline_entries)} entries...", file=sys.stderr)
+            import time as time_module
+            baseline_start = time_module.time()
+
+            first_word_frame, baseline_tokens_result = run_generation_loop(
+                runtime,
+                state=baseline_state,
+                generation=baseline_gen_state,
+                config=baseline_gen_config,
+                start_step=0,
+            )
+
+            baseline_elapsed = time_module.time() - baseline_start
+            print(f"[AUDIO COMPARE] Baseline completed in {baseline_elapsed:.2f}s", file=sys.stderr)
+            print(f"[AUDIO COMPARE] Baseline end_step: {baseline_state.end_step}", file=sys.stderr)
+            print(f"[AUDIO COMPARE] Baseline audio_buf shape: {baseline_gen_state.audio_buf.shape}", file=sys.stderr)
+
+            # Save baseline audio buffer for later comparison
+            baseline_audio_buf = baseline_gen_state.audio_buf.clone()
+            baseline_end_step = baseline_state.end_step
+
+            # Restore RNG state for warmup+extend run
+            torch.set_rng_state(saved_rng_state)
+            if saved_cuda_rng_state is not None:
+                torch.cuda.set_rng_state(saved_cuda_rng_state)
+
+            # Re-seed for warmup+extend (same seed as baseline started with)
+            random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+
+            print(f"[AUDIO COMPARE] Now running warmup+extend for comparison...", file=sys.stderr)
             print(f"{'='*60}\n", file=sys.stderr)
 
         if cached_state is not None:
@@ -681,6 +770,76 @@ def process_request(request: dict):
 
         elapsed = time_module.time() - generation_start
         print(f"[TIMING] Generation finished. Events: {event_count}, Chunks: {audio_chunk_count}, Time: {elapsed*1000:.0f}ms", file=sys.stderr)
+
+        # Compare audio tokens if baseline was run
+        if baseline_audio_buf is not None:
+            print(f"\n{'='*60}", file=sys.stderr)
+            print(f"[AUDIO COMPARE] Comparing audio tokens", file=sys.stderr)
+            print(f"{'='*60}", file=sys.stderr)
+
+            # Get warmup+extend audio buffer
+            warmup_extend_audio_buf = gen_state.audio_buf
+
+            print(f"[AUDIO COMPARE] Baseline audio_buf shape: {baseline_audio_buf.shape}", file=sys.stderr)
+            print(f"[AUDIO COMPARE] Warmup+extend audio_buf shape: {warmup_extend_audio_buf.shape}", file=sys.stderr)
+            print(f"[AUDIO COMPARE] Baseline end_step: {baseline_end_step}", file=sys.stderr)
+            print(f"[AUDIO COMPARE] Warmup+extend end_step: {state.end_step}", file=sys.stderr)
+
+            # Compare CB0 tokens (most important codebook) at key positions
+            max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
+
+            # Compare from position 1 to min of both buffer lengths
+            compare_end = min(baseline_audio_buf.shape[-1], warmup_extend_audio_buf.shape[-1])
+
+            # CB0 is at index 0
+            baseline_cb0 = baseline_audio_buf[0, 0, :compare_end].cpu()
+            warmup_cb0 = warmup_extend_audio_buf[0, 0, :compare_end].cpu()
+
+            # Find first difference
+            diff_mask = baseline_cb0 != warmup_cb0
+            num_diffs = diff_mask.sum().item()
+
+            if num_diffs == 0:
+                print(f"[AUDIO COMPARE] *** CB0 TOKENS MATCH (positions 0-{compare_end-1}) ***", file=sys.stderr)
+            else:
+                first_diff_idx = diff_mask.nonzero()[0].item()
+                print(f"[AUDIO COMPARE] *** CB0 TOKENS DIFFER ***", file=sys.stderr)
+                print(f"[AUDIO COMPARE]   Total differences: {num_diffs} out of {compare_end} positions", file=sys.stderr)
+                print(f"[AUDIO COMPARE]   First difference at position {first_diff_idx}", file=sys.stderr)
+
+                # Show tokens around the first difference
+                start = max(0, first_diff_idx - 3)
+                end = min(compare_end, first_diff_idx + 5)
+                print(f"[AUDIO COMPARE]   Baseline CB0[{start}:{end}]: {baseline_cb0[start:end].tolist()}", file=sys.stderr)
+                print(f"[AUDIO COMPARE]   Warmup+extend CB0[{start}:{end}]: {warmup_cb0[start:end].tolist()}", file=sys.stderr)
+
+                # Show where in generation this corresponds to
+                # Position N was written at step N-1
+                print(f"[AUDIO COMPARE]   Position {first_diff_idx} was written at step {first_diff_idx - 1}", file=sys.stderr)
+
+                # Check if difference is in warmup region or user region
+                # Warmup region: positions 1 to warmup_steps (approximately)
+                # User region: positions warmup_steps+1 onwards
+                if first_diff_idx <= start_step:
+                    print(f"[AUDIO COMPARE]   This is in the WARMUP region (before step {start_step})", file=sys.stderr)
+                else:
+                    print(f"[AUDIO COMPARE]   This is in the USER region (at/after step {start_step})", file=sys.stderr)
+
+            # Also compare all codebooks at a few key positions
+            print(f"\n[AUDIO COMPARE] Comparing all codebooks at key positions:", file=sys.stderr)
+            key_positions = [start_step, start_step + 1, start_step + 5, start_step + 10]
+            for pos in key_positions:
+                if pos < compare_end:
+                    baseline_all = baseline_audio_buf[0, :, pos].cpu().tolist()
+                    warmup_all = warmup_extend_audio_buf[0, :, pos].cpu().tolist()
+                    match = baseline_all == warmup_all
+                    status = "MATCH" if match else "DIFFER"
+                    print(f"[AUDIO COMPARE]   Position {pos}: {status}", file=sys.stderr)
+                    if not match:
+                        print(f"[AUDIO COMPARE]     Baseline: {baseline_all[:4]}...", file=sys.stderr)
+                        print(f"[AUDIO COMPARE]     Warmup+extend: {warmup_all[:4]}...", file=sys.stderr)
+
+            print(f"{'='*60}\n", file=sys.stderr)
 
     except Exception as e:
         import traceback

@@ -1250,7 +1250,20 @@ def run_streaming_generation_loop(
         print(f"[DEBUG STREAM] debug_include_warmup=True: outputting ALL frames from 0, ignoring cached decoder_state", file=sys.stderr)
     else:
         last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # First frame to decode in streaming
-        last_aligned_emitted = last_aligned_decoded + 1  # Skip transition frame, output from frame with more user influence
+
+        # In warmup+extend mode (start_step > 0), we must skip ALL frames that contain
+        # any warmup audio tokens. Due to codec delays, each aligned frame uses tokens
+        # from multiple raw positions. The most delayed codebook (delay=max_delay-1) at
+        # aligned frame N uses raw token at position (1 + N).
+        # For pure user audio: (1 + N) >= first_user_position = start_step + 1
+        # So N >= start_step is the first frame with ALL user tokens.
+        if start_step > 0:
+            # Warmup mode: skip to first frame with pure user audio
+            last_aligned_emitted = start_step
+            print(f"[DEBUG STREAM] Warmup mode: skipping to aligned frame {last_aligned_emitted} (first pure user frame)", file=sys.stderr)
+        else:
+            # Normal mode: just skip one transition frame
+            last_aligned_emitted = last_aligned_decoded + 1
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
@@ -1282,8 +1295,8 @@ def run_streaming_generation_loop(
 
     print(f"[DEBUG STREAM] audio_buf.shape={generation.audio_buf.shape}, total_raw_frames={generation.audio_buf.shape[-1]}", file=sys.stderr)
     print(f"[DEBUG STREAM] start_step={start_step}, max_delay={max_delay}", file=sys.stderr)
-    print(f"[DEBUG STREAM] last_aligned_decoded={last_aligned_decoded} (decoder state position)", file=sys.stderr)
-    print(f"[DEBUG STREAM] last_aligned_emitted={last_aligned_emitted} (emit from frame {last_aligned_emitted + 1})", file=sys.stderr)
+    print(f"[DEBUG STREAM] last_aligned_decoded={last_aligned_decoded} (decode from this frame for decoder continuity)", file=sys.stderr)
+    print(f"[DEBUG STREAM] last_aligned_emitted={last_aligned_emitted} (output starts at frame {last_aligned_emitted}, skipping {last_aligned_emitted - last_aligned_decoded} frames)", file=sys.stderr)
     print(f"[DEBUG STREAM] Token IDs: new_word={token_ids.new_word}, pad={token_ids.pad}, spk1={token_ids.spk1}, spk2={token_ids.spk2}", file=sys.stderr)
     print(f"[DEBUG STREAM] Initial state: entries={len(state.entries)}, padding_budget={state.padding_budget}, forced_padding={state.forced_padding}, pending_tokens={list(state.pending_tokens)}", file=sys.stderr)
     print(f"[DEBUG STREAM] Initial state: end_step={state.end_step}", file=sys.stderr)
