@@ -1385,6 +1385,10 @@ def run_streaming_generation_loop(
                 if offset < 10:
                     print(f"[DEBUG GEN] step={t} (offset={offset}): text_token={text_token}, main={main_token}, aux={aux_token}, consumed={consumed_word}", file=sys.stderr)
                     print(f"[DEBUG GEN]   state: entries={len(state.entries)}, pending={len(state.pending_tokens)}, forced_pad={state.forced_padding}, pad_budget={state.padding_budget}", file=sys.stderr)
+                    # Show transcript (words consumed so far) when entry is consumed
+                    if consumed_word and state.transcript:
+                        last_word = state.transcript[-1]
+                        print(f"[DEBUG GEN]   consumed entry: text='{last_word[0]}' at step {last_word[1]}", file=sys.stderr)
 
                 if first_word_frame is None and main_token == token_ids.new_word:
                     first_word_frame = t - config.initial_padding
