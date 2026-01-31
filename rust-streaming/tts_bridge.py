@@ -414,17 +414,17 @@ def process_request(request: dict):
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state)
 
-            # Reset ALL state machine variables to ensure clean transition to user text
-            # - padding_budget=0: forces new_word on first step (consumes first user entry)
-            # - forced_padding=0: prevents forced pad tokens from last warmup entry
-            # - pending_tokens cleared: prevents leftover warmup tokens from being output
-            # - end_step=None: allows generation to continue
-            state.padding_budget = 0
-            state.forced_padding = 0
-            state.pending_tokens.clear()
-            state.end_step = None
+            # Extend with user entries - mimic normal algorithm where entries are in sequence
+            # DON'T reset padding_budget/forced_padding/pending_tokens - let natural state carry through
+            # After warmup flush, these should already be 0/empty (that's what triggered end_step)
+            # Only reset end_step to allow generation to continue
+            print(f"[DEBUG EXTEND] State before extend (cache HIT):", file=sys.stderr)
+            print(f"[DEBUG EXTEND]   padding_budget: {state.padding_budget}", file=sys.stderr)
+            print(f"[DEBUG EXTEND]   forced_padding: {state.forced_padding}", file=sys.stderr)
+            print(f"[DEBUG EXTEND]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+            print(f"[DEBUG EXTEND]   end_step: {state.end_step}", file=sys.stderr)
 
-            # Append user entries to the state (warmup entries already consumed)
+            state.end_step = None  # Allow generation to continue
             state.entries.extend(user_entries)
 
             # Debug: log state after adding user entries
@@ -434,6 +434,10 @@ def process_request(request: dict):
             print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
             print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
             print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
+            # Show first few entries that will be processed
+            print(f"[DEBUG STATE]   first 3 entries to process:", file=sys.stderr)
+            for i, entry in enumerate(list(state.entries)[:3]):
+                print(f"[DEBUG STATE]     [{i}] text='{entry.text}', tokens={entry.tokens}, padding={entry.padding}", file=sys.stderr)
 
             start_step = warmup_steps
         else:
@@ -516,22 +520,30 @@ def process_request(request: dict):
 
             # Cache BOTH gen_state AND state (with warmup entries consumed)
             if use_cache:
+                print(f"[DEBUG CACHE] Caching state for seed {seed}:", file=sys.stderr)
+                print(f"[DEBUG CACHE]   warmup_steps: {warmup_steps}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.end_step: {state.end_step}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.padding_budget: {state.padding_budget}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.forced_padding: {state.forced_padding}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.entries: {len(state.entries)}", file=sys.stderr)
+                print(f"[DEBUG CACHE]   state.transcript: {state.transcript}", file=sys.stderr)
                 rng_state = torch.get_rng_state()
                 cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
                 _cache_put(seed, (gen_state.clone(), state.clone(), rng_state, cuda_rng_state, warmup_steps, decoder_state))
                 _log_cache_entry_size(seed, gen_state, state, decoder_state)
 
-            # Reset ALL state machine variables to ensure clean transition to user text
-            # - padding_budget=0: forces new_word on first step (consumes first user entry)
-            # - forced_padding=0: prevents forced pad tokens from last warmup entry
-            # - pending_tokens cleared: prevents leftover warmup tokens from being output
-            # - end_step=None: allows generation to continue
-            state.padding_budget = 0
-            state.forced_padding = 0
-            state.pending_tokens.clear()
-            state.end_step = None
+            # Extend with user entries - mimic normal algorithm where entries are in sequence
+            # DON'T reset padding_budget/forced_padding/pending_tokens - let natural state carry through
+            # After warmup flush, these should already be 0/empty (that's what triggered end_step)
+            # Only reset end_step to allow generation to continue
+            print(f"[DEBUG EXTEND] State before extend (cache MISS):", file=sys.stderr)
+            print(f"[DEBUG EXTEND]   padding_budget: {state.padding_budget}", file=sys.stderr)
+            print(f"[DEBUG EXTEND]   forced_padding: {state.forced_padding}", file=sys.stderr)
+            print(f"[DEBUG EXTEND]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+            print(f"[DEBUG EXTEND]   end_step: {state.end_step}", file=sys.stderr)
 
-            # Append user entries to the same state (warmup entries now consumed)
+            state.end_step = None  # Allow generation to continue
             state.entries.extend(user_entries)
 
             # Debug: log state after adding user entries
@@ -541,6 +553,10 @@ def process_request(request: dict):
             print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
             print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
             print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
+            # Show first few entries that will be processed
+            print(f"[DEBUG STATE]   first 3 entries to process:", file=sys.stderr)
+            for i, entry in enumerate(list(state.entries)[:3]):
+                print(f"[DEBUG STATE]     [{i}] text='{entry.text}', tokens={entry.tokens}, padding={entry.padding}", file=sys.stderr)
 
         warmup_time = time_module.time() - generation_start
         print(f"[TIMING] Warmup/restore took {warmup_time*1000:.0f}ms", file=sys.stderr)
