@@ -414,6 +414,11 @@ def process_request(request: dict):
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state)
 
+            # Reset padding_budget to 0 to ensure immediate consumption of first user word
+            # Without this, leftover padding from warmup causes gap frames where
+            # the model continues generating warmup audio before the first user word
+            state.padding_budget = 0
+
             # Append user entries to the state (warmup entries already consumed)
             state.entries.extend(user_entries)
             state.end_step = None  # Reset so generation continues
@@ -511,6 +516,11 @@ def process_request(request: dict):
                 cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
                 _cache_put(seed, (gen_state.clone(), state.clone(), rng_state, cuda_rng_state, warmup_steps, decoder_state))
                 _log_cache_entry_size(seed, gen_state, state, decoder_state)
+
+            # Reset padding_budget to 0 to ensure immediate consumption of first user word
+            # Without this, leftover padding from warmup causes gap frames where
+            # the model continues generating warmup audio before the first user word
+            state.padding_budget = 0
 
             # Append user entries to the same state (warmup entries now consumed)
             state.entries.extend(user_entries)
