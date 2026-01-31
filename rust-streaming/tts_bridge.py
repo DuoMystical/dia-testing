@@ -425,6 +425,11 @@ def process_request(request: dict):
             print(f"[DEBUG EXTEND]   end_step: {state.end_step}", file=sys.stderr)
 
             state.end_step = None  # Allow generation to continue
+            # Ensure minimum gap before user content (natural word spacing)
+            # When warmup naturally depletes padding_budget to 0, first user word
+            # would be consumed immediately. Force at least 2 PAD steps.
+            if state.padding_budget < 2:
+                state.forced_padding = max(state.forced_padding, 2)
             state.entries.extend(user_entries)
 
             # Debug: log state after adding user entries
@@ -544,6 +549,11 @@ def process_request(request: dict):
             print(f"[DEBUG EXTEND]   end_step: {state.end_step}", file=sys.stderr)
 
             state.end_step = None  # Allow generation to continue
+            # Ensure minimum gap before user content (natural word spacing)
+            # When warmup naturally depletes padding_budget to 0, first user word
+            # would be consumed immediately. Force at least 2 PAD steps.
+            if state.padding_budget < 2:
+                state.forced_padding = max(state.forced_padding, 2)
             state.entries.extend(user_entries)
 
             # Debug: log state after adding user entries
