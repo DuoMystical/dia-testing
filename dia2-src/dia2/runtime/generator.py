@@ -171,12 +171,15 @@ class WebMOpusStreamer:
         for packet in self._stream.encode(frame):
             self._container.mux(packet)
 
-        # Discard output by advancing _bytes_returned to current buffer position
+        # DON'T discard output - the WebM header is included in these bytes!
+        # If we discard them, the browser's SourceBuffer will fail to decode.
+        # The primed audio (~80ms of transition) will be included in first chunk,
+        # but that's acceptable to ensure the stream plays correctly.
         self._output_buffer.seek(0)
         all_bytes = self._output_buffer.read()
-        self._bytes_returned = len(all_bytes)
+        # Keep _bytes_returned at 0 so header is included in first encode_audio output
 
-        print(f"[WEBM DEBUG] prime_encoder: primed with {len(audio_np)} samples, discarded {len(all_bytes)} bytes", file=sys.stderr)
+        print(f"[WEBM DEBUG] prime_encoder: primed with {len(audio_np)} samples, header+prime={len(all_bytes)} bytes (kept)", file=sys.stderr)
 
     def finalize(self) -> bytes:
         """Finalize the stream and return any remaining data."""
