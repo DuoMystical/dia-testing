@@ -418,6 +418,14 @@ def process_request(request: dict):
             state.entries.extend(user_entries)
             state.end_step = None  # Reset so generation continues
 
+            # Debug: log state after adding user entries
+            print(f"[DEBUG STATE] After cache HIT + user entries:", file=sys.stderr)
+            print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
+            print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
+            print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
+            print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+            print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
+
             start_step = warmup_steps
         else:
             # SLOW PATH: Build initial state and run warmup
@@ -498,6 +506,14 @@ def process_request(request: dict):
             # Append user entries to the same state (warmup entries now consumed)
             state.entries.extend(user_entries)
             state.end_step = None  # Reset so generation continues
+
+            # Debug: log state after adding user entries
+            print(f"[DEBUG STATE] After cache MISS + user entries:", file=sys.stderr)
+            print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
+            print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
+            print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
+            print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+            print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
 
         warmup_time = time_module.time() - generation_start
         print(f"[TIMING] Warmup/restore took {warmup_time*1000:.0f}ms", file=sys.stderr)
