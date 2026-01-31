@@ -389,6 +389,70 @@ def process_request(request: dict):
         for i, entry in enumerate(user_entries[:5]):  # First 5 entries
             print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
 
+        # Debug: compare entry parsing between baseline (full text) and warmup+user
+        debug_compare_entries = config_overrides.get("debug_compare_entries", False)
+        if debug_compare_entries:
+            WARMUP_PHRASE = "[S1] Hello! This is a streaming TTS demo."
+            FULL_TEXT = f"{WARMUP_PHRASE} {text}"
+
+            print(f"\n{'='*60}", file=sys.stderr)
+            print(f"[COMPARE] Entry Parsing Comparison", file=sys.stderr)
+            print(f"{'='*60}", file=sys.stderr)
+            print(f"[COMPARE] Warmup: {WARMUP_PHRASE}", file=sys.stderr)
+            print(f"[COMPARE] User:   {text}", file=sys.stderr)
+            print(f"[COMPARE] Full:   {FULL_TEXT}", file=sys.stderr)
+
+            # Parse full text (baseline)
+            full_normalized = normalize_script(FULL_TEXT)
+            baseline_entries = parse_script([full_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+
+            # Parse warmup separately
+            warmup_entries_for_compare = parse_script([WARMUP_PHRASE], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+
+            # Combined = warmup + user (user already parsed with initial_speaker_idx=0)
+            combined_entries = list(warmup_entries_for_compare) + list(user_entries)
+
+            print(f"\n[COMPARE] Baseline entries ({len(baseline_entries)}):", file=sys.stderr)
+            for i, entry in enumerate(baseline_entries):
+                print(f"[COMPARE]   [{i:2d}] text='{entry.text}' tokens={entry.tokens} padding={entry.padding}", file=sys.stderr)
+
+            print(f"\n[COMPARE] Warmup entries ({len(warmup_entries_for_compare)}):", file=sys.stderr)
+            for i, entry in enumerate(warmup_entries_for_compare):
+                print(f"[COMPARE]   [{i:2d}] text='{entry.text}' tokens={entry.tokens} padding={entry.padding}", file=sys.stderr)
+
+            print(f"\n[COMPARE] User entries ({len(user_entries)}):", file=sys.stderr)
+            for i, entry in enumerate(user_entries):
+                print(f"[COMPARE]   [{i:2d}] text='{entry.text}' tokens={entry.tokens} padding={entry.padding}", file=sys.stderr)
+
+            print(f"\n[COMPARE] Combined entries ({len(combined_entries)}):", file=sys.stderr)
+            for i, entry in enumerate(combined_entries):
+                print(f"[COMPARE]   [{i:2d}] text='{entry.text}' tokens={entry.tokens} padding={entry.padding}", file=sys.stderr)
+
+            # Extract token sequences
+            baseline_tokens = []
+            for entry in baseline_entries:
+                baseline_tokens.extend(entry.tokens)
+
+            combined_tokens = []
+            for entry in combined_entries:
+                combined_tokens.extend(entry.tokens)
+
+            print(f"\n[COMPARE] Token sequences:", file=sys.stderr)
+            print(f"[COMPARE]   Baseline ({len(baseline_tokens)}): {baseline_tokens}", file=sys.stderr)
+            print(f"[COMPARE]   Combined ({len(combined_tokens)}): {combined_tokens}", file=sys.stderr)
+
+            if baseline_tokens == combined_tokens:
+                print(f"\n[COMPARE] *** TOKENS MATCH ***", file=sys.stderr)
+            else:
+                print(f"\n[COMPARE] *** TOKENS DIFFER ***", file=sys.stderr)
+                for i in range(max(len(baseline_tokens), len(combined_tokens))):
+                    bt = baseline_tokens[i] if i < len(baseline_tokens) else None
+                    ct = combined_tokens[i] if i < len(combined_tokens) else None
+                    if bt != ct:
+                        print(f"[COMPARE]   First diff at index {i}: baseline={bt}, combined={ct}", file=sys.stderr)
+                        break
+            print(f"{'='*60}\n", file=sys.stderr)
+
         if cached_state is not None:
             # FAST PATH: Restore from cache
             print(f"[CACHE] HIT - Restoring state for seed {seed}", file=sys.stderr)
