@@ -477,6 +477,15 @@ def process_request(request: dict):
             )
             start_step = warmup_steps
 
+            # Debug: log state RIGHT after warmup (before user entries added)
+            print(f"[DEBUG STATE] State RIGHT after warmup (before user entries):", file=sys.stderr)
+            print(f"[DEBUG STATE]   warmup_steps: {warmup_steps}", file=sys.stderr)
+            print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
+            print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
+            print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
+            print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
+            print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+
             # Build decoder state by decoding warmup audio (discard the audio, keep the state)
             # This primes the Mimi decoder's convolutional padding cache
             warmup_codes = gen_state.audio_buf[0, :, :warmup_steps + 1]  # (codebooks, steps)
