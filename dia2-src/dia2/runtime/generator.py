@@ -1230,8 +1230,15 @@ def run_streaming_generation_loop(
     # - Frame 122 uses tokens 122-140, has 2 user tokens (139, 140)
     #
     # First user audio starts at step start_step, writes to position start_step+1.
-    last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # First frame to decode in streaming
-    last_aligned_emitted = last_aligned_decoded + 1  # Skip transition frame, output from frame with more user influence
+    if streaming_config.debug_include_warmup:
+        # Debug mode: output ALL audio including warmup, decode from frame 0
+        last_aligned_decoded = 0
+        last_aligned_emitted = 0
+        decoder_state = None  # Force fresh decode from start
+        print(f"[DEBUG STREAM] debug_include_warmup=True: outputting ALL frames from 0, ignoring cached decoder_state", file=sys.stderr)
+    else:
+        last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # First frame to decode in streaming
+        last_aligned_emitted = last_aligned_decoded + 1  # Skip transition frame, output from frame with more user influence
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)
