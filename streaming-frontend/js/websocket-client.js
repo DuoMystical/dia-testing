@@ -114,7 +114,8 @@ class WebSocketClient {
             // Seed (empty string = random)
             seed: options.seed || '',
             // Debug options
-            debug_include_warmup: options.debugIncludeWarmup || false
+            debug_include_warmup: options.debugIncludeWarmup || false,
+            debug_compare_entries: options.debugCompareEntries || false
         };
 
         // Add voice cloning audio if provided
@@ -165,7 +166,8 @@ class WebSocketClient {
             // Seed (empty string = random)
             seed: options.seed || '',
             // Debug options
-            debug_include_warmup: options.debugIncludeWarmup || false
+            debug_include_warmup: options.debugIncludeWarmup || false,
+            debug_compare_entries: options.debugCompareEntries || false
         };
 
         // Add voice cloning audio if provided
