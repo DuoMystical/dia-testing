@@ -375,8 +375,10 @@ def process_request(request: dict):
             cached_state = _cache_get(seed)
 
         # Parse user text into entries (needed for both cache hit and miss)
+        # Warmup phrase is "[S1] Hello! This is a streaming TTS demo." so last speaker is S1 (index 0)
+        # Pass initial_speaker_idx=0 to continue seamlessly without re-inserting [S1] token
         text_normalized = normalize_script(text)
-        user_entries = parse_script([text_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+        user_entries = parse_script([text_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate, initial_speaker_idx=0)
 
         if cached_state is not None:
             # FAST PATH: Restore from cache

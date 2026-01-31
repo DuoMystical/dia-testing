@@ -983,10 +983,13 @@ def run_seed_warmup(
     transformer_capture = None
     dep_captures = None
 
+    # Compute max_delay for proper flush timing (same as streaming loop)
+    max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
+
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
 
-    print(f"[WARMUP] Running warmup (min_steps={min_steps}, max_steps={max_steps})", file=sys.stderr)
+    print(f"[WARMUP] Running warmup (min_steps={min_steps}, max_steps={max_steps}, max_delay={max_delay})", file=sys.stderr)
 
     warmup_steps = 0
     with torch.inference_mode():
@@ -1097,10 +1100,14 @@ def run_seed_warmup(
 
             warmup_steps = t + 1
 
-            # Check if warmup is complete: entries consumed AND minimum steps reached
+            # Check if warmup is complete: entries consumed AND audio flushed through codec delay
+            # After end_step (text consumed), we need max_delay more steps to flush audio
             if warmup_state is not None and warmup_state.end_step is not None:
-                if warmup_steps >= min_steps:
-                    print(f"[WARMUP] Entries consumed at step {warmup_state.end_step}, stopping at {warmup_steps} steps", file=sys.stderr)
+                # Target: end_step + max_delay to complete audio for consumed text
+                # This matches streaming loop's eos_cutoff = end_step + flush_tail
+                target_steps = warmup_state.end_step + max_delay
+                if warmup_steps >= target_steps and warmup_steps >= min_steps:
+                    print(f"[WARMUP] Entries consumed at step {warmup_state.end_step}, flushed to {warmup_steps} steps (target={target_steps})", file=sys.stderr)
                     break
 
     print(f"[WARMUP] Completed {warmup_steps} warmup steps", file=sys.stderr)
@@ -1208,22 +1215,23 @@ def run_streaming_generation_loop(
     # Use provided state (from warmup cache) or start fresh
     #
     # We track TWO separate positions:
-    # 1. last_aligned_decoded - where the decoder has processed up to (aligned frame index)
-    # 2. last_aligned_emitted - what audio we've outputted (aligned frame index)
+    # 1. last_aligned_decoded - first aligned frame index to decode (decoder's next frame)
+    # 2. last_aligned_emitted - last aligned frame we've outputted
     #
-    # The decoder was primed during warmup with aligned frames 0 to (start_step - max_delay).
-    # To avoid outputting warmup audio, we skip until we have pure user audio.
+    # With warmup properly flushed, start_step = end_step + max_delay.
+    # The decoder was primed during warmup on aligned frames 0 to (start_step - max_delay).
     #
-    # Aligned frame N uses raw tokens from positions N to N+max_delay. At step t, we write
-    # to position t+1, so warmup (steps 0 to start_step-1) writes positions 1 to start_step.
-    # First user token is at position start_step+1 (written at step start_step).
+    # Example with end_step=120, max_delay=18:
+    # - warmup_steps = 120 + 18 = 138 (flushed for max_delay after text consumed)
+    # - Decoder primed on aligned frames 0 to 120 (121 total)
+    # - last_aligned_decoded = (138+1) - 18 = 121 (first frame to decode)
+    # - Frame 121 uses tokens 121-139, position 139 is first user token
+    # - last_aligned_emitted = 122 skips the transition frame (mostly warmup)
+    # - Frame 122 uses tokens 122-140, has 2 user tokens (139, 140)
     #
-    # Frame last_aligned_decoded uses tokens [last_aligned_decoded, last_aligned_decoded+max_delay].
-    # With start_step=36, max_delay=18: last_aligned_decoded=19, uses tokens 19-36 = ALL warmup.
-    # Frame 20 uses tokens 20-37, which INCLUDES the first user token (37).
-    # Set last_aligned_emitted = last_aligned_decoded + 1 to skip the pure-warmup frame.
-    last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # Where decoder left off
-    last_aligned_emitted = last_aligned_decoded + 1  # Skip pure-warmup frame, output from first user-influenced frame
+    # First user audio starts at step start_step, writes to position start_step+1.
+    last_aligned_decoded = max(0, (start_step + 1) - max_delay)  # First frame to decode in streaming
+    last_aligned_emitted = last_aligned_decoded + 1  # Skip transition frame, output from frame with more user influence
 
     # DEBUG: Log decoder_state info at start
     print(f"[DEBUG STREAM] decoder_state provided: {decoder_state is not None}", file=sys.stderr)

@@ -11,12 +11,25 @@ def parse_script(
     tokenizer,
     constants,
     frame_rate: float,
+    initial_speaker_idx: Optional[int] = None,
 ) -> List[Entry]:
+    """
+    Parse script text into entries for the state machine.
+
+    Args:
+        script: Lines of text to parse
+        tokenizer: Tokenizer for encoding words
+        constants: Token IDs (spk1, spk2, etc.)
+        frame_rate: Frames per second for timing calculations
+        initial_speaker_idx: Starting speaker index (0=S1, 1=S2). If provided,
+            first word won't get speaker token auto-inserted if same speaker.
+            Use this to continue seamlessly from a previous generation.
+    """
     entries: List[Entry] = []
     speaker_tokens = [constants.spk1, constants.spk2]
     padding_between = 1
     event_re = re.compile(r"(?:<break\s+time=\"([0-9]+(?:.[0-9]*)?)s\"\s*/?>)|(?:\s+)")
-    last_speaker_idx = [None]
+    last_speaker_idx = [initial_speaker_idx]
 
     def add_entry(idx: int, word: str, *, pending: Optional[int], first_content: List[bool]):
         tokens: List[int]
