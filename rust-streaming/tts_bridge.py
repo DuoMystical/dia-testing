@@ -250,22 +250,20 @@ def load_model(model_size: str):
 def generate_stream_with_logging(
     model,
     script,
-    config,
-    streaming_config,
+    config=None,
+    streaming_config=None,
     prefix_speaker_1=None,
     prefix_speaker_2=None,
+    include_prefix=None,
     verbose=False,
 ):
     """
-    Exact replica of Dia2.generate_stream from d79e326, with added logging.
-    This allows us to capture internal state (audio_buf, entries, etc.) for comparison.
+    1:1 COPY of Dia2.generate_stream from d79e326, with logging added.
+    DO NOT MODIFY THE LOGIC - ONLY ADD LOGGING BETWEEN LINES.
     """
-    import sys
-    from dia2 import (
-        StreamingConfig as SC,
-        StatusEvent,
-    )
-    from dia2.generation import normalize_script, merge_generation_config, PrefixConfig
+    # --- 1:1 COPY FROM d79e326 STARTS HERE ---
+    from dia2 import StreamingConfig, StatusEvent
+    from dia2.generation import normalize_script, merge_generation_config
     from dia2.runtime.voice_clone import build_prefix_plan
     from dia2.runtime.script_parser import parse_script
     from dia2.runtime.generator import (
@@ -280,75 +278,79 @@ def generate_stream_with_logging(
 
     # Use default streaming config if not provided
     if streaming_config is None:
-        streaming_config = SC()
+        streaming_config = StreamingConfig()
 
-    # Build prefix config if voice cloning is used
-    prefix_config = None
-    if prefix_speaker_1 or prefix_speaker_2:
-        prefix_config = PrefixConfig(
-            speaker_1=prefix_speaker_1,
-            speaker_2=prefix_speaker_2,
-            include_audio=False,
-        )
+    # Merge configuration
+    merged_overrides = dict()
+    if prefix_speaker_1 is not None:
+        merged_overrides["prefix_speaker_1"] = prefix_speaker_1
+    if prefix_speaker_2 is not None:
+        merged_overrides["prefix_speaker_2"] = prefix_speaker_2
+    if include_prefix is not None:
+        merged_overrides["include_prefix"] = include_prefix
 
-    # Merge configuration (simplified - just use config directly since we built it)
-    merged = config
+    merged = merge_generation_config(base=config or model.default_config, overrides=merged_overrides)
 
     max_context = runtime.config.runtime.max_context_steps
     text = normalize_script(script)
-    prefix_plan = build_prefix_plan(runtime, prefix_config)
+    prefix_plan = build_prefix_plan(runtime, merged.prefix)
 
-    # === LOGGING: Parse entries ===
     entries = []
     if prefix_plan is not None:
         entries.extend(prefix_plan.entries)
     entries.extend(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
 
-    print(f"\n[BASELINE LOGGING] Parsed {len(entries)} entries:", file=sys.stderr)
+    # === LOGGING: entries (matches warmup format) ===
+    print(f"[DEBUG ENTRIES] Baseline entries ({len(entries)} total):", file=sys.stderr)
     for i, entry in enumerate(entries):
-        print(f"[BASELINE LOGGING]   [{i:2d}] text='{entry.text}' tokens={entry.tokens} padding={entry.padding}", file=sys.stderr)
+        print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
 
-    # === LOGGING: initial_padding setting ===
-    print(f"[BASELINE LOGGING] config.initial_padding={getattr(merged, 'initial_padding', 'NOT SET')}", file=sys.stderr)
-    print(f"[BASELINE LOGGING] runtime.machine.initial_padding (before)={runtime.machine.initial_padding}", file=sys.stderr)
+    # === LOGGING: initial_padding before/after ===
+    print(f"[DEBUG STATE] runtime.machine.initial_padding (before): {runtime.machine.initial_padding}", file=sys.stderr)
+    print(f"[DEBUG STATE] merged.initial_padding: {merged.initial_padding}", file=sys.stderr)
 
-    # Set initial_padding from config (this is what d79e326 does via merge_generation_config)
-    if hasattr(merged, 'initial_padding'):
-        runtime.machine.initial_padding = merged.initial_padding
-    print(f"[BASELINE LOGGING] runtime.machine.initial_padding (after)={runtime.machine.initial_padding}", file=sys.stderr)
+    runtime.machine.initial_padding = merged.initial_padding
 
-    print(f"[BASELINE LOGGING] Starting streaming generation: max_context={max_context} cfg_scale={merged.cfg_scale:.2f} chunk_size={streaming_config.chunk_size_frames} frames", file=sys.stderr)
+    # === LOGGING: initial_padding after setting ===
+    print(f"[DEBUG STATE] runtime.machine.initial_padding (after): {runtime.machine.initial_padding}", file=sys.stderr)
 
-    # === LOGGING: Create state ===
+    logger.event(
+        f"starting streaming generation: max_context={max_context} cfg_scale={merged.cfg_scale:.2f} "
+        f"chunk_size={streaming_config.chunk_size_frames} frames"
+    )
+
     state = runtime.machine.new_state(entries)
-    print(f"[BASELINE LOGGING] State created:", file=sys.stderr)
-    print(f"[BASELINE LOGGING]   padding_budget={state.padding_budget}", file=sys.stderr)
-    print(f"[BASELINE LOGGING]   forced_padding={state.forced_padding}", file=sys.stderr)
-    print(f"[BASELINE LOGGING]   pending_tokens={list(state.pending_tokens)}", file=sys.stderr)
 
-    # === LOGGING: Build initial generation state ===
+    # === LOGGING: state after creation (matches warmup format) ===
+    print(f"[DEBUG STATE] State after new_state:", file=sys.stderr)
+    print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
+    print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
+    print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
+    print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+    print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
+
     gen_state = build_initial_state(
         runtime,
         prefix=prefix_plan,
     )
-    print(f"[BASELINE LOGGING] gen_state.audio_buf.shape={gen_state.audio_buf.shape}", file=sys.stderr)
-    print(f"[BASELINE LOGGING] gen_state.audio_buf[0,0,:5]={gen_state.audio_buf[0,0,:5].tolist()}", file=sys.stderr)
+
+    # === LOGGING: gen_state after creation ===
+    print(f"[DEBUG STATE] gen_state.audio_buf.shape: {gen_state.audio_buf.shape}", file=sys.stderr)
+    print(f"[DEBUG STATE] gen_state.audio_buf[0,0,:10]: {gen_state.audio_buf[0,0,:10].tolist()}", file=sys.stderr)
 
     start_step = 0
     if prefix_plan is not None:
         logger.event(f"warming up with prefix ({prefix_plan.aligned_frames} frames)")
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
 
+    # === LOGGING: before generation loop ===
+    print(f"[DEBUG STATE] Before generation loop:", file=sys.stderr)
+    print(f"[DEBUG STATE]   start_step: {start_step}", file=sys.stderr)
+
     # Yield status event for prefix warmup
     yield StatusEvent(message="Prefix warmup complete" if prefix_plan else "Ready to generate", progress=0.0)
 
-    # === LOGGING: Log audio_buf before generation ===
-    print(f"[BASELINE LOGGING] Before generation loop:", file=sys.stderr)
-    print(f"[BASELINE LOGGING]   start_step={start_step}", file=sys.stderr)
-    print(f"[BASELINE LOGGING]   audio_buf[0,0,:10]={gen_state.audio_buf[0,0,:10].tolist()}", file=sys.stderr)
-
     # Run streaming generation loop and yield all events
-    # We need to intercept to log audio tokens
     for event in run_streaming_generation_loop(
         runtime,
         state=state,
@@ -360,22 +362,26 @@ def generate_stream_with_logging(
     ):
         yield event
 
-    # === LOGGING: Log final state ===
-    print(f"\n[BASELINE LOGGING] After generation loop:", file=sys.stderr)
-    print(f"[BASELINE LOGGING]   state.end_step={state.end_step}", file=sys.stderr)
-    print(f"[BASELINE LOGGING]   state.transcript={state.transcript}", file=sys.stderr)
-    print(f"[BASELINE LOGGING]   audio_buf.shape={gen_state.audio_buf.shape}", file=sys.stderr)
+    # === LOGGING: after generation loop (matches warmup format) ===
+    print(f"[DEBUG STATE] After generation loop:", file=sys.stderr)
+    print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
+    print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
+    print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
+    print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
+    print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+    print(f"[DEBUG STATE]   transcript: {state.transcript}", file=sys.stderr)
+    print(f"[DEBUG STATE]   audio_buf.shape: {gen_state.audio_buf.shape}", file=sys.stderr)
 
-    # Log first 20 CB0 tokens
+    # === LOGGING: CB0 tokens for comparison ===
     end_step = state.end_step or gen_state.audio_buf.shape[-1]
-    cb0_tokens = gen_state.audio_buf[0, 0, :min(end_step+1, 50)].cpu().tolist()
-    print(f"[BASELINE LOGGING]   CB0 tokens[0:50]: {cb0_tokens}", file=sys.stderr)
+    cb0_tokens = gen_state.audio_buf[0, 0, :min(end_step+1, 100)].cpu().tolist()
+    print(f"[DEBUG STATE] CB0 tokens[0:{min(end_step+1, 100)}]: {cb0_tokens}", file=sys.stderr)
 
-    # Store audio_buf on the generator for later comparison
-    # We'll access this after iteration
+    # Store for external access after iteration
     generate_stream_with_logging.last_audio_buf = gen_state.audio_buf.clone()
     generate_stream_with_logging.last_end_step = state.end_step
     generate_stream_with_logging.last_transcript = list(state.transcript)
+    # --- 1:1 COPY FROM d79e326 ENDS HERE ---
 
 
 def run_baseline_d79e326(request: dict, model, seed: int):
@@ -1049,6 +1055,21 @@ def process_request(request: dict):
 
         elapsed = time_module.time() - generation_start
         print(f"[TIMING] Generation finished. Events: {event_count}, Chunks: {audio_chunk_count}, Time: {elapsed*1000:.0f}ms", file=sys.stderr)
+
+        # === LOGGING: after generation loop (matches baseline format for comparison) ===
+        print(f"[DEBUG STATE] After generation loop:", file=sys.stderr)
+        print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
+        print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
+        print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
+        print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
+        print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
+        print(f"[DEBUG STATE]   transcript: {state.transcript}", file=sys.stderr)
+        print(f"[DEBUG STATE]   audio_buf.shape: {gen_state.audio_buf.shape}", file=sys.stderr)
+
+        # === LOGGING: CB0 tokens for comparison with baseline ===
+        end_step = state.end_step or gen_state.audio_buf.shape[-1]
+        cb0_tokens = gen_state.audio_buf[0, 0, :min(end_step+1, 100)].cpu().tolist()
+        print(f"[DEBUG STATE] CB0 tokens[0:{min(end_step+1, 100)}]: {cb0_tokens}", file=sys.stderr)
 
     except Exception as e:
         import traceback
