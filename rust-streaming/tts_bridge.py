@@ -657,9 +657,10 @@ def process_request(request: dict):
             for i, entry in enumerate(warmup_entries):
                 print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
 
-            # Create state with default initial_padding (matches baseline behavior)
-            # Baseline doesn't set runtime.machine.initial_padding, so neither should warmup
+            # Set initial_padding to 2 for proper warmup padding structure
+            runtime.machine.initial_padding = 2
             state = runtime.machine.new_state(warmup_entries)
+            runtime.machine.initial_padding = 0  # Reset to avoid side effects
 
             # Get max_delay for minimum warmup steps (codec alignment requirement)
             max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
