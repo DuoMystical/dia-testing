@@ -361,6 +361,9 @@ def process_request(request: dict):
         chunk_size = config_overrides.get("chunk_size_frames", 1)
         min_chunk = config_overrides.get("min_chunk_frames", 1)
         debug_include_warmup = config_overrides.get("debug_include_warmup", False)
+        debug_skip_warmup = config_overrides.get("debug_skip_warmup", False)
+        if debug_skip_warmup:
+            print(f"[DEBUG] debug_skip_warmup=True: running in baseline mode (no warmup)", file=sys.stderr)
         streaming_config = StreamingConfig(
             chunk_size_frames=chunk_size,
             min_chunk_frames=min_chunk,
@@ -484,12 +487,10 @@ def process_request(request: dict):
             full_normalized = normalize_script(FULL_TEXT)
             baseline_entries = parse_script([full_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate)
 
-            # Create baseline state with full text
-            runtime.machine.initial_padding = 19  # Standard padding
+            # Create baseline state with full text (use default initial_padding)
             baseline_state = runtime.machine.new_state(baseline_entries)
-            runtime.machine.initial_padding = 0
 
-            # Create baseline gen config (no torch.compile to avoid RNG issues on first run)
+            # Create baseline gen config - this is the CORRECT config that produces good audio
             baseline_gen_config = GenerationConfig(
                 text=SamplingConfig(
                     temperature=config_overrides.get("text_temperature", 0.6),
@@ -501,9 +502,9 @@ def process_request(request: dict):
                 ),
                 cfg_scale=config_overrides.get("cfg_scale", 2.0),
                 cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
-                initial_padding=19,
+                initial_padding=19,  # Baseline uses 19 (>= max_delay for proper codec alignment)
                 use_cuda_graph=True,
-                use_torch_compile=True,  # Same as normal run
+                use_torch_compile=True,
             )
 
             # Run baseline generation (non-streaming)
@@ -523,10 +524,12 @@ def process_request(request: dict):
             print(f"[AUDIO COMPARE] Baseline completed in {baseline_elapsed:.2f}s", file=sys.stderr)
             print(f"[AUDIO COMPARE] Baseline end_step: {baseline_state.end_step}", file=sys.stderr)
             print(f"[AUDIO COMPARE] Baseline audio_buf shape: {baseline_gen_state.audio_buf.shape}", file=sys.stderr)
+            print(f"[AUDIO COMPARE] Baseline word timing: {baseline_state.transcript}", file=sys.stderr)
 
             # Save baseline audio buffer for later comparison
             baseline_audio_buf = baseline_gen_state.audio_buf.clone()
             baseline_end_step = baseline_state.end_step
+            baseline_transcript = list(baseline_state.transcript)  # Save for comparison
 
             # Restore RNG state for warmup+extend run
             torch.set_rng_state(saved_rng_state)
@@ -542,7 +545,39 @@ def process_request(request: dict):
             print(f"[AUDIO COMPARE] Now running warmup+extend for comparison...", file=sys.stderr)
             print(f"{'='*60}\n", file=sys.stderr)
 
-        if cached_state is not None:
+        # BASELINE MODE: Skip warmup entirely if debug flag is set
+        if debug_skip_warmup:
+            print(f"[BASELINE MODE] Running without warmup...", file=sys.stderr)
+            emit_status("Generating audio (baseline mode)...", 0.1)
+
+            # Build prefix plan for voice cloning (same as normal path)
+            prefix_config = None
+            if prefix_speaker_1 or prefix_speaker_2:
+                prefix_config = PrefixConfig(
+                    speaker_1=prefix_speaker_1,
+                    speaker_2=prefix_speaker_2,
+                    include_audio=False,
+                )
+            prefix_plan = build_prefix_plan(runtime, prefix_config)
+
+            # Build initial generation state
+            gen_state = build_initial_state(runtime, prefix=prefix_plan)
+
+            # Parse user text directly (no warmup phrase)
+            # Use fresh parse without initial_speaker_idx to auto-insert [S1] if needed
+            text_normalized = normalize_script(text)
+            baseline_user_entries = parse_script([text_normalized], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+
+            # Create state with user entries only
+            state = runtime.machine.new_state(baseline_user_entries)
+
+            # Start from step 0, no warmup
+            start_step = 0
+            decoder_state = None  # No warmup audio, no decoder state
+
+            print(f"[BASELINE MODE] Starting generation from step 0 with {len(baseline_user_entries)} entries", file=sys.stderr)
+
+        elif cached_state is not None:
             # FAST PATH: Restore from cache
             print(f"[CACHE] HIT - Restoring state for seed {seed}", file=sys.stderr)
             emit_status("Using cached voice...", 0.1)
@@ -578,11 +613,6 @@ def process_request(request: dict):
             print(f"[DEBUG EXTEND]   end_step: {state.end_step}", file=sys.stderr)
 
             state.end_step = None  # Allow generation to continue
-            # Ensure minimum gap before user content (natural word spacing)
-            # When warmup naturally depletes padding_budget to 0, first user word
-            # would be consumed immediately. Force at least 2 PAD steps.
-            if state.padding_budget < 2:
-                state.forced_padding = max(state.forced_padding, 2)
             state.entries.extend(user_entries)
 
             # Debug: log state after adding user entries
@@ -627,13 +657,9 @@ def process_request(request: dict):
             for i, entry in enumerate(warmup_entries):
                 print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
 
-            # Set initial_padding to 2 (original Dia default) for proper padding structure:
-            # - 2 frames forced padding
-            # - then warmup phrase processing
-            # - total steps >= max_delay+1 to cover codec delay
-            runtime.machine.initial_padding = 2
+            # Create state with default initial_padding (matches baseline behavior)
+            # Baseline doesn't set runtime.machine.initial_padding, so neither should warmup
             state = runtime.machine.new_state(warmup_entries)
-            runtime.machine.initial_padding = 0  # Reset to avoid side effects
 
             # Get max_delay for minimum warmup steps (codec alignment requirement)
             max_delay = max(runtime.audio_delays) if runtime.audio_delays else 0
@@ -702,11 +728,6 @@ def process_request(request: dict):
             print(f"[DEBUG EXTEND]   end_step: {state.end_step}", file=sys.stderr)
 
             state.end_step = None  # Allow generation to continue
-            # Ensure minimum gap before user content (natural word spacing)
-            # When warmup naturally depletes padding_budget to 0, first user word
-            # would be consumed immediately. Force at least 2 PAD steps.
-            if state.padding_budget < 2:
-                state.forced_padding = max(state.forced_padding, 2)
             state.entries.extend(user_entries)
 
             # Debug: log state after adding user entries
