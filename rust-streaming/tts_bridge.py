@@ -326,7 +326,6 @@ def run_baseline_d79e326(request: dict, model, seed: int):
         emit_status("Starting generation...", 0.2)
 
         # Build generation config
-        # NOTE: initial_padding=2 is the d79e326 default (current default is 19)
         gen_config = GenerationConfig(
             text=SamplingConfig(
                 temperature=config_overrides.get("text_temperature", 0.6),
@@ -338,7 +337,6 @@ def run_baseline_d79e326(request: dict, model, seed: int):
             ),
             cfg_scale=config_overrides.get("cfg_scale", 2.0),
             cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
-            initial_padding=2,  # d79e326 default was 2, current default is 19
             use_cuda_graph=True,
             use_torch_compile=False,
         )
@@ -565,9 +563,8 @@ def process_request(request: dict):
             ),
             cfg_scale=config_overrides.get("cfg_scale", 2.0),
             cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
-            initial_padding=19,  # Must be >= max_delay (18) for caching
             use_cuda_graph=True,
-            use_torch_compile=False,  # Disabled to avoid RNG issues
+            use_torch_compile=False,
         )
 
         # Streaming config
