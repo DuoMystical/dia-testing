@@ -83,7 +83,7 @@ class GenerationConfig:
     audio: SamplingConfig = field(default_factory=_default_audio_sampling)
     cfg_scale: float = 6.0  # Official Dia2 recommendation
     cfg_filter_k: int = 50
-    initial_padding: int = 19  # Must be >= max_delay (18) for seed caching to work
+    initial_padding: int = 2  # d79e326 default (warmup path sets 19 explicitly)
     prefix: Optional["PrefixConfig"] = None
     use_cuda_graph: bool = False
     use_torch_compile: bool = False

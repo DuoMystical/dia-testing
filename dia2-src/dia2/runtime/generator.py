@@ -946,6 +946,10 @@ def run_seed_warmup(
     building up the KV cache and audio buffer. The warmup phrase ensures
     consistent behavior across different user texts when using the same seed.
 
+    IMPORTANT: This function's generation loop is 1:1 COPIED from d79e326's
+    run_streaming_generation_loop to ensure warmup produces the same tokens
+    as baseline would for the same input.
+
     Args:
         runtime: Runtime context
         generation: Initial generation state
@@ -958,6 +962,8 @@ def run_seed_warmup(
         Tuple of (generation_state, warmup_steps) where warmup_steps is the
         number of steps actually run.
     """
+    # === 1:1 COPY from d79e326 run_streaming_generation_loop ===
+    import time
     import sys
 
     step_tokens = generation.step_tokens
@@ -970,10 +976,25 @@ def run_seed_warmup(
     cfg_active = config.cfg_scale != 1.0
     token_ids = runtime.constants
     delay_tensor = runtime.audio_delay_tensor
+    max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
+    flush_tail = max_delay
+    first_word_frame: Optional[int] = None
+    first_word_frame_applied = False
+    eos_cutoff: Optional[int] = None
+    start_step = 0  # Warmup always starts from 0
+    last_step = start_step - 1
 
     use_graph = config.use_cuda_graph and runtime.device.type == "cuda"
-    sample_token_fn = sample_token
-    sample_audio_logits_fn = sample_audio_logits
+    use_torch_compile = config.use_torch_compile and runtime.device.type == "cuda"
+    transformer_needs_compiling = use_torch_compile
+    depformer_needs_compiling = [use_torch_compile] * runtime.model.depformer.num_depth
+
+    if use_torch_compile:
+        sample_token_fn = torch.compile(sample_token, dynamic=True, mode="max-autotune", fullgraph=True)
+        sample_audio_logits_fn = torch.compile(sample_audio_logits, dynamic=True, mode="max-autotune", fullgraph=True)
+    else:
+        sample_token_fn = sample_token
+        sample_audio_logits_fn = sample_audio_logits
 
     transformer_step = runtime.transformer_step
     depformer_step = runtime.depformer_step
@@ -981,16 +1002,44 @@ def run_seed_warmup(
     positions_view = positions.expand(branches, -1)
 
     transformer_capture = None
-    dep_captures = None
-
+    dep_captures: list[dict] | None = None
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
+
+    timing_stats = {
+        'transformer_step': 0.0,
+        'text_sampling': 0.0,
+        'machine_process': 0.0,
+        'audio_sampling': 0.0,
+        'depformer_stages': 0.0,
+        'audio_decode': 0.0,
+        'cuda_graph_capture': 0.0,
+        'step_count': 0,
+    }
+    first_step_time = None
+    cuda_graph_captured = False
+    generation_start_time = time.time()
 
     print(f"[WARMUP] Running warmup (min_steps={min_steps}, max_steps={max_steps})", file=sys.stderr)
 
     warmup_steps = 0
     with torch.inference_mode():
-        for t in range(max_steps):
+        for offset in range(max_steps):
+            step_start = time.time()
+
+            if first_step_time is None:
+                first_step_time = step_start
+
+            if use_torch_compile:
+                torch.compiler.cudagraph_mark_step_begin()
+
+            t = start_step + offset
+
+            if eos_cutoff is not None and t >= eos_cutoff:
+                break
+            if t + 1 >= audio_buf.shape[-1]:
+                break
+
             generation.reset_dep_cache()
             positions.fill_(t)
             _fill_audio_channels(step_tokens, audio_buf, delay_tensor, t, token_ids.audio_bos)
@@ -999,63 +1048,74 @@ def run_seed_warmup(
                 step_tokens[1:, 0, 0] = token_ids.zero
                 step_tokens[1:, 1, 0] = token_ids.pad
 
-            # Run transformer
-            if use_graph and transformer_capture is not None:
-                transformer_capture[0].replay()
-                hidden_t = transformer_capture[1]
-            else:
-                if use_graph and transformer_capture is None:
-                    torch.cuda.synchronize()
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        hidden_t = _execute_transformer_step(
-                            step_tokens, positions_view, generation,
-                            transformer_step, buffers,
-                        )
-                    transformer_capture = (graph, hidden_t)
-                    # Initialize dep_captures
-                    dep_captures = []
-                    for idx in range(runtime.model.depformer.num_depth):
-                        dep_captures.append({
-                            "graph": torch.cuda.CUDAGraph(),
-                            "captured": False,
-                            "prev_audio": torch.empty((branches,), dtype=torch.long, device=runtime.device),
-                            "main_tokens": torch.empty((branches,), dtype=torch.long, device=runtime.device) if idx == 0 else None,
-                            "second_tokens": torch.empty((branches,), dtype=torch.long, device=runtime.device) if idx == 0 else None,
-                        })
-                else:
-                    hidden_t = _execute_transformer_step(
-                        step_tokens, positions_view, generation,
-                        transformer_step, buffers,
-                    )
+            # Transformer step - use CUDA graph if enabled
+            t0 = time.time()
+            is_graph_capture = (use_graph and transformer_capture is None)
 
-            # Sample text token
+            if transformer_needs_compiling or not use_graph:
+                if transformer_needs_compiling:
+                    transformer_step = torch.compile(
+                        runtime.transformer_step,
+                        dynamic=True,
+                        mode="max-autotune-no-cudagraphs",
+                    )
+                    transformer_needs_compiling = False
+                hidden_t = _execute_transformer_step(
+                    step_tokens,
+                    positions_view,
+                    generation,
+                    transformer_step,
+                    buffers,
+                )
+            else:
+                transformer_capture, dep_captures = _execute_transformer_graph(
+                    runtime=runtime,
+                    step_tokens=step_tokens,
+                    positions_view=positions_view,
+                    branches=branches,
+                    generation=generation,
+                    transformer_step=transformer_step,
+                    buffers=buffers,
+                    transformer_capture=transformer_capture,
+                    dep_captures=dep_captures,
+                )
+                hidden_t = transformer_capture[1]
+
+            t1 = time.time()
+            if is_graph_capture:
+                timing_stats['cuda_graph_capture'] += (t1 - t0)
+                cuda_graph_captured = True
+            else:
+                timing_stats['transformer_step'] += (t1 - t0)
+
+            # Text token sampling
+            t0 = time.time()
             guided_text = apply_classifier_guidance(buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k)
             if guided_text.shape[0] > 1:
                 guided_text = guided_text[:1]
-            text_token = sample_token_fn(guided_text, temp=config.text.temperature, top_k=config.text.top_k).item()
 
-            # Process through state machine with warmup phrase (or use pad if no state)
-            if warmup_state is not None:
-                main_token, aux_token, consumed = runtime.machine.process(t, warmup_state, text_token)
-                second_token = aux_token if aux_token != -1 else token_ids.pad
+            text_token = sample_token_fn(
+                guided_text,
+                temp=config.text.temperature,
+                top_k=config.text.top_k,
+            ).item()
+            t1 = time.time()
+            timing_stats['text_sampling'] += (t1 - t0)
 
-                # Log warmup state machine behavior for debugging
-                # Log every step to understand the padding pattern
-                if t < 10 or consumed or warmup_state.end_step is not None:
-                    print(f"[WARMUP STEP] t={t}: main={main_token}, consumed={consumed}, end_step={warmup_state.end_step}", file=sys.stderr)
-                    print(f"[WARMUP STEP]   entries={len(warmup_state.entries)}, pending={len(warmup_state.pending_tokens)}, forced_pad={warmup_state.forced_padding}, pad_budget={warmup_state.padding_budget}", file=sys.stderr)
-                    if consumed and warmup_state.transcript:
-                        last_word = warmup_state.transcript[-1]
-                        print(f"[WARMUP STEP]   consumed: '{last_word[0]}' at step {last_word[1]}", file=sys.stderr)
-            else:
-                # Fallback: use pad tokens (old behavior)
-                main_token = token_ids.pad
-                second_token = token_ids.pad
+            t0 = time.time()
+            main_token, aux_token, _ = runtime.machine.process(t, warmup_state, text_token)
+            second_token = aux_token if aux_token != -1 else token_ids.pad
+            t1 = time.time()
+            timing_stats['machine_process'] += (t1 - t0)
+
+            if first_word_frame is None and main_token == token_ids.new_word:
+                first_word_frame = t - config.initial_padding
+
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = second_token
 
-            # Sample audio token (CB0)
+            # Audio token sampling (CB0)
+            t0 = time.time()
             guided_cb0 = apply_classifier_guidance(buffers.cb0, cfg_active, config.cfg_scale, config.cfg_filter_k)
             if guided_cb0.shape[0] > 1:
                 guided_cb0 = guided_cb0[:1]
@@ -1063,25 +1123,55 @@ def run_seed_warmup(
             codebook_token = sample_audio_logits_fn(masked_cb0, config.audio.temperature, config.audio.top_k)
             audio_buf[:, 0, t + 1] = codebook_token
 
-            # Run depformer stages
+            t1 = time.time()
+            timing_stats['audio_sampling'] += (t1 - t0)
+
             prev_audio = codebook_token.expand(branches)
             main_tokens.fill_(main_token)
             aux_tokens.fill_(second_token)
 
+            # Depformer stages - use CUDA graph if enabled
+            t0 = time.time()
             for stage in range(runtime.model.depformer.num_depth):
                 if use_graph and dep_captures is not None:
-                    dep_captures[stage] = _execute_depformer_graph(
-                        stage=stage,
-                        prev_audio=prev_audio,
-                        hidden_t=hidden_t,
-                        generation=generation,
-                        depformer_step=depformer_step,
-                        main_tokens=main_tokens,
-                        aux_tokens=aux_tokens,
-                        buffers=buffers,
-                        capture=dep_captures[stage],
-                    )
+                    if depformer_needs_compiling[stage]:
+                        runtime.model.depformer._forward_stage = torch.compile(
+                            runtime.model.depformer._forward_stage,
+                            dynamic=True,
+                            mode="max-autotune-no-cudagraphs",
+                        )
+                        depformer_needs_compiling[stage] = False
+                        _execute_depformer_stage(
+                            stage_index=stage,
+                            prev_audio=prev_audio,
+                            hidden_t=hidden_t,
+                            generation=generation,
+                            depformer_step=depformer_step,
+                            main_tokens=main_tokens,
+                            second_tokens=aux_tokens,
+                            buffers=buffers,
+                        )
+                    else:
+                        dep_captures[stage] = _execute_depformer_graph(
+                            stage=stage,
+                            prev_audio=prev_audio,
+                            hidden_t=hidden_t,
+                            generation=generation,
+                            depformer_step=depformer_step,
+                            main_tokens=main_tokens,
+                            aux_tokens=aux_tokens,
+                            buffers=buffers,
+                            capture=dep_captures[stage],
+                        )
                 else:
+                    if depformer_needs_compiling[stage]:
+                        runtime.model.depformer._forward_stage = torch.compile(
+                            runtime.model.depformer._forward_stage,
+                            dynamic=True,
+                            mode="max-autotune-no-cudagraphs",
+                        )
+                        depformer_needs_compiling[stage] = False
+
                     _execute_depformer_stage(
                         stage_index=stage,
                         prev_audio=prev_audio,
@@ -1098,23 +1188,33 @@ def run_seed_warmup(
                 )
                 if dep_logits.shape[0] > 1:
                     dep_logits = dep_logits[:1]
+
                 stage_token = sample_audio_logits_fn(
-                    dep_logits, config.audio.temperature, config.audio.top_k
+                    dep_logits,
+                    config.audio.temperature,
+                    config.audio.top_k,
                 )
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
 
+            t1 = time.time()
+            timing_stats['depformer_stages'] += (t1 - t0)
+
+            last_step = t
+            timing_stats['step_count'] += 1
+
+            if eos_cutoff is None and warmup_state.end_step is not None:
+                eos_cutoff = warmup_state.end_step + flush_tail
+
             warmup_steps = t + 1
 
-            # Check if warmup is complete: entries consumed AND minimum steps reached
-            # Streaming loop handles flush_tail for output alignment separately
-            if warmup_state is not None and warmup_state.end_step is not None:
+            # Warmup exit condition
+            if warmup_state.end_step is not None:
                 if warmup_steps >= min_steps:
                     print(f"[WARMUP] Entries consumed at step {warmup_state.end_step}, stopping at {warmup_steps} steps", file=sys.stderr)
                     break
 
     print(f"[WARMUP] Completed {warmup_steps} warmup steps", file=sys.stderr)
-    # Log final warmup state that will be used for user text
     if warmup_state is not None:
         print(f"[WARMUP FINAL] State at end of warmup:", file=sys.stderr)
         print(f"[WARMUP FINAL]   end_step: {warmup_state.end_step}", file=sys.stderr)

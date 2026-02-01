@@ -274,10 +274,6 @@ def run_baseline_d79e326(request: dict, model, seed: int):
     model_size = request.get("model_size", "2b")
     config_overrides = request.get("config", {}) or {}
 
-    # === ADDED: Prepend warmup phrase for comparison with warmup path ===
-    WARMUP_PHRASE = "[S1] Hello! This is a streaming TTS demo."
-    text = f"{WARMUP_PHRASE} {text}"
-
     # === ADDED: Set seed for reproducibility ===
     random.seed(seed)
     torch.manual_seed(seed)
@@ -567,9 +563,8 @@ def process_request(request: dict):
             ),
             cfg_scale=config_overrides.get("cfg_scale", 2.0),
             cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
-            initial_padding=19,  # Must be >= max_delay (18) for caching
             use_cuda_graph=True,
-            use_torch_compile=False,  # Disabled to avoid RNG issues
+            use_torch_compile=False,
         )
 
         # Streaming config
