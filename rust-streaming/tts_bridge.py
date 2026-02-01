@@ -153,7 +153,7 @@ def emit_status(message: str, progress: float):
     })
 
 
-def emit_audio(data: bytes, chunk_index: int, timestamp_ms: float, duration_ms: float):
+def emit_audio(data: bytes, chunk_index: int, timestamp_ms: float, duration_ms: float = 0.0):
     emit_event({
         "type": "audio_chunk",
         "data": base64.b64encode(data).decode('utf-8'),
@@ -247,154 +247,16 @@ def load_model(model_size: str):
     return model
 
 
-def generate_stream_with_logging(
-    model,
-    script,
-    config=None,
-    streaming_config=None,
-    prefix_speaker_1=None,
-    prefix_speaker_2=None,
-    include_prefix=None,
-    verbose=False,
-):
-    """
-    1:1 COPY of Dia2.generate_stream from d79e326, with logging added.
-    DO NOT MODIFY THE LOGIC - ONLY ADD LOGGING BETWEEN LINES.
-    """
-    # --- 1:1 COPY FROM d79e326 STARTS HERE ---
-    from dia2 import StreamingConfig, StatusEvent
-    from dia2.generation import normalize_script, merge_generation_config
-    from dia2.runtime.voice_clone import build_prefix_plan
-    from dia2.runtime.script_parser import parse_script
-    from dia2.runtime.generator import (
-        build_initial_state,
-        warmup_with_prefix,
-        run_streaming_generation_loop,
-    )
-    from dia2.runtime.logger import RuntimeLogger
-
-    runtime = model._ensure_runtime()
-    logger = RuntimeLogger(verbose)
-
-    # Use default streaming config if not provided
-    if streaming_config is None:
-        streaming_config = StreamingConfig()
-
-    # Merge configuration
-    merged_overrides = dict()
-    if prefix_speaker_1 is not None:
-        merged_overrides["prefix_speaker_1"] = prefix_speaker_1
-    if prefix_speaker_2 is not None:
-        merged_overrides["prefix_speaker_2"] = prefix_speaker_2
-    if include_prefix is not None:
-        merged_overrides["include_prefix"] = include_prefix
-
-    merged = merge_generation_config(base=config or model.default_config, overrides=merged_overrides)
-
-    max_context = runtime.config.runtime.max_context_steps
-    text = normalize_script(script)
-    prefix_plan = build_prefix_plan(runtime, merged.prefix)
-
-    entries = []
-    if prefix_plan is not None:
-        entries.extend(prefix_plan.entries)
-    entries.extend(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
-
-    # === LOGGING: entries (matches warmup format) ===
-    print(f"[DEBUG ENTRIES] Baseline entries ({len(entries)} total):", file=sys.stderr)
-    for i, entry in enumerate(entries):
-        print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
-
-    # === LOGGING: initial_padding before/after ===
-    print(f"[DEBUG STATE] runtime.machine.initial_padding (before): {runtime.machine.initial_padding}", file=sys.stderr)
-    print(f"[DEBUG STATE] merged.initial_padding: {merged.initial_padding}", file=sys.stderr)
-
-    runtime.machine.initial_padding = merged.initial_padding
-
-    # === LOGGING: initial_padding after setting ===
-    print(f"[DEBUG STATE] runtime.machine.initial_padding (after): {runtime.machine.initial_padding}", file=sys.stderr)
-
-    logger.event(
-        f"starting streaming generation: max_context={max_context} cfg_scale={merged.cfg_scale:.2f} "
-        f"chunk_size={streaming_config.chunk_size_frames} frames"
-    )
-
-    state = runtime.machine.new_state(entries)
-
-    # === LOGGING: state after creation (matches warmup format) ===
-    print(f"[DEBUG STATE] State after new_state:", file=sys.stderr)
-    print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
-    print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
-    print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
-    print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
-    print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
-
-    gen_state = build_initial_state(
-        runtime,
-        prefix=prefix_plan,
-    )
-
-    # === LOGGING: gen_state after creation ===
-    print(f"[DEBUG STATE] gen_state.audio_buf.shape: {gen_state.audio_buf.shape}", file=sys.stderr)
-    print(f"[DEBUG STATE] gen_state.audio_buf[0,0,:10]: {gen_state.audio_buf[0,0,:10].tolist()}", file=sys.stderr)
-
-    start_step = 0
-    if prefix_plan is not None:
-        logger.event(f"warming up with prefix ({prefix_plan.aligned_frames} frames)")
-        start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
-
-    # === LOGGING: before generation loop ===
-    print(f"[DEBUG STATE] Before generation loop:", file=sys.stderr)
-    print(f"[DEBUG STATE]   start_step: {start_step}", file=sys.stderr)
-
-    # Yield status event for prefix warmup
-    yield StatusEvent(message="Prefix warmup complete" if prefix_plan else "Ready to generate", progress=0.0)
-
-    # Run streaming generation loop and yield all events
-    for event in run_streaming_generation_loop(
-        runtime,
-        state=state,
-        generation=gen_state,
-        config=merged,
-        streaming_config=streaming_config,
-        start_step=start_step,
-        logger=logger,
-    ):
-        yield event
-
-    # === LOGGING: after generation loop (matches warmup format) ===
-    print(f"[DEBUG STATE] After generation loop:", file=sys.stderr)
-    print(f"[DEBUG STATE]   end_step: {state.end_step}", file=sys.stderr)
-    print(f"[DEBUG STATE]   entries count: {len(state.entries)}", file=sys.stderr)
-    print(f"[DEBUG STATE]   padding_budget: {state.padding_budget}", file=sys.stderr)
-    print(f"[DEBUG STATE]   forced_padding: {state.forced_padding}", file=sys.stderr)
-    print(f"[DEBUG STATE]   pending_tokens: {list(state.pending_tokens)}", file=sys.stderr)
-    print(f"[DEBUG STATE]   transcript: {state.transcript}", file=sys.stderr)
-    print(f"[DEBUG STATE]   audio_buf.shape: {gen_state.audio_buf.shape}", file=sys.stderr)
-
-    # === LOGGING: CB0 tokens for comparison ===
-    end_step = state.end_step or gen_state.audio_buf.shape[-1]
-    cb0_tokens = gen_state.audio_buf[0, 0, :min(end_step+1, 100)].cpu().tolist()
-    print(f"[DEBUG STATE] CB0 tokens[0:{min(end_step+1, 100)}]: {cb0_tokens}", file=sys.stderr)
-
-    # Store for external access after iteration
-    generate_stream_with_logging.last_audio_buf = gen_state.audio_buf.clone()
-    generate_stream_with_logging.last_end_step = state.end_step
-    generate_stream_with_logging.last_transcript = list(state.transcript)
-    # --- 1:1 COPY FROM d79e326 ENDS HERE ---
-
-
 def run_baseline_d79e326(request: dict, model, seed: int):
     """
-    Run baseline generation using 1:1 code from commit d79e326.
-    This is the reference implementation that produces correct audio.
-    Used for debugging to compare tokens with warmup+extend path.
-
-    Returns: (audio_tokens, transcript) for comparison
+    1:1 COPY of d79e326's process_request, with only these additions:
+    - model passed as parameter (not loaded via load_model)
+    - seed parameter for reproducibility
+    - Warmup phrase prepended to text (for comparison with warmup path)
     """
+    # --- 1:1 COPY FROM d79e326 process_request STARTS HERE ---
     import tempfile
     import os
-    import time as time_module
     from dia2 import (
         GenerationConfig,
         SamplingConfig,
@@ -406,43 +268,42 @@ def run_baseline_d79e326(request: dict, model, seed: int):
     )
 
     text = request.get("text", "")
+    model_size = request.get("model_size", "2b")
     config_overrides = request.get("config", {}) or {}
 
-    # Prepend warmup phrase to user text - this is what baseline should generate
+    # === ADDED: Prepend warmup phrase for comparison with warmup path ===
     WARMUP_PHRASE = "[S1] Hello! This is a streaming TTS demo."
-    full_text = f"{WARMUP_PHRASE} {text}"
+    text = f"{WARMUP_PHRASE} {text}"
 
-    print(f"\n{'='*60}", file=sys.stderr)
-    print(f"[BASELINE d79e326] Starting baseline generation", file=sys.stderr)
-    print(f"[BASELINE d79e326] Full text: {full_text[:80]}...", file=sys.stderr)
-    print(f"[BASELINE d79e326] Seed: {seed}", file=sys.stderr)
-    print(f"{'='*60}", file=sys.stderr)
-
-    # Set seed for reproducibility (same as warmup path will use)
+    # === ADDED: Set seed for reproducibility ===
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+    if not text:
+        emit_error("Text input is required")
+        return
+
     # Handle voice cloning - base64 audio data for speakers
-    # (1:1 from d79e326)
     prefix_speaker_1 = None
     prefix_speaker_2 = None
     temp_files = []
 
     try:
-        # Handle voice cloning audio (1:1 from d79e326)
+        # Handle voice cloning audio
         speaker_1_audio = config_overrides.get("speaker_1_audio")
         speaker_2_audio = config_overrides.get("speaker_2_audio")
 
         if speaker_1_audio:
+            # Decode base64 and write to temp file
             audio_bytes = base64.b64decode(speaker_1_audio)
             fd, path = tempfile.mkstemp(suffix=".wav")
             os.write(fd, audio_bytes)
             os.close(fd)
             prefix_speaker_1 = path
             temp_files.append(path)
-            print(f"[BASELINE d79e326] Voice cloning: Speaker 1 audio saved to {path} ({len(audio_bytes)} bytes)", file=sys.stderr)
+            print(f"[INFO] Voice cloning: Speaker 1 audio saved to {path} ({len(audio_bytes)} bytes)", file=sys.stderr)
 
         if speaker_2_audio:
             audio_bytes = base64.b64decode(speaker_2_audio)
@@ -451,13 +312,14 @@ def run_baseline_d79e326(request: dict, model, seed: int):
             os.close(fd)
             prefix_speaker_2 = path
             temp_files.append(path)
-            print(f"[BASELINE d79e326] Voice cloning: Speaker 2 audio saved to {path} ({len(audio_bytes)} bytes)", file=sys.stderr)
+            print(f"[INFO] Voice cloning: Speaker 2 audio saved to {path} ({len(audio_bytes)} bytes)", file=sys.stderr)
 
-        emit_status("Running baseline generation...", 0.2)
+        # === CHANGED: model passed as parameter, not loaded ===
+        # model = load_model(model_size)
 
-        # Build generation config (1:1 from d79e326)
-        # NOTE: No initial_padding parameter - this is key difference
-        # NOTE: use_torch_compile=False - disabled to avoid RNG issues
+        emit_status("Starting generation...", 0.2)
+
+        # Build generation config
         gen_config = GenerationConfig(
             text=SamplingConfig(
                 temperature=config_overrides.get("text_temperature", 0.6),
@@ -470,12 +332,11 @@ def run_baseline_d79e326(request: dict, model, seed: int):
             cfg_scale=config_overrides.get("cfg_scale", 2.0),
             cfg_filter_k=config_overrides.get("cfg_filter_k", 50),
             use_cuda_graph=True,
-            use_torch_compile=False,  # 1:1 from d79e326
+            use_torch_compile=False,
         )
 
         # Streaming config - chunk_size must be larger than max audio delay (18 frames)
         # Using 19 frames (~0.25s at 75fps) for minimum latency
-        # (1:1 from d79e326)
         chunk_size = config_overrides.get("chunk_size_frames", 19)
         min_chunk = config_overrides.get("min_chunk_frames", 10)
 
@@ -485,26 +346,20 @@ def run_baseline_d79e326(request: dict, model, seed: int):
             emit_status_every=config_overrides.get("emit_status_every", 5),
         )
 
-        print(f"[BASELINE d79e326] chunk_size_frames={chunk_size}, min_chunk_frames={min_chunk}", file=sys.stderr)
+        print(f"[CONFIG] chunk_size_frames={chunk_size}, min_chunk_frames={min_chunk}", file=sys.stderr)
 
         # Generate with streaming (include voice cloning if provided)
-        # (1:1 from d79e326)
+        import time as time_module
         generation_start = time_module.time()
         event_count = 0
         audio_chunk_count = 0
         first_audio_time = None
-        print(f"[BASELINE d79e326] Starting generate_stream with text: {full_text[:50]}...", file=sys.stderr)
+        print(f"Starting generate_stream with text: {text[:50]}...", file=sys.stderr)
         if prefix_speaker_1 or prefix_speaker_2:
-            print(f"[BASELINE d79e326] Voice cloning enabled: S1={prefix_speaker_1}, S2={prefix_speaker_2}", file=sys.stderr)
+            print(f"  Voice cloning enabled: S1={prefix_speaker_1}, S2={prefix_speaker_2}", file=sys.stderr)
 
-        # Collect audio tokens for comparison
-        baseline_audio_data = []
-
-        # Use generate_stream_with_logging instead of model.generate_stream
-        # This is 1:1 with d79e326's generate_stream but with added logging
-        for event in generate_stream_with_logging(
-            model,
-            full_text,
+        for event in model.generate_stream(
+            text,
             config=gen_config,
             streaming_config=streaming_config,
             prefix_speaker_1=prefix_speaker_1,
@@ -513,6 +368,7 @@ def run_baseline_d79e326(request: dict, model, seed: int):
         ):
             event_count += 1
             event_type = type(event).__name__
+            print(f"Received event #{event_count}: {event_type}", file=sys.stderr)
 
             if isinstance(event, AudioChunkEvent):
                 audio_chunk_count += 1
@@ -521,52 +377,47 @@ def run_baseline_d79e326(request: dict, model, seed: int):
 
                 if first_audio_time is None:
                     first_audio_time = elapsed
-                    print(f"[BASELINE d79e326] First audio chunk at {first_audio_time*1000:.0f}ms", file=sys.stderr)
+                    print(f"[TIMING] First audio chunk at {first_audio_time*1000:.0f}ms", file=sys.stderr)
 
                 # Calculate chunk duration from bytes (24kHz, 16-bit mono = 48000 bytes/sec)
                 # WAV header is 44 bytes
                 audio_bytes = len(event.audio_data) - 44
                 chunk_duration_ms = (audio_bytes / 48000) * 1000
 
-                print(f"[BASELINE d79e326] AudioChunk #{audio_chunk_count}: {len(event.audio_data)} bytes ({chunk_duration_ms:.0f}ms audio), index={event.chunk_index}, elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
-
-                # Emit audio to client (user will hear baseline audio)
-                emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms, chunk_duration_ms)
-                baseline_audio_data.append(event.audio_data)
-
+                print(f"  AudioChunk #{audio_chunk_count}: {len(event.audio_data)} bytes ({chunk_duration_ms:.0f}ms audio), index={event.chunk_index}, elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
+                emit_audio(event.audio_data, event.chunk_index, event.timestamp_ms)
             elif isinstance(event, StatusEvent):
                 elapsed = time_module.time() - generation_start
-                print(f"[BASELINE d79e326] Status: {event.message}, progress={event.progress}, elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
+                print(f"  Status: {event.message}, progress={event.progress}, elapsed={elapsed*1000:.0f}ms", file=sys.stderr)
                 emit_status(event.message, event.progress)
-
             elif isinstance(event, CompleteEvent):
                 elapsed = time_module.time() - generation_start
-                print(f"[BASELINE d79e326] Complete: {event.total_chunks} chunks, {event.total_duration_ms:.0f}ms audio, total_time={elapsed*1000:.0f}ms", file=sys.stderr)
+                print(f"[TIMING] Complete: {event.total_chunks} chunks, {event.total_duration_ms:.0f}ms audio, total_time={elapsed*1000:.0f}ms", file=sys.stderr)
                 emit_complete(event.total_chunks, event.total_duration_ms)
-
             elif isinstance(event, ErrorEvent):
-                print(f"[BASELINE d79e326] Error: {event.error}", file=sys.stderr)
+                print(f"  Error: {event.error}", file=sys.stderr)
                 emit_error(event.error)
+            else:
+                print(f"  Unknown event type: {event}", file=sys.stderr)
 
         elapsed = time_module.time() - generation_start
-        print(f"[BASELINE d79e326] Generation loop finished. Total events: {event_count}, Audio chunks: {audio_chunk_count}, total_time={elapsed*1000:.0f}ms", file=sys.stderr)
-        print(f"{'='*60}\n", file=sys.stderr)
-
-        return baseline_audio_data
+        print(f"[TIMING] Generation loop finished. Total events: {event_count}, Audio chunks: {audio_chunk_count}, total_time={elapsed*1000:.0f}ms", file=sys.stderr)
 
     except Exception as e:
         import traceback
-        print(f"[BASELINE d79e326] Error: {e}", file=sys.stderr)
+        emit_error(f"Generation error: {e}")
         print(traceback.format_exc(), file=sys.stderr)
-        return None
 
     finally:
         # Clean up temp files for voice cloning
+        import os
         for temp_file in temp_files:
             try:
                 os.unlink(temp_file)
-            except Exception:
-                pass
+                print(f"[INFO] Cleaned up temp file: {temp_file}", file=sys.stderr)
+            except Exception as cleanup_err:
+                print(f"[WARN] Failed to clean up {temp_file}: {cleanup_err}", file=sys.stderr)
+    # --- 1:1 COPY FROM d79e326 process_request ENDS HERE ---
 
 
 def process_request(request: dict):

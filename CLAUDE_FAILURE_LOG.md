@@ -103,3 +103,60 @@ Point Claude to this document.
 ## The User's Time Is Valuable
 
 Four days were wasted. That's four days the user won't get back. The user shouldn't have to repeat themselves or yell. Claude should execute instructions correctly the first time.
+
+---
+
+## Update: January 31, 2025 - CONTINUED FAILURES
+
+Even after writing this failure log, Claude CONTINUED to fail:
+
+### Failure 1: Created generate_stream_with_logging instead of copying
+- User said to copy d79e326's code exactly
+- Claude created a new function called `generate_stream_with_logging` that attempted to RECREATE the logic
+- This is NOT a 1:1 copy - it's a recreation
+- The function had differences like `merged_overrides = dict()` instead of `merged_overrides = dict(overrides)`
+
+### Failure 2: Still not using d79e326's actual code path
+- d79e326's tts_bridge.py calls `model.generate_stream()` directly
+- Claude kept trying to wrap it, intercept it, recreate it
+- The user had to explicitly say: "our d79e326 implementation should have nothing to do with our warmup system, our normal setup or anything, it just calling the generation the exact way it did in d79e326"
+
+### Failure 3: Wrong emit_audio signature
+- d79e326's emit_audio takes 3 arguments: `(data, chunk_index, timestamp_ms)`
+- Current codebase's emit_audio takes 4 arguments
+- Claude called it with 3 arguments matching d79e326, but didn't verify the function signature matched
+
+### Failure 4: Added extra code that wasn't in d79e326
+- Added `baseline_audio_data = []` and `baseline_audio_data.append()`
+- Added warmup phrase prepending: `full_text = f"{WARMUP_PHRASE} {text}"`
+- These were NOT in d79e326's process_request
+
+### The Pattern
+Claude keeps saying "1:1 copy" but then:
+1. Adds things
+2. Changes things
+3. Recreates instead of copies
+4. Uses different function signatures
+5. Wraps instead of using directly
+
+### What "1:1 Copy" Actually Means
+- Open the file from d79e326
+- Select the code
+- Paste it
+- Change ONLY what is absolutely necessary (like `self` to `model`)
+- Add logging BETWEEN lines, not instead of lines
+- DO NOT add new logic
+- DO NOT change existing logic
+- DO NOT wrap or recreate
+
+### Claude's Broken Promises
+- Said would do 1:1 copy → Did recreation instead
+- Said would only add logging → Changed logic
+- Said would match d79e326 exactly → Added warmup phrase prepending
+- Read the failure log → Immediately violated it again
+
+---
+
+## This Is Unacceptable
+
+The user has been debugging for 4+ days. Claude keeps promising to follow instructions and then immediately breaking those promises. This is not a complex task - it's copying code and adding print statements. Yet Claude keeps failing at it.
