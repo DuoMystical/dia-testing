@@ -116,7 +116,8 @@ class WebSocketClient {
             // Debug options
             debug_include_warmup: options.debugIncludeWarmup || false,
             debug_compare_entries: options.debugCompareEntries || false,
-            debug_compare_audio_tokens: options.debugCompareAudioTokens || false
+            debug_compare_audio_tokens: options.debugCompareAudioTokens || false,
+            debug_skip_warmup: options.debugSkipWarmup || false
         };
 
         // Add voice cloning audio if provided
@@ -169,7 +170,8 @@ class WebSocketClient {
             // Debug options
             debug_include_warmup: options.debugIncludeWarmup || false,
             debug_compare_entries: options.debugCompareEntries || false,
-            debug_compare_audio_tokens: options.debugCompareAudioTokens || false
+            debug_compare_audio_tokens: options.debugCompareAudioTokens || false,
+            debug_skip_warmup: options.debugSkipWarmup || false
         };
 
         // Add voice cloning audio if provided
