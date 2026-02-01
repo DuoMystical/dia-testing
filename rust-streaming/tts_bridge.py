@@ -253,6 +253,7 @@ def run_baseline_d79e326(request: dict, model, seed: int):
     - model passed as parameter (not loaded via load_model)
     - seed parameter for reproducibility
     - Warmup phrase prepended to text (for comparison with warmup path)
+    - Logging added BETWEEN lines for comparison with warmup path
     """
     # --- 1:1 COPY FROM d79e326 process_request STARTS HERE ---
     import tempfile
@@ -266,6 +267,8 @@ def run_baseline_d79e326(request: dict, model, seed: int):
         CompleteEvent,
         ErrorEvent,
     )
+    from dia2.generation import normalize_script
+    from dia2.runtime.script_parser import parse_script
 
     text = request.get("text", "")
     model_size = request.get("model_size", "2b")
@@ -280,6 +283,13 @@ def run_baseline_d79e326(request: dict, model, seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+    # === LOGGING: Log what we're generating ===
+    print(f"\n{'='*60}", file=sys.stderr)
+    print(f"[BASELINE] Starting baseline generation (d79e326 code path)", file=sys.stderr)
+    print(f"[BASELINE] Full text: {text[:100]}...", file=sys.stderr)
+    print(f"[BASELINE] Seed: {seed}", file=sys.stderr)
+    print(f"{'='*60}", file=sys.stderr)
 
     if not text:
         emit_error("Text input is required")
@@ -334,6 +344,21 @@ def run_baseline_d79e326(request: dict, model, seed: int):
             use_cuda_graph=True,
             use_torch_compile=False,
         )
+
+        # === LOGGING: Log config (matches warmup path format) ===
+        print(f"[DEBUG STATE] gen_config.initial_padding: {gen_config.initial_padding}", file=sys.stderr)
+        print(f"[DEBUG STATE] gen_config.cfg_scale: {gen_config.cfg_scale}", file=sys.stderr)
+
+        # === LOGGING: Parse entries for logging (same as generate_stream will do internally) ===
+        runtime = model._ensure_runtime()
+        normalized_text = normalize_script(text)
+        entries = parse_script([normalized_text], runtime.tokenizer, runtime.constants, runtime.frame_rate)
+        print(f"[DEBUG ENTRIES] Baseline entries ({len(entries)} total):", file=sys.stderr)
+        for i, entry in enumerate(entries):
+            print(f"[DEBUG ENTRIES]   [{i}] tokens={entry.tokens}, text='{entry.text}', padding={entry.padding}", file=sys.stderr)
+
+        # === LOGGING: Log initial_padding that will be used ===
+        print(f"[DEBUG STATE] runtime.machine.initial_padding (before generate_stream): {runtime.machine.initial_padding}", file=sys.stderr)
 
         # Streaming config - chunk_size must be larger than max audio delay (18 frames)
         # Using 19 frames (~0.25s at 75fps) for minimum latency
@@ -402,6 +427,15 @@ def run_baseline_d79e326(request: dict, model, seed: int):
 
         elapsed = time_module.time() - generation_start
         print(f"[TIMING] Generation loop finished. Total events: {event_count}, Audio chunks: {audio_chunk_count}, total_time={elapsed*1000:.0f}ms", file=sys.stderr)
+
+        # === LOGGING: Log final state ===
+        print(f"[DEBUG STATE] After generation:", file=sys.stderr)
+        print(f"[DEBUG STATE]   runtime.machine.initial_padding: {runtime.machine.initial_padding}", file=sys.stderr)
+        print(f"[DEBUG STATE]   audio_chunks: {audio_chunk_count}", file=sys.stderr)
+        # NOTE: Cannot access CB0 tokens directly because generate_stream encapsulates gen_state
+        # To compare tokens, would need to use lower-level APIs or modify generate_stream
+        print(f"[DEBUG STATE]   (CB0 tokens not accessible via generate_stream API)", file=sys.stderr)
+        print(f"{'='*60}", file=sys.stderr)
 
     except Exception as e:
         import traceback
