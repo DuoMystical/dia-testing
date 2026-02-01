@@ -294,6 +294,10 @@ class Dia2:
             logger=logger,
         )
 
+        # === ADDED: Store audio_buf for CB0 token comparison ===
+        # This allows external code to compare baseline vs warmup tokens
+        self._last_audio_buf = gen_state.audio_buf.clone()
+
     def save_wav(self, script: str | Sequence[str], path: str | Path, **kwargs):
         return self.generate(script, output_wav=path, **kwargs)
 

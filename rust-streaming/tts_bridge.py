@@ -432,9 +432,16 @@ def run_baseline_d79e326(request: dict, model, seed: int):
         print(f"[DEBUG STATE] After generation:", file=sys.stderr)
         print(f"[DEBUG STATE]   runtime.machine.initial_padding: {runtime.machine.initial_padding}", file=sys.stderr)
         print(f"[DEBUG STATE]   audio_chunks: {audio_chunk_count}", file=sys.stderr)
-        # NOTE: Cannot access CB0 tokens directly because generate_stream encapsulates gen_state
-        # To compare tokens, would need to use lower-level APIs or modify generate_stream
-        print(f"[DEBUG STATE]   (CB0 tokens not accessible via generate_stream API)", file=sys.stderr)
+
+        # === LOGGING: CB0 tokens from model._last_audio_buf (added by generate_stream) ===
+        if hasattr(model, '_last_audio_buf') and model._last_audio_buf is not None:
+            audio_buf = model._last_audio_buf
+            cb0_tokens = audio_buf[0, 0, :min(audio_buf.shape[-1], 100)].cpu().tolist()
+            print(f"[DEBUG STATE] CB0 tokens[0:{min(audio_buf.shape[-1], 100)}]: {cb0_tokens}", file=sys.stderr)
+            print(f"[DEBUG STATE] audio_buf.shape: {audio_buf.shape}", file=sys.stderr)
+        else:
+            print(f"[DEBUG STATE] (CB0 tokens not available - model._last_audio_buf not set)", file=sys.stderr)
+
         print(f"{'='*60}", file=sys.stderr)
 
     except Exception as e:
